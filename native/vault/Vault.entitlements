@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Camera access for scanning enrollment QR codes (paired with
+	     NSCameraUsageDescription). Required under the hardened runtime. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+
+	<!-- NOTE: the App Sandbox is intentionally NOT enabled. The app spawns the
+	     `vault` CLI and the `vault-helper`, and the CLI reads/writes its
+	     config dir (~/Library/Application Support/vault); a sandbox container
+	     would break both. Distribution is Developer-ID + hardened runtime +
+	     notarization (not the Mac App Store). See native/README.md. -->
+</dict>
+</plist>

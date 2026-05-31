@@ -38,6 +38,19 @@ const readCalls = async (log: string): Promise<string[]> => {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Poll the log until `want` appears, or the deadline elapses. sdNotify shells out
+// fire-and-forget, so we can't await it; spawn + PATH-resolution latency varies
+// widely by machine/filesystem, so a fixed sleep races. Wait for the effect.
+const waitForCall = async (log: string, want: string, timeoutMs = 3000): Promise<string[]> => {
+	const deadline = Date.now() + timeoutMs;
+	let calls = await readCalls(log);
+	while (!calls.includes(want) && Date.now() < deadline) {
+		await sleep(25);
+		calls = await readCalls(log);
+	}
+	return calls;
+};
+
 test("sdNotify is a no-op when NOTIFY_SOCKET is unset", async () => {
 	const { log, restore } = await withStubNotify();
 	const prev = process.env.NOTIFY_SOCKET;
@@ -58,8 +71,7 @@ test("sdNotify invokes systemd-notify when NOTIFY_SOCKET is set", async () => {
 	process.env.NOTIFY_SOCKET = "/run/dummy.sock";
 	try {
 		sdNotify("READY=1");
-		await sleep(100);
-		assert.deepEqual(await readCalls(log), ["READY=1"]);
+		assert.deepEqual(await waitForCall(log, "READY=1"), ["READY=1"]);
 	} finally {
 		if (prev === undefined) delete process.env.NOTIFY_SOCKET;
 		else process.env.NOTIFY_SOCKET = prev;
@@ -83,9 +95,8 @@ test("startWatchdog pings on a timer, and is a no-op without WATCHDOG_USEC", asy
 		// With a tiny interval (2s usec -> clamped to 1s min), expect at least one ping.
 		process.env.WATCHDOG_USEC = String(2_000_000); // 2s; half = 1s (the floor)
 		stop = startWatchdog();
-		await sleep(1200);
+		const calls = await waitForCall(log, "WATCHDOG=1");
 		stop();
-		const calls = await readCalls(log);
 		assert.ok(
 			calls.includes("WATCHDOG=1"),
 			`expected a WATCHDOG=1 ping, got ${JSON.stringify(calls)}`,

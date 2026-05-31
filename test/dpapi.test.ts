@@ -83,7 +83,7 @@ test("DPAPI keystore protects a real vault end-to-end (engine round-trip)", asyn
 
 		// Stolen disk without the DPAPI binding (different user) cannot unlock.
 		const otherUser = makeDpapiKeyStore(fakeDpapi("attacker"));
-		await assert.rejects(unlock(store, "pw", otherUser), /keystore secret missing/);
+		await assert.rejects(unlock(store, "pw", otherUser), /did not return this device's unlock key/);
 		store.close();
 	} finally {
 		if (prev === undefined) delete process.env.VAULT_HOME;

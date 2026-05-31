@@ -36,7 +36,7 @@ import {
 	type JoinToken,
 	type RelayInfo,
 } from "./engine.ts";
-import { defaultKeyStore } from "./keystore.ts";
+import { defaultKeyStore, keyStoreByName, type KeyStore } from "./keystore.ts";
 import { setJsonOutput, emit, emitError } from "./output.ts";
 import { dbPath, listVaultNames, DEFAULT_VAULT } from "./paths.ts";
 import { readPassphrase, setPassphraseSource, closePassphraseSource } from "./prompt.ts";
@@ -117,6 +117,14 @@ const openStore = async (values: Record<string, unknown>): Promise<Store> =>
 			: await dbPath(typeof values.vault === "string" ? (values.vault as string) : DEFAULT_VAULT),
 	);
 
+// Pick the keystore for UNLOCKING an existing vault: the exact provider it was
+// sealed under (so the right DUK is fetched), not merely the strongest available.
+// Passphrase-only vaults record no provider and unlock without a keystore.
+const unlockKeyStore = async (store: Store): Promise<KeyStore | undefined> => {
+	const provider = store.getMeta("keystoreProvider");
+	return provider ? await keyStoreByName(provider) : undefined;
+};
+
 const withSession = async (
 	values: Record<string, unknown>,
 	fn: (s: Session) => Promise<void> | void,
@@ -125,7 +133,7 @@ const withSession = async (
 	try {
 		if (!isInitialized(store)) throw new Error("vault not initialized; run `vault init`");
 		const pass = await readPassphrase();
-		const session = await unlock(store, pass, await defaultKeyStore());
+		const session = await unlock(store, pass, await unlockKeyStore(store));
 		await fn(session);
 	} finally {
 		store.close();
@@ -384,8 +392,9 @@ const main = async (): Promise<number> => {
 					role: (values.role as TokenB["role"]) ?? undefined,
 					relay: relayInfo(values),
 				});
-				process.stdout.write(
+				emit(
 					`Verify SAS matches the new device: ${tokenB.sas}\n\nToken B (show as QR / paste into 'device-confirm --token'):\n\n${b64(tokenB)}\n`,
+					{ sas: tokenB.sas, tokenB: b64(tokenB) },
 				);
 			});
 			return 0;
@@ -512,7 +521,11 @@ const main = async (): Promise<number> => {
 					);
 				} else if (sub === "enable" || sub === "disable") {
 					const pass = await readPassphrase();
-					const name = await setKeystore(store, pass, sub === "enable", await defaultKeyStore());
+					// Disable needs the CURRENT provider (to read+remove its DUK); enable on a
+					// passphrase-only vault picks the strongest tier available.
+					const current = store.getMeta("keystoreProvider");
+					const ks = current ? await keyStoreByName(current) : await defaultKeyStore();
+					const name = await setKeystore(store, pass, sub === "enable", ks);
 					emit(`keystore ${sub}d -> ${name}\n`, { action: sub, provider: name });
 				} else {
 					throw new Error("usage: vault keystore (status | enable | disable)");
@@ -535,7 +548,7 @@ const main = async (): Promise<number> => {
 			try {
 				if (!isInitialized(store)) throw new Error("vault not initialized; run `vault init`");
 				const pass = await readPassphrase();
-				const session = await unlock(store, pass, await defaultKeyStore());
+				const session = await unlock(store, pass, await unlockKeyStore(store));
 				return await runCmd(
 					session,
 					{

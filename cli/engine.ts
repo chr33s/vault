@@ -156,7 +156,14 @@ const openWrapKey = async (
 	const id = store.getMeta("keystoreId");
 	if (!id) throw new Error("keystore metadata is corrupt");
 	const duk = await keystore.get(id);
-	if (!duk) throw new Error(`keystore secret missing (item ${id}); cannot unlock on this device`);
+	if (!duk)
+		throw new Error(
+			`cannot unlock: the "${provider}" keystore did not return this device's unlock key ` +
+				`(item ${id}). Either access was denied/cancelled (retry), or the key was lost ` +
+				`(e.g. the secure-enclave blob or keychain entry was deleted) — if so, re-enroll ` +
+				`this device (vault auth → device-add → device-confirm), or restore it from a ` +
+				`device that can still unlock.`,
+		);
 	return cr.hkdf(accountKey, duk, KEYSTORE_INFO, 32);
 };
 

@@ -3,5 +3,16 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+.env*
+*.log
 relay.db*
 .env.local
+.build/
+native/**/.build/
+native/**/*.app
+native/build/
+native/.swiftpm
+
+## Xcode user-specific
+xcuserdata/
+*.xcuserstate

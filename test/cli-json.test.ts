@@ -72,6 +72,30 @@ test("--json emits one structured object per command", async () => {
 	});
 });
 
+test("--json device-add returns the SAS + Token B (enrollment contract for the UI)", async () => {
+	await withHome(async (home) => {
+		const env = { VAULT_PASSPHRASE: "pw" };
+		await execFile(["--json", "init"], { home, env });
+
+		// A second device (separate home) prints Token A; the first authorizes it.
+		await withHome(async (home2) => {
+			const auth = lastJson((await execFile(["--json", "auth"], { home: home2, env })).stdout);
+			const tokenA = auth.tokenA as string;
+			const added = lastJson(
+				(
+					await execFile(["--json", "device-add", "--token", tokenA, "--role", "admin"], {
+						home,
+						env,
+					})
+				).stdout,
+			);
+			assert.equal(added.ok, true);
+			assert.match(added.sas as string, /\S/);
+			assert.match(added.tokenB as string, /\S/);
+		});
+	});
+});
+
 test("--json reports errors as {ok:false,error} on stdout with non-zero exit", async () => {
 	await withHome(async (home) => {
 		const env = { VAULT_PASSPHRASE: "pw" };

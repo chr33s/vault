@@ -38,7 +38,7 @@ test/    node:test specs
 | Multi-vault                    | ✅     | `--vault <name>` selects independent named replicas; `vaults` lists them                                                                                                                                                                                  |
 | M6 SEA packaging               | ✅     | `build/` bundle + `node --build-sea` + signing + CI matrix; produces a working single-file `dist/vault` on Node 26                                                                                                                                        |
 | M7 Cloudflare deploy           | ✅     | **both** §8.2 placements: self-hosted Node behind `cloudflared` (systemd + Tunnel) **and** serverless Worker + Durable Object (`relay/worker/` + `wrangler.toml`); shared `relay/handler.ts`, Access JWT verification, runbook for both (`relay/deploy/`) |
-| M8 direct fallback / native UI | ⏳     | deferred (plan marks optional)                                                                                                                                                                                                                            |
+| M8 direct fallback / native UI | ◑      | direct LAN/tailnet fallback (§8.6) deferred; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`)                                                                      |
 
 ## Crypto (all `node:crypto`, plan §8)
 
@@ -205,8 +205,9 @@ Two global flags give a stable, scriptable contract — the foundation a native 
   or `{"ok":false,"error":"..."}` on failure (with a non-zero exit). Human text
   output is unchanged when the flag is absent.
 - `--passphrase-stdin` — read each passphrase as one newline-terminated line from
-  stdin instead of a TTY prompt. Secrets cross the process boundary over **stdin
-  only** — never argv (world-readable) or env (leaks to children, shell history).
+  stdin instead of a TTY prompt. These secrets (the passphrase and item
+  passwords) cross the process boundary over **stdin only** — never argv
+  (world-readable) or env (leaks to children, shell history).
   Commands that prompt more than once (e.g. `add --password`) read successive
   lines: account passphrase first, then the item password.
 
@@ -215,9 +216,14 @@ printf 'mypass\n'            | vault --json --passphrase-stdin list
 printf 'mypass\nitemsecret\n'| vault --json --passphrase-stdin add gh --password
 ```
 
-A native macOS wrapper would spawn the SEA binary with these flags (and call
-`EnableSecureEventInput()` / Touch ID + Secure Enclave itself); see the threat
-model for why those belong in the wrapper, not the CLI.
+A native macOS wrapper (`native/Vault.app`) spawns the SEA binary with these
+flags for its whole feature set — vault creation and multi-vault selection,
+item add/edit/remove, sync, device enrollment and people sharing (QR + camera,
+with a paste fallback), and relay configuration — and adds the app-layer
+hardening the CLI can't do itself: `EnableSecureEventInput()` while a passphrase
+field is on screen, and Touch ID + Secure Enclave unlock via the
+`secure-enclave` keystore tier (`native/`). See the threat model for why those
+belong in the wrapper, not the CLI.
 
 ## Threat model
 
@@ -229,8 +235,10 @@ What the cryptography **protects**, regardless of who runs it:
   verified.
 - **At-rest / theft / backups** — the on-disk replica (and wrapped private keys)
   is meaningless without the passphrase; with `--keychain` it also requires the
-  device's OS keystore secret (macOS keychain / Windows DPAPI). Covers a
-  stolen/copied disk, Time Machine, and a vault file synced to iCloud/Dropbox.
+  device's OS keystore secret (macOS keychain / Windows DPAPI), or — on the
+  **strong tier** — a Touch-ID-gated, non-exportable **Secure Enclave** key
+  (`native/Vault.app`). Covers a stolen/copied disk, Time Machine, and a vault
+  file synced to iCloud/Dropbox.
 - **Plaintext sprawl** — secrets aren't in `.env`/dotfiles; `vault run` decrypts
   them only transiently into a child's environment.
 - **Cross-device / cross-person sharing** — gated by sealed grants + the signed
@@ -257,8 +265,8 @@ weak-passphrase resistance); prefer the TTY passphrase prompt over
 
 The vault can't stop a keylogger that's already running as your user — but you
 can narrow the typing window. Best to worst: **don't type a passphrase at all**
-(`vault keystore enable`, or the future biometric unlock — no keystroke to
-capture); avoid `$VAULT_PASSPHRASE` (readable by your own child processes and
+(`vault keystore enable`, or the Touch-ID `secure-enclave` unlock in
+`native/Vault.app` — no keystroke to capture); avoid `$VAULT_PASSPHRASE` (readable by your own child processes and
 saved in shell history — usually a bigger leak than keystroke risk). Beyond that,
 terminal-level "secure input" exists but is narrow and platform-specific:
 
@@ -267,8 +275,8 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   keyloggers (modern macOS already gates these via TCC Input Monitoring). It does
   **not** stop root/kernel/HID-level or hardware keyloggers, and only covers the
   typing window — keys are in process memory once unlocked. The CLI can't toggle
-  it (it needs a window-server connection); a native macOS UI wrapper would call
-  it directly.
+  it (it needs a window-server connection); `native/Vault.app` calls it directly
+  while a passphrase field is on screen.
 - **Linux** — there is no toggle. Under **Wayland** you get this _structurally_
   (the compositor mediates input; apps can't sniff each other's keystrokes), so
   prefer it. **X11 has no such isolation** — any X client can read the keyboard.
@@ -285,10 +293,13 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   factor into the wrap key (`HKDF(accountKey, device-unlock-key)`), so a stolen
   disk can't be brute-forced offline at any passphrase strength. Providers:
   **macOS** login keychain (`security`) and **Windows** DPAPI (`ProtectedData`,
-  CurrentUser scope, via PowerShell). Both are _at-rest_ protection bound to the
-  OS user; true per-access user verification — Touch ID + Secure Enclave on
-  macOS, Windows Hello + TPM on Windows — needs a native shim the interface
-  accepts (the strong tier).
+  CurrentUser scope, via PowerShell) — both _at-rest_ protection bound to the OS
+  user. The **strong tier** adds true per-access user verification: on macOS,
+  **Touch ID + Secure Enclave** via the `secure-enclave` provider (a small signed
+  `vault-helper` the CLI spawns; the DUK is sealed to a non-exportable Enclave
+  key, so `get` triggers a biometric prompt and a stolen disk can't be
+  brute-forced at any passphrase strength — see `native/`). Windows Hello + TPM
+  is the equivalent not-yet-built tier on Windows.
 - **Untrusted relay** (spec §8.4): signatures + version vectors +
   order-independent CRDT mean the relay can delay but never forge, read, or
   corrupt. It sees metadata (identity, op sizes, timing), never plaintext.
@@ -300,11 +311,19 @@ terminal-level "secure input" exists but is narrow and platform-specific:
 
 ## Known limitations
 
-- **Tokens are base64 text, not rendered QR.** The plan permits printing the
-  payload string; Join/Token-B bundles also exceed the ~3 KB QR cap by design
-  (bulk history flows over sync, not the token).
-- **M8 deferred:** the optional direct LAN/tailnet fallback path (§8.6) and a
-  native macOS UI wrapper are not built.
+- **The CLI prints tokens as base64 text, not rendered QR.** The plan permits
+  printing the payload string; Join/Token-B bundles also exceed the ~3 KB QR cap
+  by design (bulk history flows over sync, not the token). `native/Vault.app`
+  renders/scans QR for the device-enrollment handshake on top of the same text
+  tokens.
+- **M8 partial:** the optional direct LAN/tailnet fallback path (§8.6) is not
+  built. The native macOS UI wrapper **is** — `native/Vault.app` (SwiftUI over
+  `vault --json`) covers the full workflow: create/unlock vaults, multi-vault
+  selection, item add/edit/remove, sync with in-app relay settings, device
+  enrollment and people sharing over the QR token handshake, and `secure-enclave`
+  Touch-ID unlock (`native/`). The app and helper are separately built/signed
+  artifacts, not npm deps, so `check:deps` stays green. arm64-only, Developer-ID +
+  hardened-runtime + notarization (not the Mac App Store).
 
 ## Stability caveats
 
