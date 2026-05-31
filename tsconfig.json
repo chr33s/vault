@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		"target": "ES2025",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"lib": ["ES2025"],
+		"types": ["node"],
+		"strict": true,
+		"noImplicitOverride": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": false,
+		"noEmit": true,
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": true,
+		"isolatedModules": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+
+		"erasableSyntaxOnly": true
+	},
+	"include": ["core/**/*.ts", "cli/**/*.ts", "relay/**/*.ts", "test/**/*.ts", "build/**/*.ts"]
+}

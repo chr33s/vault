@@ -1,0 +1,20 @@
+# cloudflared Tunnel config for the vault relay (plan §6, spec §8.2).
+# Exposes the relay at a public hostname through the Cloudflare edge with NO
+# inbound ports open on the host. Install at ~/.cloudflared/config.yml.
+#
+# Setup:
+#   cloudflared tunnel login
+#   cloudflared tunnel create vault-relay
+#   cloudflared tunnel route dns vault-relay vault.example.com
+#   cloudflared tunnel run vault-relay     # or install as a service
+#
+# The tunnel credentials file is created by `tunnel create`.
+
+tunnel: vault-relay
+credentials-file: /etc/cloudflared/vault-relay.json
+
+ingress:
+  - hostname: vault.example.com
+    service: http://127.0.0.1:8731
+  # Everything else is rejected.
+  - service: http_status:404

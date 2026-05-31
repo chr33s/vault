@@ -1,0 +1,44 @@
+# Wrangler config for the serverless relay (spec §8.2 Worker + Durable Object).
+# Deploy from this directory:  wrangler deploy
+#
+# Zero RUNTIME npm deps still holds — the worker imports only project source
+# (reusing core/* and relay/access via nodejs_compat) + the DO's built-in SQLite.
+# Wrangler itself is a build-time tool (install with `npm i -g wrangler`, or
+# `npx wrangler`), like esbuild for the SEA binary; it is never shipped.
+
+name = "vault-relay"
+main = "worker.ts"
+workers_dev = true
+# REQUIRED: a recent date so node:crypto under nodejs_compat is well-supported
+# (the worker reuses core/protocol, core/authlog and relay/access, which use
+# node:crypto — including createPublicKey/verify for the Access JWT check).
+compatibility_date = "2024-09-23"
+
+# Load-bearing: provides the node:crypto polyfill the reused core/relay code needs.
+# (The worker still avoids node:http and node:sqlite entirely — storage is the
+# Durable Object's built-in SQLite.) Smoke-test the JWT path on `wrangler dev`:
+# Workers' node:crypto public-key coverage tracks the compatibility_date.
+compatibility_flags = ["nodejs_compat"]
+
+# One Durable Object class, SQLite-backed (one instance per teamId).
+[[durable_objects.bindings]]
+name = "RELAY_DO"
+class_name = "RelayDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayDO"]
+
+# ---- Access / auth (set as secrets, not plaintext here) ----
+# Per-device service tokens (comma-separated) — the network gate (spec §8.3):
+#   wrangler secret put VAULT_RELAY_TOKENS
+# Cloudflare Access JWT verification (defense in depth):
+#   wrangler secret put CF_ACCESS_TEAM_DOMAIN   # e.g. myteam.cloudflareaccess.com
+#   wrangler secret put CF_ACCESS_AUD           # application audience tag
+#
+# Fail closed: a button-/freshly-deployed relay DENIES all traffic until Access
+# is configured (service tokens or CF_ACCESS_*), rather than running open. Flip
+# to "0" only for a deliberately public/dev relay.
+[vars]
+REQUIRE_ACCESS = "1"
+# CF_ACCESS_TEAM_DOMAIN = "myteam.cloudflareaccess.com"  # non-secret default for `wrangler dev`

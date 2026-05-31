@@ -2,11 +2,11 @@
 
 **Target:** the credential vault’s **Architecture C** (local-first core + always-on Cloudflare relay), implemented in TypeScript on **Node.js 26**, with the **CLI compiled to a single executable** via `node --build-sea`, and the **relay** as a Node process behind **Cloudflare Tunnel + Access**.
 
-**Guiding constraint:** *minimize external dependencies.* Node 26’s built-ins now cover crypto, SQLite, HTTP, testing, and TypeScript execution, so the design targets **zero runtime dependencies** — only build-time tooling.
+**Guiding constraint:** _minimize external dependencies._ Node 26’s built-ins now cover crypto, SQLite, HTTP, testing, and TypeScript execution, so the design targets **zero runtime dependencies** — only build-time tooling.
 
 This plan references the design spec (`spec.md`); section numbers like §8 point there.
 
------
+---
 
 ## 0. What gets built
 
@@ -16,19 +16,19 @@ This plan references the design spec (`spec.md`); section numbers like §8 point
 
 The CLI is the portable engine; a native Swift/macOS UI (the original framing) can later wrap it by spawning the binary or linking a thin library. Not required for v1.
 
------
+---
 
 ## 1. Platform baseline — why Node 26 fits the “minimal deps” goal
 
-|Need              |Node 26 built-in                                                                     |Removes the need for                   |
-|------------------|-------------------------------------------------------------------------------------|---------------------------------------|
-|Run TypeScript    |Native **type stripping** (stable since 25.2, default) via Amaro                     |ts-node, tsx, babel (for dev/run)      |
-|Crypto            |`node:crypto` — X25519, Ed25519, AES-256-GCM, ChaCha20-Poly1305, HKDF, scrypt, CSPRNG|libsodium, tweetnacl (mostly — see §8) |
-|Local DB          |`node:sqlite` (`DatabaseSync`)                                                       |better-sqlite3, native bindings        |
-|HTTP server/client|`node:http` / `node:https` / `fetch`                                                 |express, axios, undici                 |
-|Tests             |`node:test` + `node:assert`                                                          |jest, vitest, mocha                    |
-|Single binary     |`node --build-sea` (built-in since 25.5)                                             |pkg, nexe; even postject (now optional)|
-|File watch (dev)  |`node --watch`                                                                       |nodemon                                |
+| Need               | Node 26 built-in                                                                      | Removes the need for                    |
+| ------------------ | ------------------------------------------------------------------------------------- | --------------------------------------- |
+| Run TypeScript     | Native **type stripping** (stable since 25.2, default) via Amaro                      | ts-node, tsx, babel (for dev/run)       |
+| Crypto             | `node:crypto` — X25519, Ed25519, AES-256-GCM, ChaCha20-Poly1305, HKDF, scrypt, CSPRNG | libsodium, tweetnacl (mostly — see §8)  |
+| Local DB           | `node:sqlite` (`DatabaseSync`)                                                        | better-sqlite3, native bindings         |
+| HTTP server/client | `node:http` / `node:https` / `fetch`                                                  | express, axios, undici                  |
+| Tests              | `node:test` + `node:assert`                                                           | jest, vitest, mocha                     |
+| Single binary      | `node --build-sea` (built-in since 25.5)                                              | pkg, nexe; even postject (now optional) |
+| File watch (dev)   | `node --watch`                                                                        | nodemon                                 |
 
 Net result: **no runtime dependencies**; build-time deps are just a bundler and the type-checker.
 
@@ -38,7 +38,7 @@ Caveats to respect (documented, not blockers):
 - SEA is **Stability 1.1 (active development)**; pin the exact Node version used to build (the SEA blob must be injected into the same Node version).
 - SEA is CI-tested on **macOS arm64 only** (x64 not currently covered), Windows, and most Linux. **Decision: macOS ships arm64 only** — no x64 macOS build.
 
------
+---
 
 ## 2. Dependency posture
 
@@ -48,7 +48,7 @@ Caveats to respect (documented, not blockers):
   - `typescript` — `tsc --noEmit` for type checking in the editor and CI only.
 - **Password KDF — DECIDED: scrypt (§3.1).** `node:crypto` provides **scrypt** but not Argon2id, so v1 uses `crypto.scryptSync` (memory-hard, native, zero-dep), taking the spec’s documented fallback in place of Argon2id. This keeps the zero-runtime-dependency rule with no WASM asset to bundle. Tune cost parameters (`N`, `r`, `p`) at a documented target and store them in `kdfParams` so they can be raised over time without breaking existing vaults.
 
------
+---
 
 ## 3. Repository layout (monorepo, no workspace tooling required)
 
@@ -82,7 +82,7 @@ vault/
 
 Arg parsing uses `node:util`’s `parseArgs` — no commander/yargs.
 
------
+---
 
 ## 4. `core` — shared library (maps spec → code)
 
@@ -96,22 +96,22 @@ Arg parsing uses `node:util`’s `parseArgs` — no commander/yargs.
 
 `core` imports only `node:*` and is unit-tested in isolation.
 
------
+---
 
 ## 5. `cli` — the device client
 
 Commands (mapping to spec):
 
-|Command                         |Does                                                                                                     |Spec    |
-|--------------------------------|---------------------------------------------------------------------------------------------------------|--------|
-|`vault init`                    |Create a vault + personal keys; bootstrap the auth log                                                   |§5, §8  |
-|`vault auth`                    |Generate this device’s keypair + `deviceId`; print **Token A** QR                                        |§9.2–9.3|
-|`vault device-add`              |Scan Token A; seal vault key to it; sign auth-log entry; print **Token B** QR                            |§9.4–9.6|
-|`vault device-confirm`          |Scan Token B; unseal vault key; validate chain; build local replica                                      |§9.7–9.9|
-|`vault add/get/list/edit/rm`    |Local CRUD → CRDT ops, encrypted under the vault key                                                     |§4, §7.1|
-|`vault sync`                    |Anti-entropy round with the relay (and any direct peers)                                                 |§7.4, §8|
-|`vault rotate` / `device-remove`|Conflict-free epoch rotation; signed removal                                                             |§10.2   |
-|`vault run [.env] -- <cmd>`     |Resolve empty/declared env vars from the vault; inject into the child process env; never persists secrets|new     |
+| Command                          | Does                                                                                                      | Spec     |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------- | -------- |
+| `vault init`                     | Create a vault + personal keys; bootstrap the auth log                                                    | §5, §8   |
+| `vault auth`                     | Generate this device’s keypair + `deviceId`; print **Token A** QR                                         | §9.2–9.3 |
+| `vault device-add`               | Scan Token A; seal vault key to it; sign auth-log entry; print **Token B** QR                             | §9.4–9.6 |
+| `vault device-confirm`           | Scan Token B; unseal vault key; validate chain; build local replica                                       | §9.7–9.9 |
+| `vault add/get/list/edit/rm`     | Local CRUD → CRDT ops, encrypted under the vault key                                                      | §4, §7.1 |
+| `vault sync`                     | Anti-entropy round with the relay (and any direct peers)                                                  | §7.4, §8 |
+| `vault rotate` / `device-remove` | Conflict-free epoch rotation; signed removal                                                              | §10.2    |
+| `vault run [.env] -- <cmd>`      | Resolve empty/declared env vars from the vault; inject into the child process env; never persists secrets | new      |
 
 Local state lives under the OS config dir (`$XDG_CONFIG_HOME` / `~/Library/Application Support`):
 
@@ -122,7 +122,7 @@ QR rendering for Tokens A/B: encode as text and render in-terminal (a tiny self-
 
 ### `vault run` — inject vault secrets into a command (keep `.env` secret-free)
 
-`vault run [.env] -- <cmd> [args…]` turns a `.env` file into a *manifest of required variables* rather than a secret store: variables that are declared but empty are resolved from the local encrypted vault at runtime and injected into the child process’s environment. **Resolved secrets never touch disk**, so the `.env` itself stays safe to commit.
+`vault run [.env] -- <cmd> [args…]` turns a `.env` file into a _manifest of required variables_ rather than a secret store: variables that are declared but empty are resolved from the local encrypted vault at runtime and injected into the child process’s environment. **Resolved secrets never touch disk**, so the `.env` itself stays safe to commit.
 
 **Resolution & precedence** (per variable `KEY`):
 
@@ -143,7 +143,7 @@ Any declared variable left unresolved makes `run` **fail fast before spawning** 
 
 Security exposure of env injection is covered in §11.
 
------
+---
 
 ## 6. `relay` — the always-on hub (§8.2 self-hosted placement)
 
@@ -160,9 +160,9 @@ A dumb store-and-forward replica. **It never holds keys and enforces no content 
   - A Cloudflare Access policy issues **per-device service tokens** at enrollment; revoking a token is the §8.5 fast network cutoff.
 - **Compaction:** periodic CRDT op-log snapshotting so storage stays bounded (low priority — credential write volume is tiny).
 
-The relay can also run on Node behind the Tunnel *or* be swapped for the serverless Worker+DO placement later (§8.2) without changing the wire protocol.
+The relay can also run on Node behind the Tunnel _or_ be swapped for the serverless Worker+DO placement later (§8.2) without changing the wire protocol.
 
------
+---
 
 ## 7. SEA build pipeline (the single-binary CLI)
 
@@ -171,15 +171,15 @@ Three steps, all built-in except the bundle.
 **1. Bundle to one file** (`build/bundle.mjs`):
 
 ```js
-import { build } from 'esbuild';
+import { build } from "esbuild";
 await build({
-  entryPoints: ['cli/main.ts'],
+  entryPoints: ["cli/main.ts"],
   bundle: true,
-  platform: 'node',
-  format: 'cjs',                 // simplest SEA target; ESM also supported via mainFormat:"module"
-  target: 'node26',
-  outfile: 'dist/cli.cjs',
-  external: ['node:*'],          // keep built-ins external
+  platform: "node",
+  format: "cjs", // simplest SEA target; ESM also supported via mainFormat:"module"
+  target: "node26",
+  outfile: "dist/cli.cjs",
+  external: ["node:*"], // keep built-ins external
 });
 ```
 
@@ -212,7 +212,7 @@ codesign --sign - dist/vault               # macOS only; Windows: signtool (opti
 
 Dev loop needs none of this: `node cli/main.ts <cmd>` runs the TypeScript directly via type stripping; `node --watch` for iteration; `node --test` for tests.
 
------
+---
 
 ## 8. Crypto implementation (node:crypto → spec primitives)
 
@@ -239,7 +239,7 @@ unseal(box, myX25519Priv):  # reverse; recompute shared from box.ephPub
 
 No libsodium required. (If a vetted `crypto_box_seal` byte-compatibility is later needed, that’s the only candidate for a single audited dep.)
 
------
+---
 
 ## 9. Storage schema (`node:sqlite`, both CLI and relay)
 
@@ -261,7 +261,7 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v BLOB);   -- vault id, current epoch, acc
 
 Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The relay has no `items`/`grants`/keys.
 
------
+---
 
 ## 10. Testing (`node:test`)
 
@@ -269,10 +269,10 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 - **CRDT convergence:** randomized concurrent edit sequences must converge to one state regardless of apply order (property-style); password multi-value register surfaces divergent edits.
 - **Rotation:** simulate two concurrent admin rotations → assert all nodes converge on the `(hlc, deviceID)` winner; assert the security catch-up fires when a removal isn’t observed (§10.2).
 - **Anti-entropy:** two in-memory stores reconcile to identical op sets in one round; partition then heal.
-- **`vault run`:** a `.env` manifest mixing ambient-set, literal, empty, and `vault://` variables resolves with the correct precedence; the child receives the merged env; an unresolved required var fails *before* spawn; the child’s exit code is propagated; resolved values are never written to disk.
+- **`vault run`:** a `.env` manifest mixing ambient-set, literal, empty, and `vault://` variables resolves with the correct precedence; the child receives the merged env; an unresolved required var fails _before_ spawn; the child’s exit code is propagated; resolved values are never written to disk.
 - **SEA smoke test:** in CI, build the binary per platform and run `vault --version` + an init/add/list cycle against a local relay.
 
------
+---
 
 ## 11. Security checklist & Node-specific caveats
 
@@ -284,11 +284,11 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 - **Stability flags:** SEA (1.1) and `node:sqlite` are still maturing — pin Node’s exact patch version per release and re-run the full test matrix on every Node bump.
 - **Type-stripping discipline:** lint-ban `enum`/`namespace`/decorators so all source stays erasable and runnable without a transform.
 
------
+---
 
 ## 12. Milestones
 
-1. **M1 — `core` + tests.** Crypto, sealed-box, CRDT (with password MV-register), HLC, op-log, store. Pure, zero-dep, fully tested. *(De-risks the hardest parts first.)*
+1. **M1 — `core` + tests.** Crypto, sealed-box, CRDT (with password MV-register), HLC, op-log, store. Pure, zero-dep, fully tested. _(De-risks the hardest parts first.)_
 1. **M2 — local CLI.** `init/auth/add/get/list` plus **`run`** (resolve secrets from the local replica and inject them into a child process) against the local SQLite replica, no networking. Runnable via `node cli/main.ts`.
 1. **M3 — relay + sync.** `node:http` relay, `/sync` + `/push`, `vault sync`. Two CLIs converge through a local relay.
 1. **M4 — enrollment.** `device-add` / `device-confirm` QR handshake; auth-log validation; user-with-device-subkeys.
@@ -297,7 +297,37 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 1. **M7 — Cloudflare deployment.** `cloudflared` tunnel + Access service-token enrollment; relay JWT verification; ops/runbook.
 1. **M8 (optional) — direct fallback path** (§8.6) and/or native UI wrapper.
 
------
+---
+
+## 12a. Native UI wrapper roadmap (M8 — macOS)
+
+The CLI is the portable engine (§0); a native macOS app wraps it by **spawning the
+SEA binary** with the machine-contract flags (no engine fork, preserves zero-dep).
+Sequenced so the testable foundation lands first.
+
+- [x] **Step 1 — machine interface (DONE, in-repo).** `--json` (one structured
+      object per command; `{ok:false,error}` on failure) and `--passphrase-stdin`
+      (secrets cross the process boundary on stdin only — never argv/env). This is
+      the contract any wrapper/automation builds on. Implemented + tested in the CLI.
+- [ ] **Step 2 — `secure-enclave` KeyStore provider (needs a Mac/Xcode).** A small
+      signed Swift helper the CLI spawns, exposing the existing `KeyStore`
+      `available/put/get/del` interface — but backed by a **non-exportable Secure
+      Enclave key** (`kSecAttrTokenIDSecureEnclave`) gated by **Touch ID**
+      (`LAContext`). Slots in beside `macos-keychain`/`windows-dpapi`; biggest
+      threat-model upgrade (no passphrase to keylog; key never leaves hardware).
+      _Cannot be built/tested in the Linux sandbox._
+- [ ] **Step 3 — SwiftUI app (needs a Mac/Xcode).** Spawns
+      `dist/vault --json --passphrase-stdin`; item list/edit, Touch-ID unlock (via the
+      Step-2 shim), **QR rendering + camera scan** for the §9 enrollment tokens, sync
+      status. App-layer concerns that belong here, not in the CLI: call
+      `EnableSecureEventInput()` (Secure Keyboard Entry, §11 passphrase-entry note);
+      codesign + **notarization** + hardened-runtime/camera entitlements; arm64-only.
+
+Constraints: the Swift app + Enclave shim are separately-built/-signed artifacts
+(not npm deps, so `check:deps` stays green); secret handling must stay on stdin;
+neither protects against a compromised-while-unlocked host (threat model).
+
+---
 
 ## 13. Decisions & open items specific to this stack
 
@@ -310,6 +340,6 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 ### Still open
 
 - **SEA module format** — CommonJS (simplest) vs ESM (`mainFormat:"module"`); CJS recommended for v1.
-- **Relay placement** — self-hosted Node behind Tunnel (this plan) vs Worker+DO; protocol is identical, so deferrable.
+- **Relay placement** — RESOLVED: **both** shipped off one `relay/handler.ts` (self-hosted Node behind Tunnel _and_ Worker+Durable-Object); identical protocol, pick per deployment (see `relay/deploy/README.md`). The Worker reuses `core`/`relay/access` `node:crypto` via `nodejs_compat` (only `node:crypto` is pulled into the edge bundle; never `node:http`/`node:sqlite`).
 - **Direct fallback path (§8.6)** — ship in v1 or defer past it.
 - **Verify on the pinned Node 26 patch** — re-confirm SEA flags, `node:sqlite`, and type-stripping limits against the exact version used (these are actively evolving; see `spec.md` §13).

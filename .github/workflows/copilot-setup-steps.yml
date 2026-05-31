@@ -1,0 +1,45 @@
+# Pre-provisions the ephemeral environment the GitHub coding agent runs in.
+# The job MUST be named `copilot-setup-steps` for the agent to pick it up; its
+# steps run before the agent starts so tooling is ready offline.
+#
+# Platform baseline is Node 26 (plan §1): native type stripping is the default,
+# node:sqlite is stable, and `node --build-sea` is built in — so the vault
+# sources run and the single-file binary builds with no experimental flags.
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 26 (plan baseline)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "26.x"
+          cache: npm
+
+      - name: Install build-time tooling (no runtime deps)
+        run: npm ci
+
+      - name: Sanity-check the toolchain
+        run: |
+          node --version
+          # Type stripping is default on Node 26 — runs TS with no flags.
+          node cli/main.ts --version
+          # node:sqlite is stable on Node 26.
+          node -e "const {DatabaseSync}=require('node:sqlite'); new DatabaseSync(':memory:'); console.log('node:sqlite ok')"
+          # SEA is built in on Node 26.
+          node --help | grep -q -- '--build-sea' && echo 'build-sea available'
+          npm run check:deps

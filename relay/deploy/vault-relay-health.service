@@ -1,0 +1,19 @@
+# Optional, dependency-free liveness probe (alternative to Type=notify watchdog).
+# Curls the relay's /health; on failure, restarts vault-relay. Pair with
+# vault-relay-health.timer. Use this if you'd rather not rely on systemd-notify
+# (e.g. the helper isn't available) — it catches hangs the crash-only
+# Restart=on-failure misses.
+#
+# Install both files in /etc/systemd/system/ then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vault-relay-health.timer
+
+[Unit]
+Description=Vault relay health probe
+After=vault-relay.service
+
+[Service]
+Type=oneshot
+# --fail makes curl exit non-zero on HTTP >= 400; -m caps the request so a hung
+# relay fails the probe instead of blocking. Restart the relay on failure.
+ExecStart=/bin/sh -c 'curl -fsS -m 5 http://127.0.0.1:${PORT:-8731}/health >/dev/null || systemctl restart vault-relay'
+Environment=PORT=8731

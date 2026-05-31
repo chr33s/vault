@@ -1,0 +1,63 @@
+# systemd unit for the always-on vault relay (plan §6, §7).
+# Install: /etc/systemd/system/vault-relay.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vault-relay
+#
+# The relay is zero-knowledge: it stores opaque ops only. Even so, run it
+# unprivileged and locked down — it is internet-reachable via the Tunnel.
+
+[Unit]
+Description=Vault zero-knowledge sync relay
+After=network-online.target
+Wants=network-online.target
+# Stop restarting after too many rapid failures (see StartLimitBurst below);
+# `systemctl reset-failed vault-relay` clears the counter.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# notify: the relay calls `systemd-notify READY=1` once listening, and pings the
+# watchdog on a timer (both no-ops if NOTIFY_SOCKET is unset). Requires the
+# `systemd-notify` helper (ships with systemd) on PATH.
+Type=notify
+NotifyAccess=main
+User=vault
+Group=vault
+WorkingDirectory=/opt/vault
+# Node 26 baseline (plan §1): type stripping runs the TS source with no flags.
+# Pin the exact Node version used for releases (plan §11).
+ExecStart=/usr/bin/node /opt/vault/relay/main.ts
+Restart=on-failure
+RestartSec=2
+
+# Liveness watchdog: if the event loop stalls (a hang, not a crash), the relay
+# stops pinging and systemd kills + restarts it. on-watchdog covers that path.
+WatchdogSec=30
+# Also restart on a watchdog timeout, not just non-zero exit.
+# (Restart=on-failure already includes WATCHDOG; kept explicit for clarity.)
+
+# Recycle the process if a leak pushes memory past the ceiling rather than
+# degrading the host. Tune to your box; credential volume is tiny.
+MemoryMax=256M
+MemoryHigh=192M
+
+# Per-device service tokens (the §8.3 network gate). Comma-separated; rotate to
+# revoke a device's network reachability (§8.5).
+Environment=PORT=8731
+Environment=RELAY_DB=/var/lib/vault/relay.db
+# Environment=VAULT_RELAY_TOKENS=tokenA,tokenB
+# Cloudflare Access JWT verification (defense in depth):
+# Environment=CF_ACCESS_TEAM_DOMAIN=myteam.cloudflareaccess.com
+# Environment=CF_ACCESS_AUD=<application-audience-tag>
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/vault
+StateDirectory=vault
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

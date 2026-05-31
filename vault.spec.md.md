@@ -4,7 +4,7 @@
 
 This document consolidates the design decisions for a native Swift (macOS) credential vault that synchronizes encrypted credentials across devices and between people. It covers the cryptographic core, data model, three candidate sync architectures, device enrollment, and a coordinator-free key-rotation scheme.
 
------
+---
 
 ## Table of Contents
 
@@ -22,7 +22,7 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 1. [Architecture Comparison](#12-architecture-comparison)
 1. [Decisions and Verification Notes](#13-decisions-and-verification-notes)
 
------
+---
 
 ## 1. Goals and Non-Goals
 
@@ -40,7 +40,7 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 - Hiding the existence/among-membership graph from infrastructure operators (see §2).
 - Rolling custom cryptographic primitives. Use audited libraries only.
 
------
+---
 
 ## 2. Threat Model and Security Properties
 
@@ -58,9 +58,9 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 
 ### Key principle
 
-**Read confidentiality is enforced by cryptography; write/role/invite policy is enforced by an authority layer** (a server in Architecture A, a signed replicated auth log in Architectures B and C). Anyone holding a vault key can technically craft valid ciphertext, so write permissions are *policy*, not a cryptographic guarantee — except in the decentralized models, where signed ops + auth-log validation make write authority cryptographically checkable.
+**Read confidentiality is enforced by cryptography; write/role/invite policy is enforced by an authority layer** (a server in Architecture A, a signed replicated auth log in Architectures B and C). Anyone holding a vault key can technically craft valid ciphertext, so write permissions are _policy_, not a cryptographic guarantee — except in the decentralized models, where signed ops + auth-log validation make write authority cryptographically checkable.
 
------
+---
 
 ## 3. Cryptographic Design
 
@@ -68,7 +68,7 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 
 1. **Account key** — derived from the master password via **Argon2id** (memory-hard; not in CryptoKit, so via libsodium/swift-sodium; PBKDF2 via CommonCrypto is the weaker fallback). Wraps only the user’s private identity keys.
 1. **User private keys** — an **X25519** key (key agreement / sealing) and an **Ed25519** key (signing). Stored as ciphertext under the account key; synced to the user’s devices in that wrapped form.
-1. **Vault keys** — one symmetric key per vault, delivered to each member as a *grant*: the vault key sealed to the member’s X25519 public key.
+1. **Vault keys** — one symmetric key per vault, delivered to each member as a _grant_: the vault key sealed to the member’s X25519 public key.
 
 This indirection lets a user change their master password by re-wrapping their private keys, without re-encrypting any vault.
 
@@ -95,7 +95,7 @@ Storing a single hash that both authenticates and encrypts is a design failure: 
 - Items stored as ciphertext locally as well.
 - Use the macOS **Keychain** + **Secure Enclave** for biometric-gated unlock material; do not place the whole vault in the system Keychain.
 
------
+---
 
 ## 4. Data Model and Schema
 
@@ -181,7 +181,7 @@ ItemPayload { title, username, password, url, notes, totpSecret,
 - **Moving an item between vaults is a re-encryption**, not a metadata change (different vault keys).
 - **The infrastructure cannot re-encrypt or rotate** — it has no keys; a client performs it.
 
------
+---
 
 ## 5. Identity and Access Control
 
@@ -194,7 +194,7 @@ ItemPayload { title, username, password, url, notes, totpSecret,
 
 In a team product, “forgot master password = data loss” is usually unacceptable. Admin-assisted recovery requires **escrow**: an org keypair, with each member’s recovery key sealed to `orgPublicKey` (the `RecoveryGrant` record). The tradeoff is explicit: escrow means the org **can** reconstruct a member’s keys and therefore **can** access their data — which contradicts a naive “zero-knowledge, no one can ever see anything” claim. Offer it as a per-org policy toggle.
 
------
+---
 
 ## 6. Architecture A — Centralized (Cloudflare)
 
@@ -233,7 +233,7 @@ The sync intermediary stores only ciphertext and enforces policy (roles, write/i
 
 Interrupted rotation is safe — the DO only flips at the atomic commit. For large vaults, stage re-encrypted blobs first (R2 / staging table) and keep the commit transaction to a pointer swap.
 
------
+---
 
 ## 7. Architecture B — Decentralized (Local-First + Tailnet)
 
@@ -276,7 +276,7 @@ Only tagged vault nodes can reach the sync port. The service additionally re-che
 
 Run any node 24/7 (home server / small VM) as an always-reachable replica. It is just another tailnet node holding ciphertext — no special role, no relay infrastructure to design.
 
------
+---
 
 ## 8. Architecture C — Hybrid (Local-First + Cloudflare Relay)
 
@@ -297,7 +297,7 @@ Run any node 24/7 (home server / small VM) as an always-reachable replica. It is
 ### 8.3 Access control — network gate + crypto authority
 
 - Front the hub with **Cloudflare Access**, using per-device service tokens or mTLS client certs issued at enrollment. This is the network-layer gate, the analog of `tag:credvault` on the tailnet.
-- The signed auth log remains the authority for *what a device may do*. Two cleanly separated layers: Cloudflare gates reachability and sees metadata; the crypto gates confidentiality and write authority.
+- The signed auth log remains the authority for _what a device may do_. Two cleanly separated layers: Cloudflare gates reachability and sees metadata; the crypto gates confidentiality and write authority.
 
 ### 8.4 Untrusted-relay security analysis
 
@@ -320,7 +320,7 @@ Revoke the device’s Cloudflare Access service token or client cert for an inst
 
 Keep B’s direct path (LAN discovery or the tailnet) alive alongside the hub. The hub gives universal reachability and 24/7 availability; the direct path means a down, throttled, or eclipsing hub can never fully isolate two devices that can see each other. Same op-log, two transports, with the hub as one (very reliable) replica among peers. “Cloudflare is down” then degrades to “sync only when devices meet directly,” rather than “no sync.”
 
------
+---
 
 ## 9. Device Enrollment (CLI + QR)
 
@@ -336,7 +336,7 @@ A two-way out-of-band handshake that doubles as public-key trust establishment.
 1. New device persists the vault key (Keychain / Secure Enclave), builds its local SQLite replica.
 1. It connects to peers and runs anti-entropy to pull the encrypted history.
 1. The signed auth-log entry gossips out; honest peers now accept the device.
-1. *(Optional)* Both screens show a matching short authentication string (mutual verification).
+1. _(Optional)_ Both screens show a matching short authentication string (mutual verification).
 
 ### Token contents
 
@@ -347,13 +347,13 @@ A two-way out-of-band handshake that doubles as public-key trust establishment.
 
 - **The in-person QR is the trust anchor** that replaces the missing key-distribution authority — it’s the fingerprint-verification step baked into the UX, defeating MITM on public keys.
 - **Implicit proof-of-possession:** only the holder of the matching private key can unseal Token B.
-- In the tailnet model, Tailscale device authorization can act as a **second enrollment factor** (admit to tailnet *and* complete pairing). In Architecture C, issuing the Cloudflare Access token/cert plays the same second-factor role.
+- In the tailnet model, Tailscale device authorization can act as a **second enrollment factor** (admit to tailnet _and_ complete pairing). In Architecture C, issuing the Cloudflare Access token/cert plays the same second-factor role.
 
 ### Identity layering (DECIDED: user-with-device-subkeys)
 
-A **user identity key signs subordinate device subkeys**; the auth log lists *people*, each carrying a device set. The vault key is sealed to a device subkey during enrollment, while membership and grants are tracked per user. Revocation granularity follows directly: losing a laptop revokes a single device subkey, whereas removing a person revokes their whole device set in one signed entry. (The alternative — device-as-identity, where the log lists devices directly — is simpler but loses the person-level grouping; rejected for team use.)
+A **user identity key signs subordinate device subkeys**; the auth log lists _people_, each carrying a device set. The vault key is sealed to a device subkey during enrollment, while membership and grants are tracked per user. Revocation granularity follows directly: losing a laptop revokes a single device subkey, whereas removing a person revokes their whole device set in one signed entry. (The alternative — device-as-identity, where the log lists devices directly — is simpler but loses the person-level grouping; rejected for team use.)
 
------
+---
 
 ## 10. Key Rotation and Revocation
 
@@ -406,13 +406,13 @@ if activeKeyCommit != W.keyCommit:
 
 Membership intent is never lost — it lives in the CRDT log, separate from the abandoned key bundle.
 
-**Security catch-up.** Convergence guarantees consistency, but a removal’s *security* requires a rotation that **causally follows** it. If the winning rotation `W` did not observe some removal (the removed member may have unsealed the new key during the race), any admin issues one more rotation that observes it. That catch-up is conflict-free by the same scheme, sits at a higher epoch (supersedes unconditionally), and necessarily observes the removal — as would any concurrent competitor. It terminates: finitely many removals → finitely many catch-ups. In the common case (one admin removes + rotates atomically), there is nothing to catch up; the path only covers concurrent admins.
+**Security catch-up.** Convergence guarantees consistency, but a removal’s _security_ requires a rotation that **causally follows** it. If the winning rotation `W` did not observe some removal (the removed member may have unsealed the new key during the race), any admin issues one more rotation that observes it. That catch-up is conflict-free by the same scheme, sits at a higher epoch (supersedes unconditionally), and necessarily observes the removal — as would any concurrent competitor. It terminates: finitely many removals → finitely many catch-ups. In the common case (one admin removes + rotates atomically), there is nothing to catch up; the path only covers concurrent admins.
 
 ### 10.3 Fast network revocation (B and C)
 
-Stripping `tag:credvault` / removing the device from the tailnet (B), or revoking its Cloudflare Access token/cert (C), cuts network reachability near-instantly via the control plane — closing the *new-data* exposure window before crypto rotation finishes propagating. The network gate handles “can’t reach”; rotation handles “couldn’t read even if it did.”
+Stripping `tag:credvault` / removing the device from the tailnet (B), or revoking its Cloudflare Access token/cert (C), cuts network reachability near-instantly via the control plane — closing the _new-data_ exposure window before crypto rotation finishes propagating. The network gate handles “can’t reach”; rotation handles “couldn’t read even if it did.”
 
------
+---
 
 ## 11. Coordination Model
 
@@ -424,37 +424,37 @@ Stripping `tag:credvault` / removing the device from the tailnet (B), or revokin
 - **Rotation:** conflict-free epochs (§10.2) avoid election entirely; a self-expiring **lease** is the lighter alternative if explicit serialization is wanted. Full Raft/Paxos is feasible but a poor fit — consensus needs a quorum online, which intermittently-connected personal devices rarely have. Architecture C’s always-on hub gives that optional lease a naturally reachable home, but correctness still rests on the conflict-free epochs.
 - **The one genuinely central piece:** in B, Tailscale’s control plane (device auth + ACL push); in C, the Cloudflare edge / Access gate. Each gates access and sees metadata but never vault-content confidentiality. The tailnet piece can be **self-hosted (Headscale)**; the Cloudflare piece is Cloudflare-operated. Full elimination means returning to DHT/mDNS discovery — reopening the complexity these models removed — so keep a direct fallback path (§8.6) to avoid a single point of failure for sync.
 
------
+---
 
 ## 12. Architecture Comparison
 
-|Dimension           |A: Cloudflare (centralized)             |B: Local-first + Tailnet                        |C: Local-first + Cloudflare relay                   |
-|--------------------|----------------------------------------|------------------------------------------------|----------------------------------------------------|
-|Confidentiality     |Ciphertext-only at server               |Ciphertext-only at every relay                  |Ciphertext-only at the relay                        |
-|Write authority     |Server-enforced policy                  |Cryptographically enforced (signed ops)         |Cryptographically enforced (signed ops)             |
-|Consistency         |Strong per vault (DO serializes)        |Eventual (CRDT)                                 |Eventual (CRDT)                                     |
-|Conflict handling   |Optimistic concurrency + atomic rotation|CRDT merge + conflict-free epochs               |CRDT merge + conflict-free epochs                   |
-|Revocation speed    |Immediate server-side                   |Fast network cutoff (tailnet) + rotation gossip |Fast network cutoff (Access token) + rotation gossip|
-|Availability        |High (managed)                          |Depends on peers; mitigate with always-on node  |High (always-on hub)                                |
-|Offline             |Limited                                 |First-class                                     |First-class                                         |
-|Restrictive networks|Works (HTTPS)                           |Often blocked (WireGuard UDP)                   |Works (outbound 443)                                |
-|Metadata exposure   |Cloudflare sees `plain` fields          |Tailscale control plane sees device graph       |Cloudflare edge sees identity, op sizes, timing     |
-|Operational burden  |Low (serverless)                        |Higher (CRDT, enrollment), simplified by tailnet|Higher (CRDT, enrollment) + relay to run/pay        |
-|Trust               |Trust server for policy/availability    |Trustless data; control plane for access only   |Trustless data; relay for availability/access only  |
+| Dimension            | A: Cloudflare (centralized)              | B: Local-first + Tailnet                         | C: Local-first + Cloudflare relay                    |
+| -------------------- | ---------------------------------------- | ------------------------------------------------ | ---------------------------------------------------- |
+| Confidentiality      | Ciphertext-only at server                | Ciphertext-only at every relay                   | Ciphertext-only at the relay                         |
+| Write authority      | Server-enforced policy                   | Cryptographically enforced (signed ops)          | Cryptographically enforced (signed ops)              |
+| Consistency          | Strong per vault (DO serializes)         | Eventual (CRDT)                                  | Eventual (CRDT)                                      |
+| Conflict handling    | Optimistic concurrency + atomic rotation | CRDT merge + conflict-free epochs                | CRDT merge + conflict-free epochs                    |
+| Revocation speed     | Immediate server-side                    | Fast network cutoff (tailnet) + rotation gossip  | Fast network cutoff (Access token) + rotation gossip |
+| Availability         | High (managed)                           | Depends on peers; mitigate with always-on node   | High (always-on hub)                                 |
+| Offline              | Limited                                  | First-class                                      | First-class                                          |
+| Restrictive networks | Works (HTTPS)                            | Often blocked (WireGuard UDP)                    | Works (outbound 443)                                 |
+| Metadata exposure    | Cloudflare sees `plain` fields           | Tailscale control plane sees device graph        | Cloudflare edge sees identity, op sizes, timing      |
+| Operational burden   | Low (serverless)                         | Higher (CRDT, enrollment), simplified by tailnet | Higher (CRDT, enrollment) + relay to run/pay         |
+| Trust                | Trust server for policy/availability     | Trustless data; control plane for access only    | Trustless data; relay for availability/access only   |
 
------
+---
 
 ## 13. Decisions and Verification Notes
 
 ### Resolved
 
-- **Identity unit — DECIDED: user-with-device-subkeys** (§9). A user identity key signs subordinate device keys; the auth log lists *people*, each carrying a device set. Revocation is granular: losing a laptop revokes one device subkey; removing a person revokes their whole device set in a single signed entry. Implication: enrollment seals the vault key to a *device* subkey, but membership and grants are tracked per *user*, and the QR handshake additionally binds the new device subkey under the user’s signing key.
-- **Recovery escrow — DECIDED: offer admin-assisted recovery** (§5). Each member’s recovery key is sealed to `orgPublicKey` (`RecoveryGrant`); owners holding the org private key can reconstruct a locked-out member. The tradeoff is accepted and must be stated to users explicitly: the org *can* therefore access member data, so this is zero-knowledge **against the infrastructure**, not against an org-level recovery authority. Gate it behind a visible per-org policy flag and emit an audit-logged event on every reset.
+- **Identity unit — DECIDED: user-with-device-subkeys** (§9). A user identity key signs subordinate device keys; the auth log lists _people_, each carrying a device set. Revocation is granular: losing a laptop revokes one device subkey; removing a person revokes their whole device set in a single signed entry. Implication: enrollment seals the vault key to a _device_ subkey, but membership and grants are tracked per _user_, and the QR handshake additionally binds the new device subkey under the user’s signing key.
+- **Recovery escrow — DECIDED: offer admin-assisted recovery** (§5). Each member’s recovery key is sealed to `orgPublicKey` (`RecoveryGrant`); owners holding the org private key can reconstruct a locked-out member. The tradeoff is accepted and must be stated to users explicitly: the org _can_ therefore access member data, so this is zero-knowledge **against the infrastructure**, not against an org-level recovery authority. Gate it behind a visible per-org policy flag and emit an audit-logged event on every reset.
 
 ### Recommended
 
-- **CRDT granularity — RECOMMEND: field-level LWW** (merge after decrypt) (§7.1). The architecture already merges on-device after decryption — the sync layer only moves opaque blobs and never merges — so the “needs keys to merge” cost of field-level is *already paid*, and the key-free-merge advantage of whole-item LWW is therefore moot. Field-level prevents silent loss when two devices edit *different* fields of one item concurrently; for credentials, silently dropping a freshly-rotated password would be severe, and the extra op/metadata cost is negligible at vault edit volumes. **Refinement:** keep ordinary fields as single-value LWW registers, but model the **password field as a multi-value register** so concurrent *divergent* edits surface for the user to resolve rather than being silently overwritten.
-- **Rotation serialization — RECOMMEND: conflict-free epochs as the correctness mechanism** (§10.2). The system is eventually-consistent and partition-tolerant, and a lease cannot provide true mutual exclusion across partitions — two admins offline from each other can each believe they hold the lease — so conflict-free resolution is required as a fallback regardless, making the lease redundant *as a correctness device*. A self-expiring lease may be layered purely as a **best-effort optimization** to avoid duplicate re-encryption when connectivity is good (e.g., all nodes currently on the tailnet, or reachable via the Architecture C hub), but it must never be relied on for correctness; the conflict-free epoch resolution always governs.
+- **CRDT granularity — RECOMMEND: field-level LWW** (merge after decrypt) (§7.1). The architecture already merges on-device after decryption — the sync layer only moves opaque blobs and never merges — so the “needs keys to merge” cost of field-level is _already paid_, and the key-free-merge advantage of whole-item LWW is therefore moot. Field-level prevents silent loss when two devices edit _different_ fields of one item concurrently; for credentials, silently dropping a freshly-rotated password would be severe, and the extra op/metadata cost is negligible at vault edit volumes. **Refinement:** keep ordinary fields as single-value LWW registers, but model the **password field as a multi-value register** so concurrent _divergent_ edits surface for the user to resolve rather than being silently overwritten.
+- **Rotation serialization — RECOMMEND: conflict-free epochs as the correctness mechanism** (§10.2). The system is eventually-consistent and partition-tolerant, and a lease cannot provide true mutual exclusion across partitions — two admins offline from each other can each believe they hold the lease — so conflict-free resolution is required as a fallback regardless, making the lease redundant _as a correctness device_. A self-expiring lease may be layered purely as a **best-effort optimization** to avoid duplicate re-encryption when connectivity is good (e.g., all nodes currently on the tailnet, or reachable via the Architecture C hub), but it must never be relied on for correctness; the conflict-free epoch resolution always governs.
 
 ### Still open / verification
 

@@ -1,0 +1,11 @@
+# Runs the /health probe every 30s (see vault-relay-health.service).
+[Unit]
+Description=Run the vault relay health probe periodically
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

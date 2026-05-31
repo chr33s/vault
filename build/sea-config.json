@@ -1,0 +1,7 @@
+{
+	"main": "dist/cli.cjs",
+	"output": "dist/vault",
+	"disableExperimentalSEAWarning": true,
+	"useCodeCache": false,
+	"useSnapshot": false
+}
