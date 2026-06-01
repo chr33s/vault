@@ -47,7 +47,7 @@ const authHeaders = (auth: RelayAuth): Record<string, string> => {
 // are still closing (the latter aborts on Windows). A plain request with the
 // default agent closes its socket after the response, letting the process exit
 // cleanly on its own.
-const post = <T>(url: string, body: unknown, auth: RelayAuth): Promise<T> =>
+const post = <T>(url: string, body: unknown, auth: RelayAuth, timeoutMs?: number): Promise<T> =>
 	new Promise<T>((resolve, reject) => {
 		const u = new URL(url);
 		const data = Buffer.from(JSON.stringify(body), "utf8");
@@ -81,6 +81,13 @@ const post = <T>(url: string, body: unknown, auth: RelayAuth): Promise<T> =>
 			},
 		);
 		req.on("error", reject);
+		// Bound the wait so an unreachable/half-open peer (the §8.6 direct path hits
+		// many candidate addresses) can't stall the whole sync. The hub path leaves
+		// this unset, preserving its prior behavior.
+		if (timeoutMs)
+			req.setTimeout(timeoutMs, () =>
+				req.destroy(new Error(`request timed out after ${timeoutMs}ms`)),
+			);
 		req.end(data);
 	});
 
@@ -103,6 +110,7 @@ export const syncWithRelay = async (
 	s: Session,
 	relayUrl: string,
 	auth: RelayAuth = {},
+	opts: { timeoutMs?: number } = {},
 ): Promise<SyncStats> => {
 	const base = relayUrl.replace(/\/$/, "");
 	const localVector: VersionVector = s.store.versionVector();
@@ -117,6 +125,7 @@ export const syncWithRelay = async (
 			rotationIds: localRotationIds(s),
 		},
 		auth,
+		opts.timeoutMs,
 	);
 	const pulled = s.store.putOps(resp.ops);
 	const { authImported, rotationsImported } = importAuthAndRotations(
@@ -139,6 +148,7 @@ export const syncWithRelay = async (
 			grants: s.store.allGrants(s.vaultId),
 		},
 		auth,
+		opts.timeoutMs,
 	);
 
 	// Rebuild the materialized replica; contribute a recovery grant if escrow is

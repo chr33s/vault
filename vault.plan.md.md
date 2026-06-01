@@ -279,7 +279,7 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 - **KNOWN ISSUE — no reliable key-memory zeroing in JS/V8.** Key material cannot be guaranteed wiped from memory on this stack; this is a tracked, **accepted known issue**, not a defect to be fixed. Mitigate by minimizing key lifetime, never logging secrets, and preferring `KeyObject`s (which hold key bytes in C++ land, not JS strings). Call it out explicitly in the security review and release notes.
 - **At-rest keys:** private keys stored only as `encryptedPrivKeys` (sealed under the account key). v1 unlock = passphrase; OS-keychain/biometric unlock deferred to a native wrapper.
 - **Binary integrity:** sign every released SEA binary (`codesign` on macOS; Authenticode on Windows). Publish checksums.
-- **Relay trust:** per §8.4 the relay is untrusted — signatures + version vectors + order-independent CRDT mean it can delay but not forge/read/corrupt. Keep a direct fallback path (§8.6) to prevent eclipse, even if deferred past v1.
+- **Relay trust:** per §8.4 the relay is untrusted — signatures + version vectors + order-independent CRDT mean it can delay but not forge/read/corrupt. The direct fallback path (§8.6, tailnet variant) is shipped (`vault serve` + `vault sync --tailnet`) so the hub can't eclipse two reachable devices.
 - **Env-var injection exposure (`vault run`).** Injected secrets are visible to the spawned process, its descendant processes, and same-user process introspection (e.g. `/proc/<pid>/environ`), and can surface in crash dumps. This is the inherent tradeoff of env injection — accepted because it keeps real secrets out of on-disk `.env` files. `vault run` never persists or logs resolved values; output masking (requires piping stdio rather than inheriting) and a per-access audit entry are candidate hardening steps.
 - **Stability flags:** SEA (1.1) and `node:sqlite` are still maturing — pin Node’s exact patch version per release and re-run the full test matrix on every Node bump.
 - **Type-stripping discipline:** lint-ban `enum`/`namespace`/decorators so all source stays erasable and runnable without a transform.
@@ -295,7 +295,7 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 1. **M5 — rotation/revocation.** Conflict-free epochs + catch-up; `device-remove`.
 1. **M6 — SEA packaging.** `--build-sea` pipeline + signing + CI matrix; release artifacts.
 1. **M7 — Cloudflare deployment.** `cloudflared` tunnel + Access service-token enrollment; relay JWT verification; ops/runbook.
-1. **M8 (optional) — direct fallback path** (§8.6) and/or native UI wrapper.
+1. **M8 — direct fallback path** (§8.6, tailnet variant: `vault serve` + `vault sync --tailnet`) **and** native UI wrapper. _(Both shipped.)_
 
 ---
 
@@ -336,10 +336,10 @@ neither protects against a compromised-while-unlocked host (threat model).
 - **Password KDF: scrypt** (§2, §8) — native `node:crypto` scrypt; no Argon2id, no WASM asset in v1.
 - **macOS: arm64 only** (§1, §7) — no x64 macOS build.
 - **Key-memory zeroing: accepted KNOWN ISSUE** (§11) — not fixable on the Node/V8 stack; mitigated, documented, and surfaced in the security review.
+- **Relay placement** — **both** shipped off one `relay/handler.ts` (self-hosted Node behind Tunnel _and_ Worker+Durable-Object); identical protocol, pick per deployment (see `relay/deploy/README.md`). The Worker reuses `core`/`relay/access` `node:crypto` via `nodejs_compat` (only `node:crypto` is pulled into the edge bundle; never `node:http`/`node:sqlite`).
+- **Direct fallback path (§8.6)** — shipped as the **tailnet** variant. `vault serve` runs a keyless store-and-forward replica peer (works while locked) and `vault sync --tailnet[-only]` reconciles the same op-log over Tailscale, reusing `relay/handler.ts` (a peer is just another relay endpoint). Tailscale is the user's own OS install — shelled out to, not bundled, not an npm dep, so `check:deps` stays green. Pure-LAN/mDNS discovery not built.
 
 ### Still open
 
 - **SEA module format** — CommonJS (simplest) vs ESM (`mainFormat:"module"`); CJS recommended for v1.
-- **Relay placement** — RESOLVED: **both** shipped off one `relay/handler.ts` (self-hosted Node behind Tunnel _and_ Worker+Durable-Object); identical protocol, pick per deployment (see `relay/deploy/README.md`). The Worker reuses `core`/`relay/access` `node:crypto` via `nodejs_compat` (only `node:crypto` is pulled into the edge bundle; never `node:http`/`node:sqlite`).
-- **Direct fallback path (§8.6)** — ship in v1 or defer past it.
 - **Verify on the pinned Node 26 patch** — re-confirm SEA flags, `node:sqlite`, and type-stripping limits against the exact version used (these are actively evolving; see `spec.md` §13).

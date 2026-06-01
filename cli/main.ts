@@ -39,9 +39,11 @@ import {
 import { defaultKeyStore, keyStoreByName, type KeyStore } from "./keystore.ts";
 import { setJsonOutput, emit, emitError } from "./output.ts";
 import { dbPath, listVaultNames, DEFAULT_VAULT } from "./paths.ts";
+import { createPeerServer } from "./peerserver.ts";
 import { readPassphrase, setPassphraseSource, closePassphraseSource } from "./prompt.ts";
 import { syncWithRelay, type RelayAuth } from "./relayclient.ts";
 import { run as runCmd } from "./run.ts";
+import { syncTailnet, tailscaleStatus, DEFAULT_PEER_PORT } from "./tailnet.ts";
 
 const VERSION = "0.1.0";
 
@@ -59,12 +61,28 @@ Vault & items
 
 Sync
   sync --relay <url> [--relay-token <t>] [--access-id <id> --access-secret <s>]
+       [--tailnet] [--tailnet-only] [--port <n>] [--peer-token <t>]
                                Anti-entropy round with the relay. --relay-token is
                                the app-layer token; --access-id/--access-secret is
                                a Cloudflare Access service token (needed when an
                                Access app fronts the relay). Env fallbacks:
                                VAULT_RELAY_TOKEN, CF_ACCESS_CLIENT_ID,
                                CF_ACCESS_CLIENT_SECRET.
+                               --tailnet also reconciles directly with online
+                               Tailscale peers running 'vault serve' (§8.6 direct
+                               fallback); --tailnet-only skips the hub (e.g. it's
+                               down). --peer-token gates the peer servers (env:
+                               VAULT_PEER_TOKEN); --port sets the peer port (env:
+                               VAULT_PEER_PORT, default ${DEFAULT_PEER_PORT}).
+                               Env: VAULT_TAILNET=1 enables the tailnet leg.
+  serve [--host <ip>] [--port <n>] [--peer-token <t>]
+                               Run an always-on replica peer for the direct tailnet
+                               path (§8.6): serve this device's op-log to tailnet
+                               peers so they can sync when the hub is unreachable.
+                               No passphrase — holds no keys, runs while locked.
+                               Binds to this device's Tailscale IP by default
+                               (--host overrides). Without --peer-token it is open
+                               to the whole tailnet.
 
 Devices (token handshake)
   auth                         New device: generate keys, print Token A
@@ -207,6 +225,11 @@ const main = async (): Promise<number> => {
 			password: { type: "boolean" },
 			name: { type: "string" },
 			relay: { type: "string" },
+			tailnet: { type: "boolean" }, // sync: also reconcile with direct tailnet peers
+			"tailnet-only": { type: "boolean" }, // sync: skip the hub (e.g. hub is down)
+			host: { type: "string" }, // serve: bind address (default: this device's tailnet IP)
+			port: { type: "string" }, // serve/sync: peer-server port
+			"peer-token": { type: "string" }, // serve/sync: shared token gating the peer server
 			token: { type: "string" },
 			"token-file": { type: "string" },
 			"relay-token": { type: "string" },
@@ -321,14 +344,20 @@ const main = async (): Promise<number> => {
 
 		case "sync":
 			await withSession(values, async (s) => {
+				// Two transports for the one op-log (spec §8.6): the always-on Cloudflare
+				// hub (primary) and the direct tailnet path (fallback). --tailnet adds the
+				// peers alongside the hub; --tailnet-only skips the hub (e.g. it's down).
+				const tailnetOnly = !!values["tailnet-only"];
+				const useTailnet = tailnetOnly || !!values.tailnet || process.env.VAULT_TAILNET === "1";
+
 				// Fall back to the relay coordinates saved at enrollment (Token B / Join
 				// Token). Explicit flags/env override the saved URL and each credential.
 				const saved = savedRelay(s.store);
 				const relay = (values.relay as string | undefined) ?? saved?.url;
-				if (!relay)
+				if (!relay && !useTailnet)
 					throw new Error(
-						"usage: vault sync --relay <url> [--relay-token <t>] [--access-id <id> --access-secret <s>]\n" +
-							"(no relay saved from enrollment; pass --relay)",
+						"usage: vault sync --relay <url> [--relay-token <t>] [--access-id <id> --access-secret <s>] [--tailnet]\n" +
+							"(no relay saved from enrollment; pass --relay or --tailnet)",
 					);
 				const flags = relayAuth(values);
 				const auth = {
@@ -336,13 +365,103 @@ const main = async (): Promise<number> => {
 					accessId: flags.accessId ?? saved?.accessId,
 					accessSecret: flags.accessSecret ?? saved?.accessSecret,
 				};
-				const stats = await syncWithRelay(s, relay, auth);
+
+				let pulled = 0;
+				let pushed = 0;
+				const notes: string[] = [];
+
+				// Hub leg (unless tailnet-only). A hub failure is fatal only when the
+				// tailnet fallback isn't also running — otherwise it's the very outage
+				// §8.6 exists to ride out, so we note it and continue to the peers.
+				if (!tailnetOnly && relay) {
+					try {
+						const stats = await syncWithRelay(s, relay, auth);
+						pulled += stats.pulled;
+						pushed += stats.pushed;
+						notes.push(`relay: pulled ${stats.pulled}, pushed ${stats.pushed}`);
+					} catch (err) {
+						if (!useTailnet) throw err;
+						notes.push(`relay: failed (${err instanceof Error ? err.message : String(err)})`);
+					}
+				}
+
+				// Tailnet leg. Discovery (shelling to `tailscale`) failing is fatal only
+				// for a tailnet-only sync; otherwise the hub already carried the round.
+				if (useTailnet) {
+					const port = Number(values.port ?? process.env.VAULT_PEER_PORT ?? DEFAULT_PEER_PORT);
+					const peerToken =
+						(values["peer-token"] as string | undefined) ?? process.env.VAULT_PEER_TOKEN;
+					try {
+						const r = await syncTailnet(s, { port, auth: { token: peerToken } });
+						pulled += r.pulled;
+						pushed += r.pushed;
+						let note = `tailnet: reached ${r.reached.length} peer(s)`;
+						if (r.failed.length) note += `, ${r.failed.length} unreachable`;
+						notes.push(note);
+					} catch (err) {
+						if (tailnetOnly) throw err;
+						notes.push(`tailnet: failed (${err instanceof Error ? err.message : String(err)})`);
+					}
+				}
+
 				const epoch = maybeCatchUp(s);
-				let text = `Synced: pulled ${stats.pulled}, pushed ${stats.pushed}\n`;
+				let text = `Synced: pulled ${pulled}, pushed ${pushed}\n`;
+				for (const n of notes) text += `  ${n}\n`;
 				if (epoch) text += `Issued security catch-up rotation -> epoch ${epoch}\n`;
-				emit(text, { pulled: stats.pulled, pushed: stats.pushed, catchUpEpoch: epoch ?? null });
+				emit(text, { pulled, pushed, catchUpEpoch: epoch ?? null, notes });
 			});
 			return 0;
+
+		case "serve": {
+			// Always-on direct-path replica (spec §8.6): expose this device's op-log
+			// over the tailnet so a peer can sync when the hub is unreachable. No
+			// passphrase — it's a dumb store-and-forward replica that holds no keys and
+			// runs while the vault is locked (ops stay end-to-end encrypted).
+			const store = await openStore(values);
+			const vaultId = store.getMeta("vaultId");
+			if (!vaultId) {
+				store.close();
+				throw new Error("vault not initialized; run `vault init`");
+			}
+			// The CLI and a long-lived peer server may open the same WAL db at once;
+			// wait briefly for a concurrent writer instead of failing on SQLITE_BUSY.
+			store.db.exec("PRAGMA busy_timeout = 5000;");
+			const port = Number(values.port ?? process.env.VAULT_PEER_PORT ?? DEFAULT_PEER_PORT);
+			const token = (values["peer-token"] as string | undefined) ?? process.env.VAULT_PEER_TOKEN;
+			// Bind to this device's tailnet IP by default so the server is reachable
+			// over the tailnet (the access gate, §7.3) and not the LAN/public iface.
+			let host = values.host as string | undefined;
+			if (!host) {
+				const { selfIP } = await tailscaleStatus();
+				if (!selfIP)
+					throw new Error(
+						"could not determine this device's Tailscale IP (is Tailscale up? pass --host to override)",
+					);
+				host = selfIP;
+			}
+			const server = createPeerServer(store, vaultId, { token });
+			await new Promise<void>((resolve, reject) => {
+				server.on("error", reject);
+				server.listen(port, host, resolve);
+			});
+			emit(
+				`vault peer server listening on ${host}:${port} (vault ${vaultId})\n` +
+					(token ? "" : "warning: no --peer-token set; open to the whole tailnet\n"),
+				{ host, port, vaultId, gated: !!token },
+			);
+			// Block until signalled, then close the server and store cleanly.
+			await new Promise<void>((resolve) => {
+				const shut = (): void => {
+					server.close(() => {
+						store.close();
+						resolve();
+					});
+				};
+				process.on("SIGINT", shut);
+				process.on("SIGTERM", shut);
+			});
+			return 0;
+		}
 
 		case "rotate":
 			await withSession(values, (s) => {

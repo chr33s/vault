@@ -38,7 +38,7 @@ test/    node:test specs
 | Multi-vault                    | ✅     | `--vault <name>` selects independent named replicas; `vaults` lists them                                                                                                                                                                                  |
 | M6 SEA packaging               | ✅     | `build/` bundle + `node --build-sea` + signing + CI matrix; produces a working single-file `dist/vault` on Node 26                                                                                                                                        |
 | M7 Cloudflare deploy           | ✅     | **both** §8.2 placements: self-hosted Node behind `cloudflared` (systemd + Tunnel) **and** serverless Worker + Durable Object (`relay/worker/` + `wrangler.toml`); shared `relay/handler.ts`, Access JWT verification, runbook for both (`relay/deploy/`) |
-| M8 direct fallback / native UI | ◑      | direct LAN/tailnet fallback (§8.6) deferred; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`)                                                                      |
+| M8 direct fallback / native UI | ✅     | **direct tailnet fallback (§8.6) shipped** — `vault serve` replica peer + `vault sync --tailnet` over Tailscale; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`)  |
 
 ## Crypto (all `node:crypto`, plan §8)
 
@@ -185,6 +185,31 @@ vault recovery-enable                       # owner: prints the org PRIVATE key 
 vault recover --user <id> --org-key <k>     # owner: reconstruct a locked-out member
 ```
 
+## Direct tailnet fallback (spec §8.6)
+
+The relay is the always-on hub, but it's only one replica. The **same** op-log
+also flows directly between devices over the user's [Tailscale](https://tailscale.com)
+tailnet, so a down, throttled, or eclipsing hub can't isolate two devices that
+can reach each other. The tailnet is the transport + access gate, **never** the
+confidentiality boundary — ops stay end-to-end encrypted and signed; a peer sees
+only ciphertext plus the membership metadata it already gossips through the hub.
+
+```bash
+# On an always-on device: serve this vault's replica to the tailnet.
+vault serve                                  # binds to this device's Tailscale IP
+vault serve --peer-token <t>                 # gate it with a shared token (recommended)
+
+# On another device: reconcile with the hub AND online tailnet peers...
+vault sync --tailnet --relay <url>
+# ...or skip the hub entirely (e.g. it's unreachable):
+vault sync --tailnet-only --peer-token <t>
+```
+
+`vault serve` holds no keys and runs while the vault is locked — it's a dumb
+store-and-forward replica. Tailscale is the user's own OS install (shelled out
+to via its CLI, not bundled, not an npm dependency). Set `VAULT_TAILNET=1` to
+enable the tailnet leg of every `sync` without the flag.
+
 ## Multiple vaults
 
 A user can belong to many vaults; each is an independent local replica.
@@ -316,14 +341,9 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   by design (bulk history flows over sync, not the token). `native/Vault.app`
   renders/scans QR for the device-enrollment handshake on top of the same text
   tokens.
-- **M8 partial:** the optional direct LAN/tailnet fallback path (§8.6) is not
-  built. The native macOS UI wrapper **is** — `native/Vault.app` (SwiftUI over
-  `vault --json`) covers the full workflow: create/unlock vaults, multi-vault
-  selection, item add/edit/remove, sync with in-app relay settings, device
-  enrollment and people sharing over the QR token handshake, and `secure-enclave`
-  Touch-ID unlock (`native/`). The app and helper are separately built/signed
-  artifacts, not npm deps, so `check:deps` stays green. arm64-only, Developer-ID +
-  hardened-runtime + notarization (not the Mac App Store).
+- **Direct fallback is tailnet-only.** The §8.6 direct path ships as the Tailscale
+  variant (`vault serve` + `vault sync --tailnet`, see above); the pure-LAN/mDNS
+  discovery variant is not built, so the direct path needs a working tailnet.
 
 ## Stability caveats
 
