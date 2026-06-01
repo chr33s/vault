@@ -13,7 +13,7 @@ struct CLIError: LocalizedError {
 }
 
 // The success/failure envelope shared by every --json response.
-private nonisolated struct Envelope: Decodable {
+private struct Envelope: Decodable {
 	let ok: Bool
 	let error: String?
 }

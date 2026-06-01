@@ -1,6 +1,9 @@
 {
 	"$schema": "./node_modules/oxfmt/configuration_schema.json",
-	"ignorePatterns": [],
+	"useTabs": true,
+	"tabWidth": 2,
+	"overrides": [{ "files": ["*.md", "*.{yaml,yml}"], "useTabs": false }],
+	"ignorePatterns": ["**/.build/**", "native/**/*.app/**"],
 	"experimentalSortImports": {
 		"internalPattern": ["#"],
 		"newlinesBetween": false

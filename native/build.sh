@@ -30,7 +30,7 @@ echo "==> Building $APP_NAME via xcodebuild (Release, arm64); signing deferred"
 # SEA CLI and the bundle share one consistent signing pass.
 xcodebuild \
 	-project vault.xcodeproj \
-	-target vault \
+	-scheme vault \
 	-configuration Release \
 	-derivedDataPath "$DERIVED" \
 	ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
@@ -54,7 +54,7 @@ fi
 sign() {
 	local ts=()
 	[[ "$SIGN_ID" != "-" ]] && ts=(--timestamp)
-	codesign --force --options runtime "${ts[@]}" --sign "$SIGN_ID" "$@"
+	codesign --force --options runtime ${ts[@]+"${ts[@]}"} --sign "$SIGN_ID" "$@"
 }
 
 echo "==> Signing (identity: $SIGN_ID)"

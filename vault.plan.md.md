@@ -173,13 +173,13 @@ Three steps, all built-in except the bundle.
 ```js
 import { build } from "esbuild";
 await build({
-  entryPoints: ["cli/main.ts"],
-  bundle: true,
-  platform: "node",
-  format: "cjs", // simplest SEA target; ESM also supported via mainFormat:"module"
-  target: "node26",
-  outfile: "dist/cli.cjs",
-  external: ["node:*"], // keep built-ins external
+	entryPoints: ["cli/main.ts"],
+	bundle: true,
+	platform: "node",
+	format: "cjs", // simplest SEA target; ESM also supported via mainFormat:"module"
+	target: "node26",
+	outfile: "dist/cli.cjs",
+	external: ["node:*"], // keep built-ins external
 });
 ```
 
@@ -187,11 +187,11 @@ await build({
 
 ```json
 {
-  "main": "dist/cli.cjs",
-  "output": "dist/vault",
-  "disableExperimentalSEAWarning": true,
-  "useCodeCache": false,
-  "useSnapshot": false
+	"main": "dist/cli.cjs",
+	"output": "dist/vault",
+	"disableExperimentalSEAWarning": true,
+	"useCodeCache": false,
+	"useSnapshot": false
 }
 ```
 
@@ -309,19 +309,19 @@ Sequenced so the testable foundation lands first.
       object per command; `{ok:false,error}` on failure) and `--passphrase-stdin`
       (secrets cross the process boundary on stdin only — never argv/env). This is
       the contract any wrapper/automation builds on. Implemented + tested in the CLI.
-- [ ] **Step 2 — `secure-enclave` KeyStore provider (needs a Mac/Xcode).** A small
-      signed Swift helper the CLI spawns, exposing the existing `KeyStore`
-      `available/put/get/del` interface — but backed by a **non-exportable Secure
-      Enclave key** (`kSecAttrTokenIDSecureEnclave`) gated by **Touch ID**
-      (`LAContext`). Slots in beside `macos-keychain`/`windows-dpapi`; biggest
-      threat-model upgrade (no passphrase to keylog; key never leaves hardware).
-      _Cannot be built/tested in the Linux sandbox._
-- [ ] **Step 3 — SwiftUI app (needs a Mac/Xcode).** Spawns
+- [x] **Step 2 — `secure-enclave` KeyStore provider (DONE).** A small signed Swift
+      helper (`native/Sources/Helper`, `vault-helper`) the CLI spawns, exposing
+      the existing `KeyStore` `available/put/get/del` interface — but backed by a
+      **non-exportable Secure Enclave key** (`kSecAttrTokenIDSecureEnclave`) gated by
+      **Touch ID** (`LAContext`). Slots in beside `macos-keychain`/`windows-dpapi`
+      via provider-aware resolution (`cli/keystore.ts`); biggest threat-model upgrade
+      (no passphrase to keylog; key never leaves hardware).
+- [x] **Step 3 — SwiftUI app (DONE).** `native/` (`Vault.app`) spawns
       `dist/vault --json --passphrase-stdin`; item list/edit, Touch-ID unlock (via the
       Step-2 shim), **QR rendering + camera scan** for the §9 enrollment tokens, sync
-      status. App-layer concerns that belong here, not in the CLI: call
-      `EnableSecureEventInput()` (Secure Keyboard Entry, §11 passphrase-entry note);
-      codesign + **notarization** + hardened-runtime/camera entitlements; arm64-only.
+      status. App-layer concerns handled here, not in the CLI: `EnableSecureEventInput()`
+      (Secure Keyboard Entry, §11 passphrase-entry note); `build.sh` does codesign +
+      hardened-runtime/camera entitlements and documents **notarization**; arm64-only.
 
 Constraints: the Swift app + Enclave shim are separately-built/-signed artifacts
 (not npm deps, so `check:deps` stays green); secret handling must stay on stdin;

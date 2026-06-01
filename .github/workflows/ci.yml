@@ -13,8 +13,8 @@ jobs:
     name: test + typecheck + zero-dep
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           # Node 26 is the platform baseline (plan §1): type stripping is the
           # default, node:sqlite is stable, and SEA is built in. Pin the exact
@@ -33,14 +33,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: linux-x64 }
+          - { os: ubuntu-24.04, target: linux-x64 }
           - { os: ubuntu-24.04-arm, target: linux-arm64 }
           - { os: macos-14, target: darwin-arm64 } # arm64 only (plan §1, §7)
-          - { os: windows-latest, target: win-x64 }
+          - { os: windows-2025, target: win-x64 } # pinned: windows-latest redirects to windows-2025-vs2026 by 2026-06-15
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: "26.x"
       - run: npm ci
@@ -50,8 +50,30 @@ jobs:
         run: |
           BIN=dist/vault; [ -f dist/vault.exe ] && BIN=dist/vault.exe
           VAULT_BIN="$BIN" node --test test/sea.test.ts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vault-${{ matrix.target }}
           path: |
             dist/vault*
+
+  native:
+    name: native helper + app (darwin-arm64)
+    needs: sea
+    runs-on: macos-14 # Apple Silicon (arm64), matches the SEA target (plan §1, §7)
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26.x"
+      - run: npm ci
+      # vault.xcodeproj uses objectVersion 77 (Xcode 16 project format); the
+      # macos-14 runner defaults to Xcode 15.4, which can't read it. Pick the
+      # newest installed Xcode 16.x.
+      - run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+      - shell: bash
+        run: npm run build:sea
+      - run: swift build -c release --arch arm64 --product vault-helper
+        working-directory: native
+      - run: ./build.sh
+        working-directory: native
+      - run: codesign --verify --deep --strict --verbose=2 native/vault.app
