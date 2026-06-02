@@ -20,7 +20,8 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 1. [Key Rotation and Revocation](#10-key-rotation-and-revocation)
 1. [Coordination Model](#11-coordination-model)
 1. [Architecture Comparison](#12-architecture-comparison)
-1. [Decisions and Verification Notes](#13-decisions-and-verification-notes)
+1. [Secret Consumption — Agent Proxy](#13-secret-consumption--agent-proxy)
+1. [Decisions and Verification Notes](#14-decisions-and-verification-notes)
 
 ---
 
@@ -33,6 +34,7 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 - **Whole-vault sharing** with **multi-vault** support: each team is a vault; a user may belong to many vaults; a personal vault is a team-of-one.
 - Sync across a user’s own devices and between different people.
 - Offline-capable, with deterministic conflict resolution.
+- **Local secret-consumption surfaces that minimize plaintext exposure to the consuming program** — including an **agent proxy** that injects a credential into outbound requests so an AI agent (or any untrusted child process) can _use_ a secret without ever _seeing_ it (§13).
 
 ### Non-Goals
 
@@ -59,6 +61,10 @@ This document consolidates the design decisions for a native Swift (macOS) crede
 ### Key principle
 
 **Read confidentiality is enforced by cryptography; write/role/invite policy is enforced by an authority layer** (a server in Architecture A, a signed replicated auth log in Architectures B and C). Anyone holding a vault key can technically craft valid ciphertext, so write permissions are _policy_, not a cryptographic guarantee — except in the decentralized models, where signed ops + auth-log validation make write authority cryptographically checkable.
+
+### Local secret-consumption boundary
+
+Distinct from the sync-layer model above: once a secret is unlocked on a device, how it reaches the program that uses it is its own exposure surface. Env injection hands the plaintext to the consuming process; the **agent proxy** (§13) instead injects it only on egress, keeping the value out of an untrusted consumer (e.g. an AI agent) entirely. Neither defends against a compromised-while-unlocked host.
 
 ---
 
@@ -444,7 +450,35 @@ Stripping `tag:credvault` / removing the device from the tailnet (B), or revokin
 
 ---
 
-## 13. Decisions and Verification Notes
+## 13. Secret Consumption — Agent Proxy
+
+The vault is not only a store but a _secret-consumption surface_: a client ultimately has to feed a secret to a program that uses it. There are two such surfaces, with different exposure profiles:
+
+- **Env injection (`vault run`, plan §5).** Resolves secrets into a child process’s environment. Simple and universal, but the **consuming process holds the plaintext** — it can read, log, or exfiltrate it. Appropriate when the consumer is trusted.
+- **Agent proxy (`vault proxy`).** For consumers that are **not** fully trusted with the raw secret — chiefly **AI agents**, where prompt injection or an over-eager tool call could leak an API key, but also third-party CLIs of uncertain provenance. The agent’s outbound API calls are routed through a local, loopback-only proxy that injects the credential _on egress_; the secret is attached to the request only after it leaves the agent, and only when the request is bound for its designated upstream. **The agent never possesses the secret value.**
+
+### 13.1 Model
+
+- The proxy runs on `127.0.0.1` and is driven by a **policy** mapping upstreams → injection rules: `{ upstream host, where to inject (header / query param), which vault reference supplies the value }`. The policy reuses the **same `.env` manifest format as env injection** (`vault run`) rather than a separate config language — one parser, and a single `.env` can drive both surfaces (plan §5).
+- The agent is pointed at the proxy in one of two ways: as a **custom API base URL** (`http://127.0.0.1:<port>/…`, the default — no TLS interception, no CA install), or via `HTTPS_PROXY` (forward-proxy / `CONNECT` mode, which needs a locally-trusted MITM CA and is therefore optional).
+- On each request the proxy injects the secret, forwards to the real upstream over genuine TLS, and streams the response back. Resolution reads the **local encrypted replica** (offline, instant), exactly like `vault run`, and likewise requires an **unlocked** vault.
+
+### 13.2 Security properties
+
+The proxy is a strictly stronger boundary than env injection — but only if it enforces **host binding**:
+
+- **Host-bound credentials.** A secret is bound to its configured upstream; the proxy refuses to attach it to any other destination. This is the decisive advantage over env injection: with `run`, a compromised agent holding the raw key can POST it anywhere; with the proxy, the agent can only _cause_ the key to be sent to its one legitimate upstream — never learn it, never redirect it.
+- **Egress allowlist.** Requests to hosts not named in the policy are rejected — an exfiltration / SSRF guard.
+- **No cross-host redirect carry-over.** The proxy will not follow a 3xx that would carry the injected credential to a different host (the host-binding rule, applied to redirects).
+- **Loopback-only, no persistence.** Binds `127.0.0.1` only; never writes or logs the secret value; emits a per-injection **audit entry** (upstream, rule, timestamp — never the value).
+
+### 13.3 Residual exposure
+
+The proxy removes the secret’s _value_ from the agent but not the agent’s _ability to use it_: a compromised-while-running agent can still issue authenticated calls to the legitimate upstream for as long as the proxy is up (a confused-deputy use of the live capability). Containment is therefore **scope and lifetime** — narrow policy (one upstream, least-privilege key), run the proxy only for the agent’s session, and pair high-value keys with upstream-side rate/scope limits. This is the inherent ceiling of letting an untrusted consumer _use_ a secret it must not _see_; it is an accepted, documented tradeoff (mirrors the env-injection note in plan §11).
+
+---
+
+## 14. Decisions and Verification Notes
 
 ### Resolved
 

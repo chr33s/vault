@@ -68,7 +68,7 @@ vault/
     index.ts
   cli/
     main.ts               # arg parsing (node:util parseArgs), command dispatch
-    commands/*.ts         # auth, device-add, device-confirm, add, get, list, sync, rotate, device-remove, run
+    commands/*.ts         # auth, device-add, device-confirm, add, get, list, sync, rotate, device-remove, run, proxy
   relay/
     main.ts               # node:http server, anti-entropy endpoints (§7.4)
     access.ts             # verify Cloudflare Access JWT
@@ -102,16 +102,17 @@ Arg parsing uses `node:util`’s `parseArgs` — no commander/yargs.
 
 Commands (mapping to spec):
 
-| Command                          | Does                                                                                                      | Spec     |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------- | -------- |
-| `vault init`                     | Create a vault + personal keys; bootstrap the auth log                                                    | §5, §8   |
-| `vault auth`                     | Generate this device’s keypair + `deviceId`; print **Token A** QR                                         | §9.2–9.3 |
-| `vault device-add`               | Scan Token A; seal vault key to it; sign auth-log entry; print **Token B** QR                             | §9.4–9.6 |
-| `vault device-confirm`           | Scan Token B; unseal vault key; validate chain; build local replica                                       | §9.7–9.9 |
-| `vault add/get/list/edit/rm`     | Local CRUD → CRDT ops, encrypted under the vault key                                                      | §4, §7.1 |
-| `vault sync`                     | Anti-entropy round with the relay (and any direct peers)                                                  | §7.4, §8 |
-| `vault rotate` / `device-remove` | Conflict-free epoch rotation; signed removal                                                              | §10.2    |
-| `vault run [.env] -- <cmd>`      | Resolve empty/declared env vars from the vault; inject into the child process env; never persists secrets | new      |
+| Command                             | Does                                                                                                                                  | Spec      |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `vault init`                        | Create a vault + personal keys; bootstrap the auth log                                                                                | §5, §8    |
+| `vault auth`                        | Generate this device’s keypair + `deviceId`; print **Token A** QR                                                                     | §9.2–9.3  |
+| `vault device-add`                  | Scan Token A; seal vault key to it; sign auth-log entry; print **Token B** QR                                                         | §9.4–9.6  |
+| `vault device-confirm`              | Scan Token B; unseal vault key; validate chain; build local replica                                                                   | §9.7–9.9  |
+| `vault add/get/list/edit/rm`        | Local CRUD → CRDT ops, encrypted under the vault key                                                                                  | §4, §7.1  |
+| `vault sync`                        | Anti-entropy round with the relay (and any direct peers)                                                                              | §7.4, §8  |
+| `vault rotate` / `device-remove`    | Conflict-free epoch rotation; signed removal                                                                                          | §10.2     |
+| `vault run [.env] -- <cmd>`         | Resolve empty/declared env vars from the vault; inject into the child process env; never persists secrets                             | new       |
+| `vault proxy [--config f] -- <cmd>` | Run a loopback credential-injecting proxy; route an AI agent’s API calls through it so the agent _uses_ secrets without _seeing_ them | new (§13) |
 
 Local state lives under the OS config dir (`$XDG_CONFIG_HOME` / `~/Library/Application Support`):
 
@@ -142,6 +143,28 @@ Any declared variable left unresolved makes `run` **fail fast before spawning** 
 **Flags.** `--env <file>` (default `./.env`), `--vault <name>` (which vault names resolve against; default vault), `--allow-missing` (warn instead of failing on unresolved vars).
 
 Security exposure of env injection is covered in §11.
+
+### `vault proxy` — let an AI agent use secrets without seeing them (spec §13)
+
+Where `vault run` puts the plaintext in the child’s environment, `vault proxy` keeps it out of the consumer entirely: it stands up a **loopback-only credential-injecting proxy** and routes the agent’s outbound API calls through it, attaching the secret only on egress.
+
+`vault proxy [--config <file>] [--vault <name>] [--port <n>] [-- <cmd> [args…]]`
+
+- **Policy — the same `.env` manifest format as `run`** (one parser, no new config language, no new dep). A reserved `UPSTREAM=` key names the destination; every other line is an injected request header whose value resolves with the identical `vault://` references and precedence rules as `run` (ambient non-empty → literal → vault lookup). Query-param injection uses a `?name=` key; a literal value (no `vault://`) passes straight through as a non-secret header. One upstream per manifest is the common single-API agent case; multiple upstreams use repeated `--config` files.
+
+  ```
+  # doubles as the proxy policy
+  UPSTREAM=https://api.anthropic.com
+  x-api-key=vault://personal/anthropic/key   # resolved from the local replica, never seen by the agent
+  anthropic-version=2023-06-01               # literal, non-secret → passes through
+  ```
+
+- **Two modes.**
+  - _Reverse-proxy (default, no MITM):_ the proxy exposes `http://127.0.0.1:<port>/<route>` per upstream; the agent’s SDK is pointed there through its base-URL env var (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, …). No CA install, no TLS interception.
+  - _Forward-proxy (`CONNECT`):_ for clients that only honor `HTTPS_PROXY`; needs a locally-trusted MITM CA, so it ships opt-in / later (spec §13.1).
+- **Injection & forwarding.** Per request: match route/host to a rule, inject the header or query secret, forward to the real upstream over `node:https`, stream the response back. Built on `node:http` / `node:https` / `node:net` — **zero new deps**.
+- **Optional child spawn.** With `-- <cmd>`, spawn the agent (`node:child_process.spawn`, `stdio:'inherit'`) with the base-URL / `HTTPS_PROXY` env preset to the proxy and **the real secret absent from its environment**; forward exit code and signals; tear the proxy down when the child exits. Without a command, run the proxy in the foreground for an externally-launched agent.
+- **Security (spec §13.2; see also §11).** Bind `127.0.0.1` only; **host-bind** every secret (refuse to inject toward any host but the rule’s upstream); **allowlist egress** (reject unconfigured hosts); never carry the injected credential across a cross-host redirect; never log or persist the value; emit a per-injection audit entry. Requires an unlocked vault and reads the local replica (offline, instant).
 
 ---
 
@@ -270,6 +293,7 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 - **Rotation:** simulate two concurrent admin rotations → assert all nodes converge on the `(hlc, deviceID)` winner; assert the security catch-up fires when a removal isn’t observed (§10.2).
 - **Anti-entropy:** two in-memory stores reconcile to identical op sets in one round; partition then heal.
 - **`vault run`:** a `.env` manifest mixing ambient-set, literal, empty, and `vault://` variables resolves with the correct precedence; the child receives the merged env; an unresolved required var fails _before_ spawn; the child’s exit code is propagated; resolved values are never written to disk.
+- **`vault proxy`:** a request from the child hits the proxy and reaches a stub upstream with the configured header/secret injected, while the secret is **absent from the child’s env** and never logged; a request to a non-allowlisted host is rejected; a cross-host redirect does not carry the injected credential; the proxy binds loopback only and tears down on child exit.
 - **SEA smoke test:** in CI, build the binary per platform and run `vault --version` + an init/add/list cycle against a local relay.
 
 ---
@@ -281,6 +305,7 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 - **Binary integrity:** sign every released SEA binary (`codesign` on macOS; Authenticode on Windows). Publish checksums.
 - **Relay trust:** per §8.4 the relay is untrusted — signatures + version vectors + order-independent CRDT mean it can delay but not forge/read/corrupt. The direct fallback path (§8.6, tailnet variant) is shipped (`vault serve` + `vault sync --tailnet`) so the hub can't eclipse two reachable devices.
 - **Env-var injection exposure (`vault run`).** Injected secrets are visible to the spawned process, its descendant processes, and same-user process introspection (e.g. `/proc/<pid>/environ`), and can surface in crash dumps. This is the inherent tradeoff of env injection — accepted because it keeps real secrets out of on-disk `.env` files. `vault run` never persists or logs resolved values; output masking (requires piping stdio rather than inheriting) and a per-access audit entry are candidate hardening steps.
+- **Agent-proxy exposure (`vault proxy`, spec §13.2–13.3).** The proxy keeps the secret _value_ out of the agent, but a compromised-while-running agent can still drive authenticated calls to the legitimate upstream for the proxy’s lifetime (confused deputy). Contain by scope + lifetime: least-privilege keys, one upstream per rule, proxy only up for the agent’s session, **host-binding + egress allowlist** to block redirection/exfiltration, and loopback-only bind. The injected credential must never cross a cross-host redirect, and resolved values are never logged. Accepted tradeoff.
 - **Stability flags:** SEA (1.1) and `node:sqlite` are still maturing — pin Node’s exact patch version per release and re-run the full test matrix on every Node bump.
 - **Type-stripping discipline:** lint-ban `enum`/`namespace`/decorators so all source stays erasable and runnable without a transform.
 
@@ -289,7 +314,7 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 ## 12. Milestones
 
 1. **M1 — `core` + tests.** Crypto, sealed-box, CRDT (with password MV-register), HLC, op-log, store. Pure, zero-dep, fully tested. _(De-risks the hardest parts first.)_
-1. **M2 — local CLI.** `init/auth/add/get/list` plus **`run`** (resolve secrets from the local replica and inject them into a child process) against the local SQLite replica, no networking. Runnable via `node cli/main.ts`.
+1. **M2 — local CLI.** `init/auth/add/get/list` plus **`run`** (resolve secrets from the local replica and inject them into a child process) and **`proxy`** (route an AI agent’s API calls through a loopback injector so it uses secrets without seeing them, spec §13) against the local SQLite replica, no sync networking. Runnable via `node cli/main.ts`.
 1. **M3 — relay + sync.** `node:http` relay, `/sync` + `/push`, `vault sync`. Two CLIs converge through a local relay.
 1. **M4 — enrollment.** `device-add` / `device-confirm` QR handshake; auth-log validation; user-with-device-subkeys.
 1. **M5 — rotation/revocation.** Conflict-free epochs + catch-up; `device-remove`.
@@ -337,9 +362,11 @@ neither protects against a compromised-while-unlocked host (threat model).
 - **macOS: arm64 only** (§1, §7) — no x64 macOS build.
 - **Key-memory zeroing: accepted KNOWN ISSUE** (§11) — not fixable on the Node/V8 stack; mitigated, documented, and surfaced in the security review.
 - **Relay placement** — **both** shipped off one `relay/handler.ts` (self-hosted Node behind Tunnel _and_ Worker+Durable-Object); identical protocol, pick per deployment (see `relay/deploy/README.md`). The Worker reuses `core`/`relay/access` `node:crypto` via `nodejs_compat` (only `node:crypto` is pulled into the edge bundle; never `node:http`/`node:sqlite`).
+- **Agent-proxy policy format — DECIDED: reuse the `.env` manifest** (§5, spec §13). The proxy policy is expressed in the same manifest format and parser as `vault run` (a reserved `UPSTREAM=` key plus header/`?query` lines resolving `vault://` references) — no separate JSON/TOML config and no second parser. One `.env` can serve both `run` and `proxy`.
 - **Direct fallback path (§8.6)** — shipped as the **tailnet** variant. `vault serve` runs a keyless store-and-forward replica peer (works while locked) and `vault sync --tailnet[-only]` reconciles the same op-log over Tailscale, reusing `relay/handler.ts` (a peer is just another relay endpoint). Tailscale is the user's own OS install — shelled out to, not bundled, not an npm dep, so `check:deps` stays green. Pure-LAN/mDNS discovery not built.
 
 ### Still open
 
 - **SEA module format** — CommonJS (simplest) vs ESM (`mainFormat:"module"`); CJS recommended for v1.
+- **Agent-proxy MITM mode** — the reverse-proxy / base-URL mode (spec §13.1) ships first; the `HTTPS_PROXY` / `CONNECT` mode needs a locally-trusted CA and is deferred / opt-in.
 - **Verify on the pinned Node 26 patch** — re-confirm SEA flags, `node:sqlite`, and type-stripping limits against the exact version used (these are actively evolving; see `spec.md` §13).

@@ -32,8 +32,10 @@ const fieldValue = (item: ItemView, field: string): string | undefined => {
 	return item.fields[field];
 };
 
-// Resolve a single declaration against ambient env + the vault.
-const resolveOne = (s: Session, decl: EnvDecl): string | undefined => {
+// Resolve a single declaration against ambient env + the vault. Exported so
+// `vault proxy` resolves its injection values with the identical precedence
+// (ambient non-empty -> literal -> vault lookup), per spec §13.1 / plan §5.
+export const resolveOne = (s: Session, decl: EnvDecl): string | undefined => {
 	const ambient = process.env[decl.key];
 
 	// 1. Ambient non-empty value always wins (local override).

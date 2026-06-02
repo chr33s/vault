@@ -41,6 +41,7 @@ import { setJsonOutput, emit, emitError } from "./output.ts";
 import { dbPath, listVaultNames, DEFAULT_VAULT } from "./paths.ts";
 import { createPeerServer } from "./peerserver.ts";
 import { readPassphrase, setPassphraseSource, closePassphraseSource } from "./prompt.ts";
+import { proxy as proxyCmd, DEFAULT_PROXY_PORT } from "./proxy.ts";
 import { syncWithRelay, type RelayAuth } from "./relayclient.ts";
 import { run as runCmd } from "./run.ts";
 import { syncTailnet, tailscaleStatus, DEFAULT_PEER_PORT } from "./tailnet.ts";
@@ -109,6 +110,14 @@ Recovery escrow (per-vault policy, spec §5)
 Secrets into a command
   run [--env <file>] [--vault <name>] [--allow-missing] -- <cmd> [args...]
                                Resolve .env vars from the vault, inject, spawn
+  proxy --config <file> [--config <file> ...] [--vault <name>] [--port <n>] [-- <cmd> [args...]]
+                               Run a loopback credential-injecting proxy so an AI
+                               agent USES a secret without SEEING it (spec §13).
+                               The .env-format policy uses a reserved UPSTREAM=
+                               line + header/?query lines (same vault:// refs as
+                               run). With -- <cmd>, spawns the agent pointed at
+                               the proxy (secret absent from its env); else runs
+                               in the foreground. Port default ${DEFAULT_PROXY_PORT}.
 
 Global: --vault <name> selects a vault (default "${DEFAULT_VAULT}"); --db <path> overrides the file.
   --json                       Emit one JSON object per command (machine contract for wrappers).
@@ -242,6 +251,7 @@ const main = async (): Promise<number> => {
 			"access-secret": { type: "string" },
 			env: { type: "string" }, // run
 			"allow-missing": { type: "boolean" }, // run
+			config: { type: "string", multiple: true }, // proxy: policy file(s)
 		},
 	});
 
@@ -678,6 +688,27 @@ const main = async (): Promise<number> => {
 					rest[0]!,
 					rest.slice(1),
 				);
+			} finally {
+				store.close();
+			}
+		}
+
+		case "proxy": {
+			// `rest` is the optional child command + argv after `--`. The proxy
+			// keeps secrets out of that child entirely (spec §13): it resolves them
+			// from the local replica and injects on egress, never into the env.
+			const configFiles = (values.config as string[] | undefined) ?? [];
+			if (configFiles.length === 0)
+				throw new Error(
+					"usage: vault proxy --config <file> [--config <file> ...] [--port <n>] [-- <cmd> [args...]]",
+				);
+			const store = await openStore(values);
+			try {
+				if (!isInitialized(store)) throw new Error("vault not initialized; run `vault init`");
+				const pass = await readPassphrase();
+				const session = await unlock(store, pass, await unlockKeyStore(store));
+				const port = Number(values.port ?? DEFAULT_PROXY_PORT);
+				return await proxyCmd(session, { configFiles, port }, rest[0], rest.slice(1));
 			} finally {
 				store.close();
 			}

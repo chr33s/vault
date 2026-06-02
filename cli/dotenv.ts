@@ -11,7 +11,12 @@ export type EnvDecl = {
 	value: string | undefined;
 };
 
-const LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(=(.*))?\s*$/;
+// Keys are env-var names for `run`, but `vault proxy` reuses this same parser
+// for its policy manifest (plan §5), where a key may be an HTTP header name
+// (hyphens, e.g. `x-api-key`) or a query-param marker (a leading `?`). The
+// broader charset is backward-compatible: real env-var names never contain
+// `-`/`?`, so `run`'s behavior is unchanged.
+const LINE = /^\s*(?:export\s+)?(\??[A-Za-z_][A-Za-z0-9_.-]*)\s*(=(.*))?\s*$/;
 
 const unquote = (raw: string): string => {
 	const v = raw.trim();
