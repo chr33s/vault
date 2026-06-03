@@ -8,9 +8,10 @@ behind Cloudflare Tunnel + Access. See the [implementation plan](./vault.plan.md
 
 **Guiding constraint: zero runtime dependencies.** Everything resolves to
 `node:*` built-ins (crypto, sqlite, http, test, type-stripping, SEA). The only
-non-runtime tooling is a bundler (`esbuild`) and the type-checker (`typescript`),
-which never ship inside the binary. A CI check (`npm run check:deps`) fails the
-build if any `package.json` declares runtime `dependencies`.
+non-runtime tooling is a bundler (`esbuild`), the type-checker (`typescript`),
+and the linter/formatter (`oxlint`/`oxfmt`) — none of which ship inside the
+binary. A CI check (`npm run check:deps`) fails the build if any `package.json`
+declares runtime `dependencies`.
 
 ## Layout
 
@@ -39,6 +40,7 @@ test/    node:test specs
 | M6 SEA packaging               | ✅     | `build/` bundle + `node --build-sea` + signing + CI matrix; produces a working single-file `dist/vault` on Node 26                                                                                                                                        |
 | M7 Cloudflare deploy           | ✅     | **both** §8.2 placements: self-hosted Node behind `cloudflared` (systemd + Tunnel) **and** serverless Worker + Durable Object (`relay/worker/` + `wrangler.toml`); shared `relay/handler.ts`, Access JWT verification, runbook for both (`relay/deploy/`) |
 | M8 direct fallback / native UI | ✅     | **direct tailnet fallback (§8.6) shipped** — `vault serve` replica peer + `vault sync --tailnet` over Tailscale; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`)  |
+| Agent secret-use proxy (§13)   | ✅     | `vault proxy` — a loopback egress proxy injects a vault secret into an AI agent's API calls so the agent **uses** a credential without **seeing** it; host-bound, egress-allowlisted, no redirect-follow, per-injection audit                              |
 
 ## Crypto (all `node:crypto`, plan §8)
 
@@ -56,9 +58,10 @@ test/    node:test specs
 run and the binary builds with **no experimental flags**.
 
 ```bash
-npm install                 # build-time tooling only (esbuild, typescript, @types/node)
+npm install                 # build-time tooling only (esbuild, typescript, oxlint, oxfmt, @types/node)
 npm test                    # node:test suite (node --test)
 npm run typecheck           # tsc --noEmit (also enforces erasable TS)
+npm run check               # oxlint (type-aware) + oxfmt --check
 npm run check:deps          # zero-runtime-dependency guard
 
 # CLI (passphrase via prompt or $VAULT_PASSPHRASE)
@@ -102,6 +105,40 @@ a warning). Resolution is offline/instant (reads the local SQLite replica).
 # .env:  DATABASE_URL=  (empty → resolved from the vault)
 vault run --env .env -- ./server
 ```
+
+## `vault proxy` — let an AI agent USE a secret without SEEING it (spec §13)
+
+Where `vault run` hands the plaintext to the child's environment, `proxy` keeps
+the credential _out_ of the consumer entirely. It stands up a loopback
+(`127.0.0.1`-only) HTTP proxy that injects the secret on **egress** — only on
+requests bound for the policy's upstream — then forwards to the real upstream
+over genuine TLS and streams the response back. The agent points its SDK's
+base-URL at the proxy; the secret never enters its env, argv, or memory.
+
+The policy is a `.env`-format manifest: a reserved `UPSTREAM=` line names the
+destination, `?name` lines inject query params, and every other key injects a
+request header. Injection values resolve with the same precedence as `run`
+(ambient → literal → `vault://` ref), so the real key lives only in the vault.
+The proxy fails to start if a declared secret can't be resolved (no silent
+no-op injection).
+
+```bash
+# policy.env:
+#   UPSTREAM=https://api.anthropic.com
+#   x-api-key=vault://personal/anthropic    # resolved from the vault
+vault proxy --config policy.env -- claude   # spawn the agent, base-URL preset, key absent
+vault proxy --config policy.env             # foreground, for an externally-launched agent
+```
+
+Hardening (spec §13.2): binds loopback only; each secret is attached to its
+upstream host only; egress is allowlisted (an unconfigured host gets `403`);
+redirects are **not** followed (a credential can't hop to another host); the
+value is never logged or persisted; and every injection emits a stderr audit
+line (upstream + rule names + timestamp, never the value). Pass `--config`
+repeatedly for multiple upstreams. For known SDKs the spawned child's base-URL
+env is preset automatically (`ANTHROPIC_BASE_URL`,
+`OPENAI_BASE_URL`/`OPENAI_API_BASE`); otherwise point the agent at
+`$VAULT_PROXY_URL`. TLS-interception (CONNECT/MITM) mode is deferred (§13.1).
 
 ## Device enrollment (spec §9)
 
@@ -265,7 +302,9 @@ What the cryptography **protects**, regardless of who runs it:
   (`native/Vault.app`). Covers a stolen/copied disk, Time Machine, and a vault
   file synced to iCloud/Dropbox.
 - **Plaintext sprawl** — secrets aren't in `.env`/dotfiles; `vault run` decrypts
-  them only transiently into a child's environment.
+  them only transiently into a child's environment, and `vault proxy` keeps them
+  out of the consumer entirely (injected on egress, so an AI agent never even
+  holds the key).
 - **Cross-device / cross-person sharing** — gated by sealed grants + the signed
   auth log.
 
