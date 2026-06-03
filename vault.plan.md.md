@@ -354,6 +354,24 @@ neither protects against a compromised-while-unlocked host (threat model).
 
 ---
 
+## 12b. Cross-platform keystore tiers roadmap (spec §3.5)
+
+The `KeyStore` interface (`available/put/get/del`, plus an optional `bindingMode`
+the engine persists) accepts both shelled OS tools and spawned native helpers.
+Every tier is a `BlobCipher` over `makeBlobKeyStore`'s on-disk wrapped blob, so the
+disk plumbing, id validation, and provider resolution are shared; the three
+spawn transports share one `spawnCollect` helper.
+
+- [x] **Linux at-rest — `systemd-creds`.** `--with-key=host` (the DPAPI analog; `auto`/`tpm2` ⇒ TPM-bound at rest). Surfaced via the `--with-key` flag on `keystore enable`; the chosen mode is persisted (`keystoreKeyMode`) and **pinned on unlock** so the availability probe matches the sealed binding. Validated against a stub + the real `systemd-creds`.
+- [x] **Linux/Windows TPM2 strong tier.** Dependency-free TPM2 codec (`cli/tpm2/`) that seals the DUK with a PIN as authValue (per-access UV + DA lockout) over a **salted HMAC + parameter-encrypted** session (ECDH→KDFe/KDFa; AES-CFB on the secret-bearing parameters), so the DUK/PIN never cross the CPU↔TPM bus in the clear. Transport: `/dev/tpmrm0` (Linux) or **TBS** (Windows, `tbs.dll` via a persistent PowerShell helper). Opt-in via `$VAULT_TPM2=1`; PIN from `$VAULT_TPM2_PIN`. Codec + sessions + the persistent-process framing validated against the **swtpm** emulator; the literal `tbs.dll` call is untested off-Windows (verify on a real host).
+- [ ] **Windows Hello strong tier (`KeyCredentialManager`)** — spec §3.5. A signed C# (CsWinRT) helper (PowerShell WinRT-projection fallback for dev) speaking the stdin/stdout `available/put/get/del` protocol; wraps the DUK under a key derived from a **deterministic** Hello-gated signature (`HKDF` over `RequestSignAsync(challenge)`, then AES-256-GCM). Sequenced like §12a: (1) the off-Windows-testable `BlobCipher` (blob format + HKDF/AES-GCM wrap + helper protocol), unit-tested with a fake-sign oracle; (2) the WinRT helper, validated on a Windows host (enrollment self-test for signature determinism; gesture on every `get`); (3) caller-auth via **Authenticode** (`WinVerifyTrust`), the analog of the macOS Team-ID check. Falls back to CNG/NCrypt if a platform signs with PSS.
+
+Constraints (as §12a): native helpers are separately-built/-signed artifacts (not
+npm deps, so `check:deps` stays green); secrets stay on stdin; none protect a
+compromised-while-unlocked host.
+
+---
+
 ## 13. Decisions & open items specific to this stack
 
 ### Resolved in this revision

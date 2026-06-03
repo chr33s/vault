@@ -40,7 +40,7 @@ test/    node:test specs
 | M6 SEA packaging               | ✅     | `build/` bundle + `node --build-sea` + signing + CI matrix; produces a working single-file `dist/vault` on Node 26                                                                                                                                        |
 | M7 Cloudflare deploy           | ✅     | **both** §8.2 placements: self-hosted Node behind `cloudflared` (systemd + Tunnel) **and** serverless Worker + Durable Object (`relay/worker/` + `wrangler.toml`); shared `relay/handler.ts`, Access JWT verification, runbook for both (`relay/deploy/`) |
 | M8 direct fallback / native UI | ✅     | **direct tailnet fallback (§8.6) shipped** — `vault serve` replica peer + `vault sync --tailnet` over Tailscale; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`)  |
-| Agent secret-use proxy (§13)   | ✅     | `vault proxy` — a loopback egress proxy injects a vault secret into an AI agent's API calls so the agent **uses** a credential without **seeing** it; host-bound, egress-allowlisted, no redirect-follow, per-injection audit                              |
+| Agent secret-use proxy (§13)   | ✅     | `vault proxy` — a loopback egress proxy injects a vault secret into an AI agent's API calls so the agent **uses** a credential without **seeing** it; host-bound, egress-allowlisted, no redirect-follow, per-injection audit                             |
 
 ## Crypto (all `node:crypto`, plan §8)
 
@@ -297,8 +297,9 @@ What the cryptography **protects**, regardless of who runs it:
   verified.
 - **At-rest / theft / backups** — the on-disk replica (and wrapped private keys)
   is meaningless without the passphrase; with `--keychain` it also requires the
-  device's OS keystore secret (macOS keychain / Windows DPAPI), or — on the
-  **strong tier** — a Touch-ID-gated, non-exportable **Secure Enclave** key
+  device's OS keystore secret (macOS keychain, Windows DPAPI, or Linux
+  `systemd-creds`), or — on the **strong tier** — a Touch-ID-gated,
+  non-exportable **Secure Enclave** key
   (`native/Vault.app`). Covers a stolen/copied disk, Time Machine, and a vault
   file synced to iCloud/Dropbox.
 - **Plaintext sprawl** — secrets aren't in `.env`/dotfiles; `vault run` decrypts
@@ -344,6 +345,8 @@ terminal-level "secure input" exists but is narrow and platform-specific:
 - **Linux** — there is no toggle. Under **Wayland** you get this _structurally_
   (the compositor mediates input; apps can't sniff each other's keystrokes), so
   prefer it. **X11 has no such isolation** — any X client can read the keyboard.
+  Better still, skip typing: `vault keystore enable` uses `systemd-creds`
+  (machine-bound; `VAULT_SYSTEMD_CREDS_KEY=tpm2` binds the unlock key to the TPM).
 - **Windows** — **no app-usable equivalent**; low-level keyboard hooks aren't
   blockable per-process. Lean on the keystore path (DPAPI today, Windows Hello +
   TPM as the strong tier) instead of typing.
@@ -356,14 +359,27 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   `vault init --keychain` / `vault keystore enable` folds an OS keystore second
   factor into the wrap key (`HKDF(accountKey, device-unlock-key)`), so a stolen
   disk can't be brute-forced offline at any passphrase strength. Providers:
-  **macOS** login keychain (`security`) and **Windows** DPAPI (`ProtectedData`,
-  CurrentUser scope, via PowerShell) — both _at-rest_ protection bound to the OS
-  user. The **strong tier** adds true per-access user verification: on macOS,
+  **macOS** login keychain (`security`), **Windows** DPAPI (`ProtectedData`,
+  CurrentUser scope, via PowerShell), and **Linux** `systemd-creds`
+  (`--with-key=host`; set `VAULT_SYSTEMD_CREDS_KEY=tpm2` to bind the DUK to the
+  TPM) — all _at-rest_ protection bound to the OS user or machine. The **strong
+  tier** adds true per-access user verification: on macOS,
   **Touch ID + Secure Enclave** via the `secure-enclave` provider (a small signed
   `vault-helper` the CLI spawns; the DUK is sealed to a non-exportable Enclave
   key, so `get` triggers a biometric prompt and a stolen disk can't be
-  brute-forced at any passphrase strength — see `native/`). Windows Hello + TPM
-  is the equivalent not-yet-built tier on Windows.
+  brute-forced at any passphrase strength — see `native/`); on **Linux**, the
+  opt-in `tpm2` provider (`VAULT_TPM2=1`) seals the DUK straight to the TPM via
+  `/dev/tpmrm0` with a dependency-free, in-tree TPM2 codec (`cli/tpm2/`) — with
+  `VAULT_TPM2_PIN` set, unseal requires the PIN and the TPM enforces
+  dictionary-attack lockout (per-access UV); without it, at-rest TPM binding. It
+  uses **salted HMAC sessions with parameter encryption**, so the DUK and PIN
+  never cross the CPU↔TPM bus in the clear (defeats passive bus sniffing on
+  discrete TPMs); validated against the swtpm emulator. The same `tpm2` provider
+  also drives **Windows TPMs over TBS** (`tbs.dll` via a persistent PowerShell
+  helper) — the transport framing + codec are validated against swtpm on Linux,
+  but the literal `tbs.dll` call is untested off-Windows and should be verified on
+  a real Windows host. A biometric **Windows Hello** (WinRT `KeyCredentialManager`)
+  front-end is still not built.
 - **Untrusted relay** (spec §8.4): signatures + version vectors +
   order-independent CRDT mean the relay can delay but never forge, read, or
   corrupt. It sees metadata (identity, op sizes, timing), never plaintext.

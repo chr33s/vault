@@ -101,6 +101,27 @@ Storing a single hash that both authenticates and encrypts is a design failure: 
 - Items stored as ciphertext locally as well.
 - Use the macOS **Keychain** + **Secure Enclave** for biometric-gated unlock material; do not place the whole vault in the system Keychain.
 
+### 3.5 Keystore second factor — at-rest binding and per-access tiers
+
+By default the at-rest private keys are sealed under the scrypt-derived account key alone (§3.4), so a stolen disk + a weak passphrase is brute-forceable offline. An optional **keystore** binds a high-entropy per-device **unlock key (DUK)** to an OS-protected store; the wrap key becomes `HKDF(accountKey, DUK)`, so disk-only theft cannot decrypt at any passphrase strength. Two strengths, by platform:
+
+| Platform | At-rest binding                                                            | Per-access UV (strong tier)                                        |
+| -------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| macOS    | login **Keychain** (`security`)                                            | **Secure Enclave** + Touch ID                                      |
+| Windows  | **DPAPI** (CurrentUser)                                                    | **Windows Hello** (`KeyCredentialManager`) · TPM via **TBS** + PIN |
+| Linux    | **`systemd-creds`** (`--with-key=host`; `auto`/`tpm2` ⇒ TPM-bound at rest) | **TPM2** (`/dev/tpmrm0`) + PIN                                     |
+
+Each provider is a `BlobCipher`: it wraps the DUK and the wrapped blob lives on disk; the binding key never leaves its store. The recorded binding (e.g. the systemd-creds `--with-key` mode) is persisted and **pinned on unlock**, so the unlock-time probe matches how the DUK was sealed.
+
+**TPM2 tier (Linux `/dev/tpmrm0`, Windows TBS).** Seals the DUK to the TPM under a deterministic ECC primary as a keyedhash sealed object whose authValue is the PIN (TPM dictionary-attack lockout ⇒ per-access UV). Authorization + transport use a **salted HMAC session with parameter encryption**: an ephemeral ECDH to a NULL-hierarchy primary → KDFe/KDFa session key; AES-CFB on the sealed data inbound (Create) and the unsealed data outbound (Unseal). So neither the DUK nor the PIN crosses the CPU↔TPM bus in the clear — defeats **passive** bus sniffing (an active on-bus MITM substituting its own salt key still needs a cert-verified EK; out of scope). No PIN ⇒ at-rest TPM binding.
+
+**Windows Hello tier (`KeyCredentialManager`).** Per-access UV: every unlock requires a Hello gesture (PIN/face/fingerprint) releasing a non-exportable TPM key.
+
+- `KeyCredential` exposes **sign only, not decrypt** — so the DUK is not held in the key; it is **wrapped** under a key derived from a signature: `wrapKey = HKDF(RequestSignAsync(challenge), salt=challenge)`, persisted as `AES-256-GCM(wrapKey, DUK)` (a `BlobCipher`, like the other tiers; `get` triggers the gesture).
+- **Load-bearing prerequisite:** the signature must be **deterministic** for a fixed challenge. KeyCredentialManager keys are RSA-2048 / PKCS#1 v1.5 (deterministic) — the same mechanism Bitwarden/KeePassXC use for Hello unlock. Verify per platform and **self-test at enrollment** (sign the challenge twice, assert equal); if a platform ever signs with RSA-PSS (randomized), this route is unusable and the fallback is **CNG/NCrypt** (a Hello-gated key that actually decrypts).
+- Flow: `IsSupportedAsync` → `available()`; one per-device credential (`dev.vault.unlock`, reused across vaults, with a per-id random challenge in the blob) via `RequestCreateAsync`/`OpenAsync`; `RequestSignAsync` on every `get`. Non-`Success` statuses (`UserCanceled`, `NotFound`, `SecurityDeviceLocked`, `UserPrefersPassword`) map to "no secret" → the engine's standard "couldn't unlock (retry)" path.
+- Lifecycle: a lost credential (TPM clear / Hello or PIN reset) makes the blob unrecoverable ⇒ **re-enroll the device** (as for a lost Secure-Enclave blob). Per-user, **interactive-session only** — no headless unlock (inherent to per-access UV).
+
 ---
 
 ## 4. Data Model and Schema

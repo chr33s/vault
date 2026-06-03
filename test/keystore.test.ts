@@ -236,6 +236,9 @@ test("defaultKeyStore() resolves a platform provider, or undefined where none ex
 	if (platform() === "darwin") {
 		// Always at least the login-keychain tier; secure-enclave when its helper is installed.
 		assert.ok(ks && (ks.name === "secure-enclave" || ks.name === "macos-keychain"));
+	} else if (platform() === "linux") {
+		// systemd-creds when present + the host key is reachable; otherwise none.
+		assert.ok(ks === undefined || ks.name === "systemd-creds");
 	} else if (platform() !== "win32") {
 		assert.equal(ks, undefined);
 	}

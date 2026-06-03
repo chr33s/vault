@@ -36,7 +36,7 @@ import {
 	type JoinToken,
 	type RelayInfo,
 } from "./engine.ts";
-import { defaultKeyStore, keyStoreByName, type KeyStore } from "./keystore.ts";
+import { defaultKeyStore, keyStoreByName, systemdCredsKeyMode, type KeyStore } from "./keystore.ts";
 import { setJsonOutput, emit, emitError } from "./output.ts";
 import { dbPath, listVaultNames, DEFAULT_VAULT } from "./paths.ts";
 import { createPeerServer } from "./peerserver.ts";
@@ -53,7 +53,10 @@ const HELP = `vault ${VERSION} — end-to-end encrypted, local-first credential 
 Usage: vault <command> [options]
 
 Vault & items
-  init [--keychain]            Create a vault + personal keys; bootstrap the auth log
+  init [--keychain] [--with-key host|tpm2|auto]
+                               Create a vault + personal keys; bootstrap the auth log
+                               (--keychain folds in an OS keystore; --with-key picks
+                               the Linux systemd-creds binding)
   add <title> [--field k=v ...] [--password]   Add an item (password read from prompt)
   get <title> [--field name]   Show an item (or one field)
   list                         List item titles
@@ -101,7 +104,12 @@ Sharing with other people
 Vaults & keys
   vaults                       List local vaults
   rotate                       Issue a new key epoch (conflict-free)
-  keystore (status|enable|disable)   OS-keychain second factor for at-rest keys
+  keystore (status|enable|disable) [--with-key host|tpm2|auto]
+                               OS-keychain second factor for at-rest keys.
+                               --with-key picks the Linux systemd-creds binding
+                               (host = machine-bound; tpm2/auto = TPM-bound); it
+                               also applies to 'init --keychain'. Sugar over
+                               $VAULT_SYSTEMD_CREDS_KEY; ignored off Linux.
 
 Recovery escrow (per-vault policy, spec §5)
   recovery-enable              Owner: create the org escrow key; print the org private key
@@ -149,7 +157,11 @@ const openStore = async (values: Record<string, unknown>): Promise<Store> =>
 // Passphrase-only vaults record no provider and unlock without a keystore.
 const unlockKeyStore = async (store: Store): Promise<KeyStore | undefined> => {
 	const provider = store.getMeta("keystoreProvider");
-	return provider ? await keyStoreByName(provider) : undefined;
+	// Pass the persisted binding (systemd-creds --with-key mode) so the keystore is
+	// resolved in the same mode the DUK was sealed under, not the ambient default.
+	return provider
+		? await keyStoreByName(provider, store.getMeta("keystoreKeyMode") || undefined)
+		: undefined;
 };
 
 const withSession = async (
@@ -247,6 +259,7 @@ const main = async (): Promise<number> => {
 			device: { type: "string" },
 			"org-key": { type: "string" },
 			keychain: { type: "boolean" },
+			"with-key": { type: "string" }, // keystore/init: systemd-creds binding (host|tpm2|auto)
 			"access-id": { type: "string" },
 			"access-secret": { type: "string" },
 			env: { type: "string" }, // run
@@ -257,6 +270,12 @@ const main = async (): Promise<number> => {
 
 	if (values.json) setJsonOutput(true);
 	if (values["passphrase-stdin"]) setPassphraseSource("stdin");
+	// `--with-key <mode>` is sugar over $VAULT_SYSTEMD_CREDS_KEY: it selects the
+	// systemd-creds binding used when a DUK is minted (`init --keychain`,
+	// `keystore enable`). The systemd provider reads the env at seal time, and
+	// systemd-creds decrypt auto-detects the mode, so it never needs persisting.
+	if (typeof values["with-key"] === "string")
+		process.env.VAULT_SYSTEMD_CREDS_KEY = values["with-key"];
 
 	// positionals[0] is the command; `rest` are its sub-arguments (item title,
 	// keystore subcommand, or — for `run` — the child command + its argv).
@@ -639,21 +658,49 @@ const main = async (): Promise<number> => {
 				if (sub === "status") {
 					const st = keystoreStatus(store);
 					const ks = await defaultKeyStore();
-					emit(
-						`this vault: ${st.protected ? st.provider : "passphrase-only"}\n` +
-							`platform keystore: ${ks ? ks.name : "none available"}\n`,
-						{
-							protected: st.protected,
-							provider: st.provider ?? null,
-							platformKeystore: ks ? ks.name : null,
-						},
-					);
+					// "this vault": how it's actually sealed (the persisted binding).
+					// "platform keystore": the mode a NEW enable would use here (env default).
+					const vaultLabel = !st.protected
+						? "passphrase-only"
+						: st.keyMode
+							? `${st.provider} (--with-key=${st.keyMode})`
+							: st.provider!;
+					const platformMode = ks?.name === "systemd-creds" ? systemdCredsKeyMode() : undefined;
+					const platformLabel = ks
+						? platformMode
+							? `${ks.name} (new enable: --with-key=${platformMode})`
+							: ks.name
+						: "none available";
+					emit(`this vault: ${vaultLabel}\nplatform keystore: ${platformLabel}\n`, {
+						protected: st.protected,
+						provider: st.provider ?? null,
+						keyMode: st.keyMode ?? null,
+						platformKeystore: ks ? ks.name : null,
+						...(platformMode ? { platformKeyMode: platformMode } : {}),
+					});
 				} else if (sub === "enable" || sub === "disable") {
 					const pass = await readPassphrase();
 					// Disable needs the CURRENT provider (to read+remove its DUK); enable on a
-					// passphrase-only vault picks the strongest tier available.
+					// passphrase-only vault picks the strongest tier available. Resolve the
+					// current provider in its persisted binding so the probe/get match it.
 					const current = store.getMeta("keystoreProvider");
-					const ks = current ? await keyStoreByName(current) : await defaultKeyStore();
+					const ks = current
+						? await keyStoreByName(current, store.getMeta("keystoreKeyMode") || undefined)
+						: await defaultKeyStore();
+					// A non-host --with-key on Linux that ends up with no usable keystore is
+					// almost always "that binding isn't available here" (e.g. tpm2 with no
+					// TPM) rather than "no keystore at all" — say so, and suggest host.
+					if (
+						sub === "enable" &&
+						!ks &&
+						process.platform === "linux" &&
+						typeof values["with-key"] === "string" &&
+						values["with-key"] !== "host"
+					)
+						throw new Error(
+							`no keystore available with --with-key=${values["with-key"]} ` +
+								`(systemd-creds may lack that binding here, e.g. no TPM); try --with-key=host`,
+						);
 					const name = await setKeystore(store, pass, sub === "enable", ks);
 					emit(`keystore ${sub}d -> ${name}\n`, { action: sub, provider: name });
 				} else {

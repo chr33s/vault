@@ -120,7 +120,10 @@ const KEYSTORE_INFO = "credvault/keystore/v1";
 // plus the meta the CALLER must persist (provider/id) — atomically with
 // encPrivKeys — so a crash can't leave meta pointing at a DUK that encPrivKeys
 // isn't yet sealed under. With no keystore the wrap key is just the account key.
-type WrapMeta = { keystoreProvider: string; keystoreId: string };
+// keystoreKeyMode records a provider-specific binding (systemd-creds --with-key
+// mode) so unlock can resolve the keystore in the SAME binding the DUK was sealed
+// under; "" for providers/vaults with no such knob.
+type WrapMeta = { keystoreProvider: string; keystoreId: string; keystoreKeyMode: string };
 const createWrapKey = async (
 	accountKey: Buffer,
 	keystore: KeyStore | undefined,
@@ -131,16 +134,21 @@ const createWrapKey = async (
 		await keystore.put(id, duk);
 		return {
 			wrap: cr.hkdf(accountKey, duk, KEYSTORE_INFO, 32),
-			meta: { keystoreProvider: keystore.name, keystoreId: id },
+			meta: {
+				keystoreProvider: keystore.name,
+				keystoreId: id,
+				keystoreKeyMode: keystore.bindingMode?.() ?? "",
+			},
 		};
 	}
-	return { wrap: accountKey, meta: { keystoreProvider: "", keystoreId: "" } };
+	return { wrap: accountKey, meta: { keystoreProvider: "", keystoreId: "", keystoreKeyMode: "" } };
 };
 
 // Persist the wrap meta (call inside the same transaction as encPrivKeys).
 const persistWrapMeta = (store: Store, meta: WrapMeta): void => {
 	store.setMeta("keystoreProvider", meta.keystoreProvider);
 	store.setMeta("keystoreId", meta.keystoreId);
+	store.setMeta("keystoreKeyMode", meta.keystoreKeyMode);
 };
 
 // Recompute the EXISTING wrap key to open a vault (no state change).
@@ -1188,11 +1196,19 @@ export const recoverUser = (s: Session, userId: string, orgPrivB64: string): str
 // keystore second factor — enable/disable/status on an existing vault
 // ============================================================================
 
-export type KeystoreStatus = { provider: string | undefined; protected: boolean };
+export type KeystoreStatus = {
+	provider: string | undefined;
+	protected: boolean;
+	keyMode: string | undefined; // provider-specific binding the vault is sealed under
+};
 
 export const keystoreStatus = (store: Store): KeystoreStatus => {
 	const provider = store.getMeta("keystoreProvider");
-	return { provider: provider || undefined, protected: !!provider };
+	return {
+		provider: provider || undefined,
+		protected: !!provider,
+		keyMode: store.getMeta("keystoreKeyMode") || undefined,
+	};
 };
 
 // Re-wrap the at-rest private keys with (enable=true) or without (enable=false)
@@ -1230,7 +1246,7 @@ export const setKeystore = async (
 	// when nothing references it (a crash before commit leaves the old setup intact).
 	const { wrap, meta } = enable
 		? await createWrapKey(accountKey, keystore)
-		: { wrap: accountKey, meta: { keystoreProvider: "", keystoreId: "" } as WrapMeta };
+		: { wrap: accountKey, meta: { keystoreProvider: "", keystoreId: "", keystoreKeyMode: "" } };
 	const reSealed = JSON.stringify(sealPrivUnderAccountKey(priv, wrap));
 	store.transaction(() => {
 		persistWrapMeta(store, meta);
