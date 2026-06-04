@@ -400,6 +400,31 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   variant (`vault serve` + `vault sync --tailnet`, see above); the pure-LAN/mDNS
   discovery variant is not built, so the direct path needs a working tailnet.
 
+## Keychain approach: this vault vs. fnox
+
+[fnox's keychain provider](https://fnox.jdx.dev/providers/keychain) uses the OS
+credential store as a **primary secret storage backend** — plaintext values are
+written directly into the macOS Keychain, Windows Credential Manager, or Linux
+Secret Service, and `fnox.toml` holds pointer names rather than values.
+
+This vault uses the OS secure store differently: the keychain **never holds a
+user secret**. It holds a high-entropy **Device Unlock Key (DUK)** that is
+folded into the at-rest encryption key as `HKDF(accountKey, DUK)`. Actual
+secrets live only in the end-to-end-encrypted, locally-replicated vault.
+
+|                                   | fnox keychain                      | this vault                                                               |
+| --------------------------------- | ---------------------------------- | ------------------------------------------------------------------------ |
+| **What's stored in the OS store** | The plaintext secret value         | A random Device Unlock Key                                               |
+| **Purpose**                       | Primary secret storage             | Second factor for offline-theft resistance                               |
+| **macOS strong tier**             | Login Keychain (unlocked at login) | Secure Enclave — non-exportable key, Touch ID required per access        |
+| **Caller authentication**         | None                               | Helper verifies caller's Developer Team signature before Touch ID prompt |
+| **Sync across devices**           | Per-machine, not portable          | Vault syncs end-to-end; each device gets its own independent DUK         |
+
+fnox also recommends storing a single `age` private key in the keychain (rather
+than each secret directly) to avoid repeated macOS permission dialogs — the same
+layered pattern this vault uses by default: one OS-protected key unlocks many
+encrypted items.
+
 ## Stability caveats
 
 SEA (Stability 1.1) and `node:sqlite` are still maturing — pin Node's exact
