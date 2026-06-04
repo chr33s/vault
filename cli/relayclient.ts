@@ -41,14 +41,23 @@ const authHeaders = (auth: RelayAuth): Record<string, string> => {
 	return h;
 };
 
+// Cap on a single relay/peer response body. The relay is partially trusted
+// (clients re-verify all crypto), but a compromised/buggy one must not OOM a
+// syncing client with an unbounded stream. The peer server applies the same
+// inbound cap. Override via PostOptions.maxBytes.
+export const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+export type PostOptions = { timeoutMs?: number; maxBytes?: number };
+
 // Use node:http/https directly rather than fetch: fetch (undici) keeps a
 // keep-alive connection pool that holds the event loop open after the request,
 // so a CLI would either hang on exit or have to force-exit while those handles
 // are still closing (the latter aborts on Windows). A plain request with the
 // default agent closes its socket after the response, letting the process exit
 // cleanly on its own.
-const post = <T>(url: string, body: unknown, auth: RelayAuth, timeoutMs?: number): Promise<T> =>
+const post = <T>(url: string, body: unknown, auth: RelayAuth, opts: PostOptions = {}): Promise<T> =>
 	new Promise<T>((resolve, reject) => {
+		const { timeoutMs, maxBytes = MAX_RESPONSE_BYTES } = opts;
 		const u = new URL(url);
 		const data = Buffer.from(JSON.stringify(body), "utf8");
 		const requestFn = u.protocol === "https:" ? httpsRequest : httpRequest;
@@ -64,7 +73,18 @@ const post = <T>(url: string, body: unknown, auth: RelayAuth, timeoutMs?: number
 			},
 			(res) => {
 				const chunks: Buffer[] = [];
-				res.on("data", (c: Buffer) => chunks.push(c));
+				let size = 0;
+				res.on("data", (c: Buffer) => {
+					size += c.length;
+					if (size > maxBytes) {
+						// Abort the transfer and fail; a later 'end'/resolve is a no-op once
+						// the promise has rejected.
+						req.destroy();
+						reject(new Error(`relay response exceeded ${maxBytes} bytes`));
+						return;
+					}
+					chunks.push(c);
+				});
 				res.on("end", () => {
 					const text = Buffer.concat(chunks).toString("utf8");
 					const status = res.statusCode ?? 0;
@@ -91,7 +111,7 @@ const post = <T>(url: string, body: unknown, auth: RelayAuth, timeoutMs?: number
 		req.end(data);
 	});
 
-export { authHeaders };
+export { authHeaders, post };
 
 export type SyncStats = {
 	pulled: number;
@@ -125,7 +145,7 @@ export const syncWithRelay = async (
 			rotationIds: localRotationIds(s),
 		},
 		auth,
-		opts.timeoutMs,
+		{ timeoutMs: opts.timeoutMs },
 	);
 	const pulled = s.store.putOps(resp.ops);
 	const { authImported, rotationsImported } = importAuthAndRotations(
@@ -148,7 +168,7 @@ export const syncWithRelay = async (
 			grants: s.store.allGrants(s.vaultId),
 		},
 		auth,
-		opts.timeoutMs,
+		{ timeoutMs: opts.timeoutMs },
 	);
 
 	// Rebuild the materialized replica; contribute a recovery grant if escrow is

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { init, unlock } from "../cli/engine.ts";
-import { syncWithRelay } from "../cli/relayclient.ts";
+import { post, syncWithRelay } from "../cli/relayclient.ts";
 import { Store } from "../core/store.ts";
 
 const startStub = (
@@ -60,6 +60,35 @@ test("syncWithRelay rejects on malformed JSON from the relay", async () => {
 		await withSession(async (s) => {
 			await assert.rejects(syncWithRelay(s, url)); // JSON.parse throws -> reject
 		});
+	} finally {
+		server.close();
+	}
+});
+
+test("post aborts a relay response that exceeds the size cap", async () => {
+	// A compromised/buggy relay streaming an unbounded body must not OOM the client.
+	const { url, server } = await startStub((_req, res) => {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end("x".repeat(100_000)); // far over the tiny cap below
+	});
+	try {
+		await assert.rejects(
+			post(url, {}, {}, { maxBytes: 1024 }),
+			/relay response exceeded 1024 bytes/,
+		);
+	} finally {
+		server.close();
+	}
+});
+
+test("post accepts a response within the size cap", async () => {
+	const { url, server } = await startStub((_req, res) => {
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ ok: true }));
+	});
+	try {
+		const body = await post<{ ok: boolean }>(url, {}, {}, { maxBytes: 1024 });
+		assert.deepEqual(body, { ok: true });
 	} finally {
 		server.close();
 	}

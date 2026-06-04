@@ -14,6 +14,7 @@ import {
 	winnerAtEpoch,
 	needsCatchUp,
 	keyCommit,
+	wellFormedRotation,
 	type RotationRecord,
 } from "../core/rotation.ts";
 
@@ -27,6 +28,18 @@ test("envelope hash + signature verify; tamper detected", () => {
 	assert.ok(verifyEnvelope(op)); // hash-only (relay path)
 	const tampered = { ...op, payload: Buffer.from("evil").toString("base64") };
 	assert.ok(!verifyEnvelope(tampered));
+});
+
+test("envelope: a valid hash signed by the wrong key fails signature verification", () => {
+	// The hash-only check passes (the bytes are internally consistent), but the
+	// signature must be rejected when checked against a different device's key —
+	// guards the relay-then-replica boundary where the op-author key is enforced.
+	const author = crypto.generateEd25519();
+	const impostor = crypto.generateEd25519();
+	const op = mkOp("devA", 1, author.privateKey);
+	assert.ok(verifyEnvelope(op)); // hash-only path accepts it
+	assert.ok(verifyEnvelope(op, author.publicKey)); // correct key accepts it
+	assert.ok(!verifyEnvelope(op, impostor.publicKey)); // wrong key rejects it
 });
 
 test("anti-entropy: two stores reconcile to identical op sets in one round", () => {
@@ -116,4 +129,24 @@ test("security catch-up needed when winner didn't observe a removal", () => {
 	assert.ok(!needsCatchUp({ ...win, observed: ["h-add", "h-removal"] }, ["h-removal"]));
 	// No removals -> no catch-up.
 	assert.ok(!needsCatchUp(win, []));
+});
+
+test("wellFormedRotation accepts a valid epoch chain and rejects nonsense", () => {
+	const rec = (epoch: number, baseEpoch: number): RotationRecord => ({
+		epoch,
+		baseEpoch,
+		hlc: encodeHLC({ millis: 1, counter: 0, deviceId: "A" }),
+		deviceId: "A",
+		keyCommit: "x",
+		grants: {},
+		observed: [],
+		signerId: "A",
+		sig: "",
+	});
+	assert.ok(wellFormedRotation(rec(1, 0))); // genesis epoch
+	assert.ok(wellFormedRotation(rec(7, 6))); // baseEpoch === epoch - 1
+	assert.ok(!wellFormedRotation(rec(0, -1))); // epoch must be >= 1
+	assert.ok(!wellFormedRotation(rec(5, 1))); // baseEpoch must be epoch - 1
+	assert.ok(!wellFormedRotation(rec(3, 3))); // base cannot equal epoch
+	assert.ok(!wellFormedRotation(rec(2.5, 1.5))); // must be integers
 });

@@ -2,7 +2,7 @@
 // CRDT/auth log; key material is a single-valued epoch chosen by a deterministic
 // total order, so concurrent admin rotations converge with no coordinator.
 
-import { sha256, verify } from "./crypto.ts";
+import { sha256, verify, encodeBox, decodeBox } from "./crypto.ts";
 import { compareEncoded } from "./hlc.ts";
 import type { SealedBox } from "./sealedbox.ts";
 
@@ -14,18 +14,16 @@ export type SealedGrant = {
 	tag: string;
 };
 
+// A SealedBox is an AeadBox plus an ephemeral pubkey, so its base64 form is the
+// shared encodeBox shape with ephPub alongside.
 export const encodeGrant = (b: SealedBox): SealedGrant => ({
 	ephPub: b.ephPub.toString("base64"),
-	iv: b.iv.toString("base64"),
-	ct: b.ct.toString("base64"),
-	tag: b.tag.toString("base64"),
+	...encodeBox(b),
 });
 
 export const decodeGrant = (g: SealedGrant): SealedBox => ({
 	ephPub: Buffer.from(g.ephPub, "base64"),
-	iv: Buffer.from(g.iv, "base64"),
-	ct: Buffer.from(g.ct, "base64"),
-	tag: Buffer.from(g.tag, "base64"),
+	...decodeBox(g),
 });
 
 export type RotationRecord = {
@@ -61,6 +59,16 @@ export const verifyRotation = (r: RotationRecord, signerPub: Buffer): boolean =>
 	const { sig, ...rest } = r;
 	return verify(rotationBytes(rest), signerPub, Buffer.from(sig, "base64"));
 };
+
+// Structural sanity check, independent of the signature. rotate()/init always
+// mint epoch >= 1 with baseEpoch === epoch - 1, so this rejects only malformed
+// records — a cheap guard against a buggy/hostile authorized device emitting a
+// nonsensical epoch chain.
+export const wellFormedRotation = (r: RotationRecord): boolean =>
+	Number.isInteger(r.epoch) &&
+	Number.isInteger(r.baseEpoch) &&
+	r.epoch >= 1 &&
+	r.baseEpoch === r.epoch - 1;
 
 // Deterministic winner among records: higher epoch always supersedes; within an
 // epoch, argmax over (hlc, deviceId). Every honest node computes the same winner

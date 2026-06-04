@@ -151,3 +151,22 @@ export const aeadDecrypt = (key: Buffer, box: AeadBox, aad?: Buffer): Buffer => 
 	decipher.setAuthTag(box.tag);
 	return Buffer.concat([decipher.update(box.ct), decipher.final()]);
 };
+
+// ---- AEAD box (de)serialization to a base64 JSON shape ----
+// The transport/at-rest form of an AeadBox. Many call sites persist or wire an
+// AEAD result as base64 {iv,ct,tag}; these two helpers are the single place that
+// conversion lives (a SealedBox/OpPayload is this shape plus extra fields).
+
+export type EncodedBox = { iv: string; ct: string; tag: string };
+
+export const encodeBox = (box: AeadBox): EncodedBox => ({
+	iv: box.iv.toString("base64"),
+	ct: box.ct.toString("base64"),
+	tag: box.tag.toString("base64"),
+});
+
+export const decodeBox = (e: EncodedBox): AeadBox => ({
+	iv: Buffer.from(e.iv, "base64"),
+	ct: Buffer.from(e.ct, "base64"),
+	tag: Buffer.from(e.tag, "base64"),
+});

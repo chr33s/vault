@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { VaultState, buildItemOps, buildDeleteOp, type FieldOp } from "../core/crdt.ts";
+import {
+	VaultState,
+	buildItemOps,
+	buildDeleteOp,
+	DELETED_FIELD,
+	type FieldOp,
+} from "../core/crdt.ts";
 import { Clock, encodeHLC } from "../core/hlc.ts";
 
 const mkClock = (device: string, start = 1000) => {
@@ -30,6 +36,59 @@ test("CRDT converges regardless of apply order (property-style)", () => {
 		const shuffled = [...ops].sort(() => Math.random() - 0.5);
 		assert.equal(apply(shuffled), base, "diverged on reorder");
 	}
+});
+
+test("CRDT converges across three concurrent devices regardless of order", () => {
+	const ca = mkClock("devA", 1000);
+	const cb = mkClock("devB", 1003);
+	const cc = mkClock("devC", 1006);
+	// Three devices touch overlapping fields of the same item, plus a 3-way
+	// concurrent password write (none observed the others).
+	const ops: FieldOp[] = [
+		...buildItemOps("i1", { title: "a", url: "ua", password: "pa" }, () => encodeHLC(ca.tick())),
+		...buildItemOps("i1", { title: "b", notes: "nb", password: "pb" }, () => encodeHLC(cb.tick())),
+		...buildItemOps("i1", { url: "uc", password: "pc" }, () => encodeHLC(cc.tick())),
+	];
+
+	const apply = (order: FieldOp[]): string => {
+		const s = new VaultState();
+		s.applyAll(order);
+		const v = s.materialize("i1")!;
+		// Sort passwords so the canonical view is order-independent for comparison.
+		return JSON.stringify({ fields: v.fields, passwords: [...v.passwords].sort() });
+	};
+
+	const base = apply(ops);
+	for (let i = 0; i < 25; i++) {
+		const shuffled = [...ops].sort(() => Math.random() - 0.5);
+		assert.equal(apply(shuffled), base, "three-way merge diverged on reorder");
+	}
+	// All three unobserved passwords survive as a conflict set.
+	const s = new VaultState();
+	s.applyAll(ops);
+	assert.deepEqual([...s.materialize("i1")!.passwords].sort(), ["pa", "pb", "pc"]);
+});
+
+test("CRDT delete is LWW: a later write resurrects only via an undelete", () => {
+	const c = mkClock("dev", 4000);
+	const s = new VaultState();
+	s.applyAll(buildItemOps("i1", { title: "orig" }, () => encodeHLC(c.tick())));
+	s.apply(buildDeleteOp("i1", encodeHLC(c.tick())));
+	assert.equal(s.list().length, 0, "deleted item is hidden");
+
+	// A later write to an ORDINARY field does not resurrect the item — the deleted
+	// tombstone is its own LWW register and still holds.
+	s.apply({ itemId: "i1", field: "title", value: "edited", hlc: encodeHLC(c.tick()) });
+	assert.equal(s.materialize("i1")!.deleted, true, "ordinary write does not undelete");
+	assert.equal(s.list().length, 0);
+
+	// Clearing the tombstone at a higher HLC undeletes; the item returns with the
+	// latest field state.
+	s.apply({ itemId: "i1", field: DELETED_FIELD, value: null, hlc: encodeHLC(c.tick()) });
+	const v = s.materialize("i1")!;
+	assert.equal(v.deleted, false, "undelete restores the item");
+	assert.equal(v.fields.title, "edited");
+	assert.equal(s.list().length, 1);
 });
 
 test("CRDT apply is idempotent", () => {

@@ -22,7 +22,7 @@ import {
 import * as cr from "../core/crypto.ts";
 import { Clock, encodeHLC, decodeHLC } from "../core/hlc.ts";
 import { deriveKeys, DEFAULT_KDF_PARAMS, type KdfParams } from "../core/kdf.ts";
-import { makeEnvelope, verifyEnvelope, type OpEnvelope } from "../core/protocol.ts";
+import { makeEnvelope, rotationId, verifyEnvelope, type OpEnvelope } from "../core/protocol.ts";
 import {
 	winner,
 	keyCommit,
@@ -30,6 +30,7 @@ import {
 	decodeGrant,
 	rotationBytes,
 	verifyRotation,
+	wellFormedRotation,
 	needsCatchUp,
 	type RotationRecord,
 	type SealedGrant,
@@ -74,7 +75,7 @@ const idFromPub = (pub: Buffer): string => cr.sha256(pub).toString("hex").slice(
 
 // ---- at-rest private-key sealing under the account key ----
 
-type SealedBlob = { iv: string; ct: string; tag: string };
+type SealedBlob = cr.EncodedBox;
 
 const sealPrivUnderAccountKey = (priv: PrivKeys, accountKey: Buffer): SealedBlob => {
 	const json = JSON.stringify({
@@ -83,20 +84,11 @@ const sealPrivUnderAccountKey = (priv: PrivKeys, accountKey: Buffer): SealedBlob
 		deviceSign: priv.deviceSign.toString("base64"),
 		deviceEnc: priv.deviceEnc.toString("base64"),
 	});
-	const box = cr.aeadEncrypt(accountKey, Buffer.from(json, "utf8"));
-	return {
-		iv: box.iv.toString("base64"),
-		ct: box.ct.toString("base64"),
-		tag: box.tag.toString("base64"),
-	};
+	return cr.encodeBox(cr.aeadEncrypt(accountKey, Buffer.from(json, "utf8")));
 };
 
 const openPrivWithAccountKey = (blob: SealedBlob, accountKey: Buffer): PrivKeys => {
-	const pt = cr.aeadDecrypt(accountKey, {
-		iv: Buffer.from(blob.iv, "base64"),
-		ct: Buffer.from(blob.ct, "base64"),
-		tag: Buffer.from(blob.tag, "base64"),
-	});
+	const pt = cr.aeadDecrypt(accountKey, cr.decodeBox(blob));
 	const o = JSON.parse(pt.toString("utf8"));
 	return {
 		userSign: Buffer.from(o.userSign, "base64"),
@@ -179,16 +171,11 @@ const openWrapKey = async (
 // `keyCommit` identifies which vault key encrypted this op, so an op survives
 // even when concurrent rotations leave several keys live at the same epoch.
 
-type OpPayload = { keyCommit: string; iv: string; ct: string; tag: string };
+type OpPayload = cr.EncodedBox & { keyCommit: string };
 
 const encryptOp = (op: FieldOp, keyCommitHex: string, key: Buffer): Buffer => {
 	const box = cr.aeadEncrypt(key, Buffer.from(JSON.stringify(op), "utf8"));
-	const p: OpPayload = {
-		keyCommit: keyCommitHex,
-		iv: box.iv.toString("base64"),
-		ct: box.ct.toString("base64"),
-		tag: box.tag.toString("base64"),
-	};
+	const p: OpPayload = { keyCommit: keyCommitHex, ...cr.encodeBox(box) };
 	return Buffer.from(JSON.stringify(p), "utf8");
 };
 
@@ -196,11 +183,7 @@ const decryptOp = (payloadB64: string, keys: Map<string, Buffer>): FieldOp | und
 	const p = JSON.parse(Buffer.from(payloadB64, "base64").toString("utf8")) as OpPayload;
 	const key = keys.get(p.keyCommit);
 	if (!key) return undefined; // encrypted under a key we don't hold
-	const pt = cr.aeadDecrypt(key, {
-		iv: Buffer.from(p.iv, "base64"),
-		ct: Buffer.from(p.ct, "base64"),
-		tag: Buffer.from(p.tag, "base64"),
-	});
+	const pt = cr.aeadDecrypt(key, cr.decodeBox(p));
 	return JSON.parse(pt.toString("utf8")) as FieldOp;
 };
 
@@ -261,6 +244,7 @@ const validRotations = (
 	membership: Membership = replay(store.authLog()),
 ): RotationRecord[] =>
 	loadRotations(store).filter((r) => {
+		if (!wellFormedRotation(r)) return false; // reject a nonsensical epoch chain
 		const pub = membership.deviceKeys.get(r.signerId);
 		return pub !== undefined && verifyRotation(r, pub);
 	});
@@ -542,12 +526,12 @@ export const importAuthAndRotations = (
 	const haveRot = new Set(
 		s.store.rotations().map((r) => {
 			const o = JSON.parse(r) as RotationRecord;
-			return `${o.epoch}:${o.deviceId}`;
+			return rotationId(o.epoch, o.deviceId);
 		}),
 	);
 	for (const rec of incomingRotations) {
 		const r = JSON.parse(rec) as RotationRecord;
-		if (!haveRot.has(`${r.epoch}:${r.deviceId}`)) {
+		if (!haveRot.has(rotationId(r.epoch, r.deviceId))) {
 			s.store.putRotation(r.epoch, r.deviceId, rec);
 			rotationsImported++;
 		}
@@ -795,14 +779,7 @@ export const authNewDevice = async (store: Store, password: string): Promise<Tok
 	store.setMeta("kdfParams", JSON.stringify(kdfParams));
 	store.setMeta("deviceSignPub", deviceSign.publicKey.toString("base64"));
 	store.setMeta("deviceEncPub", deviceEnc.publicKey.toString("base64"));
-	store.setMeta(
-		"pendingPriv",
-		JSON.stringify({
-			iv: blob.iv.toString("base64"),
-			ct: blob.ct.toString("base64"),
-			tag: blob.tag.toString("base64"),
-		}),
-	);
+	store.setMeta("pendingPriv", JSON.stringify(cr.encodeBox(blob)));
 
 	return {
 		deviceId,
@@ -889,11 +866,7 @@ export const deviceConfirm = async (
 	let deviceEnc: Buffer;
 	try {
 		const blob = JSON.parse(requireMeta(store, "pendingPriv")) as SealedBlob;
-		const pt = cr.aeadDecrypt(accountKey, {
-			iv: Buffer.from(blob.iv, "base64"),
-			ct: Buffer.from(blob.ct, "base64"),
-			tag: Buffer.from(blob.tag, "base64"),
-		});
+		const pt = cr.aeadDecrypt(accountKey, cr.decodeBox(blob));
 		const o = JSON.parse(pt.toString("utf8"));
 		deviceSign = Buffer.from(o.deviceSign, "base64");
 		deviceEnc = Buffer.from(o.deviceEnc, "base64");

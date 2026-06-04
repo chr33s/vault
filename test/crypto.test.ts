@@ -31,6 +31,19 @@ test("AEAD round-trip; wrong key/aad fails", async () => {
 	assert.throws(() => crypto.aeadDecrypt(key, box, Buffer.from("wrong")));
 });
 
+test("encodeBox/decodeBox round-trips an AEAD box through its base64 form", () => {
+	const key = crypto.randomBytes(32);
+	const box = crypto.aeadEncrypt(key, Buffer.from("persist me"));
+	const encoded = crypto.encodeBox(box);
+	// Wire/at-rest shape is base64 strings (stable across persistence).
+	assert.equal(typeof encoded.iv, "string");
+	assert.equal(typeof encoded.ct, "string");
+	assert.equal(typeof encoded.tag, "string");
+	// JSON-trip it the way the engine persists meta, then decode + decrypt.
+	const reloaded = crypto.decodeBox(JSON.parse(JSON.stringify(encoded)));
+	assert.equal(crypto.aeadDecrypt(key, reloaded).toString(), "persist me");
+});
+
 test("sealed-box seal/unseal; wrong recipient fails", async () => {
 	const recip = crypto.generateX25519();
 	const other = crypto.generateX25519();

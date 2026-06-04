@@ -81,16 +81,22 @@ export class VaultState {
 		for (const op of ops) this.apply(op);
 	}
 
-	// Live password values: those not superseded by a later (observed) write.
-	private livePasswords(a: ItemAcc): string[] {
+	// Currently-live password writes (not superseded by a later observed write,
+	// not cleared), in canonical HLC order. The single source of truth behind both
+	// the materialized values and the `replaces` set.
+	private liveEntries(a: ItemAcc): { hlc: string; value: string }[] {
 		const live: { hlc: string; value: string }[] = [];
 		for (const [hlc, value] of a.pwValues) {
-			if (a.pwSuperseded.has(hlc)) continue;
-			if (value === null) continue;
+			if (a.pwSuperseded.has(hlc) || value === null) continue;
 			live.push({ hlc, value });
 		}
 		live.sort((x, y) => compareEncoded(x.hlc, y.hlc));
-		return live.map((x) => x.value);
+		return live;
+	}
+
+	// Live password values: those not superseded by a later (observed) write.
+	private livePasswords(a: ItemAcc): string[] {
+		return this.liveEntries(a).map((x) => x.value);
 	}
 
 	// The HLCs of the currently-live password writes — an editor passes these as
@@ -98,13 +104,7 @@ export class VaultState {
 	livePasswordHlcs(itemId: string): string[] {
 		const a = this.items.get(itemId);
 		if (!a) return [];
-		const hlcs: string[] = [];
-		for (const [hlc, value] of a.pwValues) {
-			if (a.pwSuperseded.has(hlc)) continue;
-			if (value === null) continue;
-			hlcs.push(hlc);
-		}
-		return hlcs;
+		return this.liveEntries(a).map((x) => x.hlc);
 	}
 
 	materialize(itemId: string): ItemView | undefined {

@@ -18,6 +18,31 @@ export type EnvDecl = {
 // `-`/`?`, so `run`'s behavior is unchanged.
 const LINE = /^\s*(?:export\s+)?(\??[A-Za-z_][A-Za-z0-9_.-]*)\s*(=(.*))?\s*$/;
 
+// Strip a trailing ` #…` comment, but not a `#` inside a quoted value
+// (`"p@ss # w0rd"`) — a naive /\s+#/ would clip the inner `#`. A `#` opens a
+// comment only at line start or after whitespace; a quote protects a span only
+// when value-leading (line start, or after `=`/whitespace) AND closed (a lone
+// `it's` is not a span).
+const stripComment = (s: string): string => {
+	let i = 0;
+	while (i < s.length) {
+		const ch = s[i]!;
+		const prev = i === 0 ? "" : s[i - 1]!;
+		const valueLeading = i === 0 || prev === "=" || /\s/.test(prev);
+		if ((ch === "'" || ch === '"') && valueLeading) {
+			const close = s.indexOf(ch, i + 1);
+			if (close !== -1) {
+				i = close + 1; // skip the whole quoted span (any `#` within is literal)
+				continue;
+			}
+			// no closing quote: fall through and treat this char as ordinary text
+		}
+		if (ch === "#" && (i === 0 || /\s/.test(prev))) return s.slice(0, i);
+		i++;
+	}
+	return s;
+};
+
 const unquote = (raw: string): string => {
 	const v = raw.trim();
 	if (v.length >= 2 && ((v[0] === '"' && v.at(-1) === '"') || (v[0] === "'" && v.at(-1) === "'"))) {
@@ -29,8 +54,8 @@ const unquote = (raw: string): string => {
 export const parseDotenv = (text: string): EnvDecl[] => {
 	const decls: EnvDecl[] = [];
 	for (const rawLine of text.split(/\r?\n/)) {
-		const line = rawLine.replace(/\s+#.*$/, ""); // strip trailing comments
-		if (!line.trim() || line.trim().startsWith("#")) continue;
+		const line = stripComment(rawLine); // strip trailing comments (quote-aware)
+		if (!line.trim()) continue;
 		const m = LINE.exec(line);
 		if (!m) continue;
 		const key = m[1]!;
