@@ -4,14 +4,20 @@
 
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { finished } from "node:stream/promises";
 import type { ItemView } from "../core/crdt.ts";
 import { parseDotenv, parseVaultRef, type EnvDecl } from "./dotenv.ts";
 import { getItem, type Session } from "./engine.ts";
+import { installScrubbedFatalHandlers, makeScrubStream, registerSecret } from "./scrub.ts";
 
 export type ResolveOptions = {
 	envFile: string;
 	defaultVault: string;
 	allowMissing: boolean;
+	// --mask: pipe the child's stdout/stderr through the secret scrubber so a
+	// child that echoes an injected value gets it redacted (plan §11). Opt-in
+	// because piping (vs inheriting) forgoes a TTY on the child's output streams.
+	mask?: boolean;
 };
 
 export type Resolution = {
@@ -88,16 +94,55 @@ export const run = async (
 		process.stderr.write(`warning: ${msg}\n`);
 	}
 
+	// One per-access audit entry (parity with `vault proxy`, spec §13.2): names
+	// the injected variables + the command, never the values. Operational, so it
+	// goes to stderr (keeps --json stdout clean).
+	const injected = Object.keys(env);
+	if (injected.length > 0)
+		process.stderr.write(
+			`audit: ${new Date().toISOString()} injected [${injected.join(", ")}] -> ${command}\n`,
+		);
+
 	const merged = { ...process.env, ...env };
+
+	// --mask: defense-in-depth against a child that echoes an injected secret.
+	// Register each value with the scrubber and pipe the child's stdout/stderr
+	// through the streaming redactor; also scrub our own crash dumps. stdin stays
+	// inherited so interactive prompts still reach the terminal.
+	let restore: (() => void) | undefined;
+	if (opts.mask) {
+		for (const v of Object.values(env)) registerSecret(v);
+		restore = installScrubbedFatalHandlers();
+	}
+
 	return await new Promise<number>((resolve, reject) => {
-		const child = spawn(command, args, { env: merged, stdio: "inherit" });
+		const child = spawn(command, args, {
+			env: merged,
+			stdio: opts.mask ? ["inherit", "pipe", "pipe"] : "inherit",
+		});
+		// In mask mode the child's output is piped through the scrubber rather than
+		// inherited; wait for both streams to flush before settling so no scrubbed
+		// output is truncated when the child exits (`end:false` keeps our own
+		// stdout/stderr open). Non-mask mode inherits the fds, so there's nothing
+		// to drain.
+		let drained: Promise<unknown> = Promise.resolve();
+		if (opts.mask) {
+			const so = makeScrubStream();
+			const se = makeScrubStream();
+			child.stdout!.pipe(so).pipe(process.stdout, { end: false });
+			child.stderr!.pipe(se).pipe(process.stderr, { end: false });
+			drained = Promise.allSettled([finished(so), finished(se)]);
+		}
 		child.on("error", reject);
 		child.on("exit", (code, signal) => {
-			if (signal) {
-				process.kill(process.pid, signal);
-				return;
-			}
-			resolve(code ?? 0);
+			void drained.then(() => {
+				restore?.();
+				if (signal) {
+					process.kill(process.pid, signal);
+					return;
+				}
+				resolve(code ?? 0);
+			});
 		});
 	});
 };

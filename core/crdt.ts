@@ -11,6 +11,15 @@ import { compareEncoded } from "./hlc.ts";
 
 export const PASSWORD_FIELD = "password";
 export const DELETED_FIELD = "__deleted__";
+// Item type (spec §4): a reserved single-value LWW field, so the type travels
+// inside the *encrypted* item content (never plaintext metadata to the relay).
+// Absent => the default, so items written before typing existed read as `login`.
+export const ITEM_TYPE_FIELD = "__type__";
+export type ItemType = "login" | "note" | "card" | "identity";
+export const ITEM_TYPES: readonly ItemType[] = ["login", "note", "card", "identity"];
+export const DEFAULT_ITEM_TYPE: ItemType = "login";
+export const isItemType = (v: string): v is ItemType =>
+	(ITEM_TYPES as readonly string[]).includes(v);
 
 // A single field mutation. `value === null` clears the field.
 export type FieldOp = {
@@ -25,6 +34,7 @@ export type FieldOp = {
 
 export type ItemView = {
 	itemId: string;
+	itemType: ItemType;
 	fields: Record<string, string>;
 	// Live password values. More than one => unresolved concurrent edits.
 	passwords: string[];
@@ -112,6 +122,7 @@ export class VaultState {
 		if (!a) return undefined;
 		const fields: Record<string, string> = {};
 		let deleted = false;
+		let itemType: ItemType = DEFAULT_ITEM_TYPE;
 		// Emit fields in sorted key order so the materialized view is canonical
 		// regardless of the order ops were applied in.
 		const names = [...a.lww.keys()].sort();
@@ -121,10 +132,17 @@ export class VaultState {
 				deleted = reg.value !== null;
 				continue;
 			}
+			if (name === ITEM_TYPE_FIELD) {
+				// Reserved: kept off `fields` and surfaced as the typed `itemType`.
+				// An unrecognized value (forward-compat / tamper) falls back to default.
+				if (reg.value !== null && isItemType(reg.value)) itemType = reg.value;
+				continue;
+			}
 			if (reg.value !== null) fields[name] = reg.value;
 		}
 		return {
 			itemId,
+			itemType,
 			fields,
 			passwords: this.livePasswords(a),
 			deleted,

@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as crypto from "../core/crypto.ts";
-import { deriveKeys, DEFAULT_KDF_PARAMS } from "../core/kdf.ts";
+import {
+	deriveKeys,
+	DEFAULT_KDF_PARAMS,
+	type Argon2idParams,
+	type ScryptParams,
+} from "../core/kdf.ts";
 import { seal, unseal } from "../core/sealedbox.ts";
 
 test("x25519 ECDH agrees both directions", async () => {
@@ -61,4 +66,59 @@ test("KDF: account key and auth verifier are distinct and deterministic", async 
 	assert.ok(!d1.accountKey.equals(d1.authVerifier));
 	const d3 = await deriveKeys("wrong password", params);
 	assert.ok(!d1.accountKey.equals(d3.accountKey));
+});
+
+test("KDF: new vaults default to Argon2id (spec §3.1's preferred primitive)", () => {
+	const p = DEFAULT_KDF_PARAMS();
+	assert.equal(p.algo, "argon2id");
+});
+
+// Known-answer tests pin the derivation so any future refactor that would change
+// a vault's account key — locking out existing data — fails loudly. One KAT per
+// algorithm: Argon2id (new vaults) and legacy scrypt (vaults sealed before the
+// switch must keep unlocking, read via the `algo` discriminator — no migration).
+const KAT_PW = "correct horse battery staple";
+const KAT_SALT = Buffer.alloc(16, 0xab).toString("base64");
+
+test("KDF KAT: Argon2id derivation is stable (backward-compat guard)", async () => {
+	const params: Argon2idParams = {
+		algo: "argon2id",
+		salt: KAT_SALT,
+		memory: 1 << 16,
+		passes: 3,
+		parallelism: 1,
+	};
+	const d = await deriveKeys(KAT_PW, params);
+	assert.equal(
+		d.accountKey.toString("hex"),
+		"537dad7970336e46404563336f6b8c9b33153dac78058a58f08b6dda4a8f75b4",
+	);
+	assert.equal(
+		d.authVerifier.toString("hex"),
+		"c0c0a775b90e1906355dbf953c1f829fb0b13658c86d37d4f9ff51867f0bf46f",
+	);
+});
+
+test("KDF KAT: legacy scrypt vaults still derive the same keys", async () => {
+	const params: ScryptParams = { algo: "scrypt", salt: KAT_SALT, N: 1 << 15, r: 8, p: 1 };
+	const d1 = await deriveKeys(KAT_PW, params);
+	const d2 = await deriveKeys(KAT_PW, params);
+	assert.ok(d1.accountKey.equals(d2.accountKey), "deterministic");
+	assert.equal(
+		d1.accountKey.toString("hex"),
+		"c41a25b9d0deeb1db1d468a63b348f45ba9a2a25e8b2fc620b6f1d19846fe184",
+	);
+	assert.equal(
+		d1.authVerifier.toString("hex"),
+		"626fece6eb40feac6413238d67ac0e7d83710a6c42a5b0a1a06b32ca8ffe74b9",
+	);
+	// Same salt + password, different KDF → different key (the algos don't alias).
+	const argon = await deriveKeys(KAT_PW, {
+		algo: "argon2id",
+		salt: KAT_SALT,
+		memory: 1 << 16,
+		passes: 3,
+		parallelism: 1,
+	});
+	assert.ok(!d1.accountKey.equals(argon.accountKey));
 });

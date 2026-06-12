@@ -19,12 +19,25 @@ jobs:
           # Node 26 is the platform baseline (plan §1): type stripping is the
           # default, node:sqlite is stable, and SEA is built in. Pin the exact
           # patch per release (plan §11) and re-run on every Node bump.
-          node-version: "26.x"
+          node-version-file: "package.json"
       - run: npm ci
       - run: npm run check
       - run: npm run check:deps
       - run: npm run typecheck
       - run: npm test
+
+  strong-tier:
+    name: strong-tier (swtpm TPM2, linux)
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: "package.json"
+      - run: sudo apt-get update && sudo apt-get install -y swtpm swtpm-tools
+      - run: npm ci
+      - run: node --test test/tpm2.test.ts
 
   sea:
     name: sea binary (${{ matrix.target }})
@@ -42,7 +55,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: "26.x"
+          node-version-file: "package.json"
       - run: npm ci
       - shell: bash
         run: npm run build:sea
@@ -64,7 +77,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: "26.x"
+          node-version-file: "package.json"
       - run: npm ci
       # vault.xcodeproj uses objectVersion 77 (Xcode 16 project format); the
       # macos-14 runner defaults to Xcode 15.4, which can't read it. Pick the

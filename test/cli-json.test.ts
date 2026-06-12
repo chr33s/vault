@@ -72,6 +72,80 @@ test("--json emits one structured object per command", async () => {
 	});
 });
 
+test("--type assigns and surfaces the item type; invalid is rejected", async () => {
+	await withHome(async (home) => {
+		const env = { VAULT_PASSPHRASE: "pw" };
+		await execFile(["--json", "init"], { home, env });
+
+		// Default type when --type is omitted.
+		const added = lastJson(
+			(await execFile(["--json", "add", "gh", "--field", "username=alice"], { home, env })).stdout,
+		);
+		assert.equal(added.itemType, "login");
+
+		// Explicit type round-trips through get + list JSON.
+		const card = lastJson(
+			(
+				await execFile(["--json", "add", "visa", "--type", "card", "--field", "number=4111"], {
+					home,
+					env,
+				})
+			).stdout,
+		);
+		assert.equal(card.itemType, "card");
+		const got = lastJson((await execFile(["--json", "get", "visa"], { home, env })).stdout);
+		assert.equal(got.itemType, "card");
+		const list = lastJson((await execFile(["--json", "list"], { home, env })).stdout);
+		const visa = (list.items as Array<{ title: string; itemType: string }>).find(
+			(i) => i.title === "visa",
+		);
+		assert.equal(visa?.itemType, "card");
+
+		// edit --type changes it.
+		await execFile(["--json", "edit", "visa", "--type", "identity"], { home, env });
+		const edited = lastJson((await execFile(["--json", "get", "visa"], { home, env })).stdout);
+		assert.equal(edited.itemType, "identity");
+
+		// An invalid type fails (and never creates the item).
+		const bad = lastJson(
+			(await execFile(["--json", "add", "x", "--type", "bogus"], { home, env })).stdout,
+		);
+		assert.equal(bad.ok, false);
+		assert.match(bad.error as string, /invalid --type/);
+	});
+});
+
+test("totp: `vault totp` and `get` surface a live RFC-6238 code", async () => {
+	await withHome(async (home) => {
+		const env = { VAULT_PASSPHRASE: "pw" };
+		await execFile(["--json", "init"], { home, env });
+		// Store the RFC 6238 sample secret (base32) in the conventional `totp` field.
+		await execFile(["--json", "add", "gh", "--field", "totp=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"], {
+			home,
+			env,
+		});
+
+		const otp = lastJson((await execFile(["--json", "totp", "gh"], { home, env })).stdout);
+		assert.equal(otp.ok, true);
+		assert.match(otp.code as string, /^\d{6}$/, "6-digit code");
+		assert.equal(otp.period, 30);
+		assert.equal(otp.digits, 6);
+		assert.equal(otp.algorithm, "sha1");
+		assert.ok((otp.expiresIn as number) >= 1 && (otp.expiresIn as number) <= 30);
+
+		// `get` exposes the same derived code under `otp` (the raw secret stays a field).
+		const got = lastJson((await execFile(["--json", "get", "gh"], { home, env })).stdout);
+		assert.match((got.otp as { code: string }).code, /^\d{6}$/);
+		assert.equal((got.fields as Record<string, string>).totp, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+
+		// No totp field -> a clear error.
+		await execFile(["--json", "add", "plain", "--field", "username=x"], { home, env });
+		const none = lastJson((await execFile(["--json", "totp", "plain"], { home, env })).stdout);
+		assert.equal(none.ok, false);
+		assert.match(none.error as string, /no "totp" field/);
+	});
+});
+
 test("--json device-add returns the SAS + Token B (enrollment contract for the UI)", async () => {
 	await withHome(async (home) => {
 		const env = { VAULT_PASSPHRASE: "pw" };

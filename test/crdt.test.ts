@@ -5,6 +5,7 @@ import {
 	buildItemOps,
 	buildDeleteOp,
 	DELETED_FIELD,
+	ITEM_TYPE_FIELD,
 	type FieldOp,
 } from "../core/crdt.ts";
 import { Clock, encodeHLC } from "../core/hlc.ts";
@@ -13,6 +14,21 @@ const mkClock = (device: string, start = 1000) => {
 	let t = start;
 	return new Clock(device, () => t++);
 };
+
+test("itemType: reserved field surfaces as itemType, defaults to login", () => {
+	const s = new VaultState();
+	const clk = mkClock("d");
+	// No type op -> default login; the reserved field never appears in `fields`.
+	s.applyAll(buildItemOps("i", { title: "x" }, () => encodeHLC(clk.tick())));
+	assert.equal(s.materialize("i")!.itemType, "login");
+	assert.ok(!(ITEM_TYPE_FIELD in s.materialize("i")!.fields));
+	// A type op sets it.
+	s.applyAll(buildItemOps("i", { [ITEM_TYPE_FIELD]: "card" }, () => encodeHLC(clk.tick())));
+	assert.equal(s.materialize("i")!.itemType, "card");
+	// An unrecognized value falls back to the default (forward-compat / tamper).
+	s.applyAll(buildItemOps("i", { [ITEM_TYPE_FIELD]: "bogus" }, () => encodeHLC(clk.tick())));
+	assert.equal(s.materialize("i")!.itemType, "login");
+});
 
 test("CRDT converges regardless of apply order (property-style)", () => {
 	// Build a pool of ops from two devices editing overlapping fields.

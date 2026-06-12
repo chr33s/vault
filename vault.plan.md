@@ -20,15 +20,15 @@ The CLI is the portable engine; a native Swift/macOS UI (the original framing) c
 
 ## 1. Platform baseline — why Node 26 fits the “minimal deps” goal
 
-| Need               | Node 26 built-in                                                                      | Removes the need for                    |
-| ------------------ | ------------------------------------------------------------------------------------- | --------------------------------------- |
-| Run TypeScript     | Native **type stripping** (stable since 25.2, default) via Amaro                      | ts-node, tsx, babel (for dev/run)       |
-| Crypto             | `node:crypto` — X25519, Ed25519, AES-256-GCM, ChaCha20-Poly1305, HKDF, scrypt, CSPRNG | libsodium, tweetnacl (mostly — see §8)  |
-| Local DB           | `node:sqlite` (`DatabaseSync`)                                                        | better-sqlite3, native bindings         |
-| HTTP server/client | `node:http` / `node:https` / `fetch`                                                  | express, axios, undici                  |
-| Tests              | `node:test` + `node:assert`                                                           | jest, vitest, mocha                     |
-| Single binary      | `node --build-sea` (built-in since 25.5)                                              | pkg, nexe; even postject (now optional) |
-| File watch (dev)   | `node --watch`                                                                        | nodemon                                 |
+| Need               | Node 26 built-in                                                                                | Removes the need for                    |
+| ------------------ | ----------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Run TypeScript     | Native **type stripping** (stable since 25.2, default) via Amaro                                | ts-node, tsx, babel (for dev/run)       |
+| Crypto             | `node:crypto` — X25519, Ed25519, AES-256-GCM, ChaCha20-Poly1305, HKDF, Argon2id, scrypt, CSPRNG | libsodium, tweetnacl (mostly — see §8)  |
+| Local DB           | `node:sqlite` (`DatabaseSync`)                                                                  | better-sqlite3, native bindings         |
+| HTTP server/client | `node:http` / `node:https` / `fetch`                                                            | express, axios, undici                  |
+| Tests              | `node:test` + `node:assert`                                                                     | jest, vitest, mocha                     |
+| Single binary      | `node --build-sea` (built-in since 25.5)                                                        | pkg, nexe; even postject (now optional) |
+| File watch (dev)   | `node --watch`                                                                                  | nodemon                                 |
 
 Net result: **no runtime dependencies**; build-time deps are just a bundler and the type-checker.
 
@@ -46,7 +46,7 @@ Caveats to respect (documented, not blockers):
 - **Build/dev dependencies (never shipped in the binary):**
   - `esbuild` — bundle the TS entry + `core` into one JS file for SEA (the injected main can only load built-ins, so a single bundled file is required). Also strips types as a side effect.
   - `typescript` — `tsc --noEmit` for type checking in the editor and CI only.
-- **Password KDF — DECIDED: scrypt (§3.1).** `node:crypto` provides **scrypt** but not Argon2id, so v1 uses `crypto.scryptSync` (memory-hard, native, zero-dep), taking the spec’s documented fallback in place of Argon2id. This keeps the zero-runtime-dependency rule with no WASM asset to bundle. Tune cost parameters (`N`, `r`, `p`) at a documented target and store them in `kdfParams` so they can be raised over time without breaking existing vaults.
+- **Password KDF — DECIDED: Argon2id (§3.1), the spec’s preferred primitive.** Node 26 exposes `crypto.argon2`/`argon2Sync`, so Argon2id is now native, memory-hard, and **zero-dep with no WASM asset** — superseding the original scrypt fallback (which this plan chose only because Argon2id was not yet in `node:crypto`). New vaults derive the master key with Argon2id at **64 MiB / 3 passes / 1 lane** (above the OWASP minimums, ~tens of ms to unlock). Cost params + the algorithm are stored in `kdfParams` so they can be raised over time. **Legacy scrypt vaults keep working** with no migration: `kdfParams.algo` discriminates, and the scrypt derivation path is retained (and KAT-locked in tests) so a vault sealed before the switch still unlocks.
 
 ---
 
@@ -59,7 +59,8 @@ vault/
   core/
     crypto.ts             # node:crypto wrappers (§8)
     sealedbox.ts          # ECIES seal/unseal to an X25519 pubkey
-    kdf.ts                # scrypt — decided KDF (§2)
+    kdf.ts                # Argon2id — decided KDF (§2); legacy scrypt read path
+    totp.ts               # RFC 6238 TOTP code generation (§4 totpSecret)
     crdt.ts               # field-level LWW + HLC, tombstones (§7.1, §13)
     authlog.ts            # signed, hash-chained membership log (§5)
     rotation.ts           # conflict-free epoch scheme (§10.2)
@@ -68,7 +69,7 @@ vault/
     index.ts
   cli/
     main.ts               # arg parsing (node:util parseArgs), command dispatch
-    commands/*.ts         # auth, device-add, device-confirm, add, get, list, sync, rotate, device-remove, run, proxy
+    commands/*.ts         # auth, device-add, device-confirm, add, get, list, totp, sync, rotate, device-remove, run, proxy
   relay/
     main.ts               # node:http server, anti-entropy endpoints (§7.4)
     access.ts             # verify Cloudflare Access JWT
@@ -87,7 +88,7 @@ Arg parsing uses `node:util`’s `parseArgs` — no commander/yargs.
 ## 4. `core` — shared library (maps spec → code)
 
 - **`crypto.ts` / `sealedbox.ts` (§3.2):** all primitives via `node:crypto` (details in §8). `sealedbox` implements the spec’s “seal a key to a public key” as ECIES over X25519 + HKDF + AES-256-GCM.
-- **`kdf.ts` (§3.1, §3.3):** derive the master key from the password (scrypt), then split into the account key (encryption branch) and `authVerifier` (auth branch) via two distinct HKDF `info` labels so neither yields the other.
+- **`kdf.ts` (§3.1, §3.3):** derive the master key from the password (Argon2id; legacy scrypt vaults read via the `algo` tag), then split into the account key (encryption branch) and `authVerifier` (auth branch) via two distinct HKDF `info` labels so neither yields the other.
 - **`crdt.ts` (§7.1, §13 decision):** vault = map of items; each item = map of fields; each field a **last-writer-wins register keyed by HLC**; tombstones for deletes. The **password field is a multi-value register** so divergent concurrent edits surface instead of being lost (per §13).
 - **`authlog.ts` (§5):** append-only, hash-chained, Ed25519-signed entries; user-with-device-subkeys identity model (§9 decision) — a user key signs device subkeys; the log lists people, each with a device set.
 - **`rotation.ts` (§10.2):** the conflict-free epoch scheme — `RotationRecord`, the `(epoch, hlc, deviceID)` total-order tiebreak, idempotent loser re-apply, and the security catch-up rotation.
@@ -108,7 +109,8 @@ Commands (mapping to spec):
 | `vault auth`                        | Generate this device’s keypair + `deviceId`; print **Token A** QR                                                                     | §9.2–9.3  |
 | `vault device-add`                  | Scan Token A; seal vault key to it; sign auth-log entry; print **Token B** QR                                                         | §9.4–9.6  |
 | `vault device-confirm`              | Scan Token B; unseal vault key; validate chain; build local replica                                                                   | §9.7–9.9  |
-| `vault add/get/list/edit/rm`        | Local CRUD → CRDT ops, encrypted under the vault key                                                                                  | §4, §7.1  |
+| `vault add/get/list/edit/rm`        | Local CRUD → CRDT ops, encrypted under the vault key (items carry an `itemType`)                                                      | §4, §7.1  |
+| `vault totp <title>`                | Generate the current RFC 6238 TOTP code from a stored `totp` secret (base32 / otpauth URI); `get` also shows it inline                | §4        |
 | `vault sync`                        | Anti-entropy round with the relay (and any direct peers)                                                                              | §7.4, §8  |
 | `vault rotate` / `device-remove`    | Conflict-free epoch rotation; signed removal                                                                                          | §10.2     |
 | `vault run [.env] -- <cmd>`         | Resolve empty/declared env vars from the vault; inject into the child process env; never persists secrets                             | new       |
@@ -140,7 +142,7 @@ Any declared variable left unresolved makes `run` **fail fast before spawning** 
 
 **Zero-dependency.** The dotenv parser is ~30 lines in `core` (no `dotenv` package); `spawn` and flag parsing (`node:util` `parseArgs`) are built-ins.
 
-**Flags.** `--env <file>` (default `./.env`), `--vault <name>` (which vault names resolve against; default vault), `--allow-missing` (warn instead of failing on unresolved vars).
+**Flags.** `--env <file>` (default `./.env`), `--vault <name>` (which vault names resolve against; default vault), `--allow-missing` (warn instead of failing on unresolved vars), `--mask` (pipe the child's stdout/stderr through the secret scrubber so an echoed secret is redacted — opt-in because piping forgoes a child TTY; see §11).
 
 Security exposure of env injection is covered in §11.
 
@@ -245,7 +247,7 @@ All zero-dependency:
 - **Ed25519 sign/verify:** `generateKeyPairSync('ed25519')`; `crypto.sign(null, msg, priv)` / `crypto.verify(null, msg, pub, sig)`.
 - **AEAD:** `createCipheriv('aes-256-gcm', key, iv)` (+ `getAuthTag`), or `'chacha20-poly1305'`.
 - **HKDF:** `crypto.hkdfSync('sha256', ikm, salt, info, len)`.
-- **Password KDF:** `crypto.scryptSync(pw, salt, 32, { N, r, p })` — scrypt is the decided KDF (§2).
+- **Password KDF:** `crypto.argon2('argon2id', { message: pw, nonce: salt, memory, passes, parallelism, tagLength: 32 })` — Argon2id is the decided KDF (§2); legacy vaults fall back to `crypto.scrypt(pw, salt, 32, { N, r, p })` via the stored `algo`.
 - **CSPRNG:** `crypto.randomBytes`.
 
 **Sealed-box (`crypto_box_seal` analog), the heart of grants/Token B (§3.2, §8):**
@@ -304,7 +306,7 @@ Relay store is just `ops` (opaque) + a per-`(team)` version-vector view. The rel
 - **At-rest keys:** private keys stored only as `encryptedPrivKeys` (sealed under the account key). v1 unlock = passphrase; OS-keychain/biometric unlock deferred to a native wrapper.
 - **Binary integrity:** sign every released SEA binary (`codesign` on macOS; Authenticode on Windows). Publish checksums.
 - **Relay trust:** per §8.4 the relay is untrusted — signatures + version vectors + order-independent CRDT mean it can delay but not forge/read/corrupt. The direct fallback path (§8.6, tailnet variant) is shipped (`vault serve` + `vault sync --tailnet`) so the hub can't eclipse two reachable devices.
-- **Env-var injection exposure (`vault run`).** Injected secrets are visible to the spawned process, its descendant processes, and same-user process introspection (e.g. `/proc/<pid>/environ`), and can surface in crash dumps. This is the inherent tradeoff of env injection — accepted because it keeps real secrets out of on-disk `.env` files. `vault run` never persists or logs resolved values; output masking (requires piping stdio rather than inheriting) and a per-access audit entry are candidate hardening steps.
+- **Env-var injection exposure (`vault run`).** Injected secrets are visible to the spawned process, its descendant processes, and same-user process introspection (e.g. `/proc/<pid>/environ`), and can surface in crash dumps. This is the inherent tradeoff of env injection — accepted because it keeps real secrets out of on-disk `.env` files. `vault run` never persists or logs resolved values. Two hardening steps are now implemented: a **per-access audit entry** (one stderr line naming the injected vars + command, never the values — parity with `vault proxy`), emitted on every `run`; and **output masking** via opt-in `--mask`, which pipes the child's stdout/stderr through the shared streaming scrubber (`cli/scrub.ts`) so an echoed secret is redacted. `--mask` is opt-in because piping (rather than inheriting) the child's output forgoes a TTY on those streams; stdin stays inherited so interactive prompts still work.
 - **Agent-proxy exposure (`vault proxy`, spec §13.2–13.3).** The proxy keeps the secret _value_ out of the agent, but a compromised-while-running agent can still drive authenticated calls to the legitimate upstream for the proxy’s lifetime (confused deputy). Contain by scope + lifetime: least-privilege keys, one upstream per rule, proxy only up for the agent’s session, **host-binding + egress allowlist** to block redirection/exfiltration, and loopback-only bind. The injected credential must never cross a cross-host redirect, and resolved values are never logged. Accepted tradeoff.
 - **Stability flags:** SEA (1.1) and `node:sqlite` are still maturing — pin Node’s exact patch version per release and re-run the full test matrix on every Node bump.
 - **Type-stripping discipline:** lint-ban `enum`/`namespace`/decorators so all source stays erasable and runnable without a transform.
@@ -376,15 +378,16 @@ compromised-while-unlocked host.
 
 ### Resolved in this revision
 
-- **Password KDF: scrypt** (§2, §8) — native `node:crypto` scrypt; no Argon2id, no WASM asset in v1.
+- **Password KDF: Argon2id** (§2, §8) — native `node:crypto` `argon2` (Node 26), the spec’s preferred primitive; zero-dep, no WASM asset. New vaults use Argon2id (64 MiB / 3 passes / 1 lane); legacy scrypt vaults still unlock via the stored `algo` discriminator (no migration). Both derivations are KAT-locked in tests.
 - **macOS: arm64 only** (§1, §7) — no x64 macOS build.
 - **Key-memory zeroing: accepted KNOWN ISSUE** (§11) — not fixable on the Node/V8 stack; mitigated, documented, and surfaced in the security review.
 - **Relay placement** — **both** shipped off one `relay/handler.ts` (self-hosted Node behind Tunnel _and_ Worker+Durable-Object); identical protocol, pick per deployment (see `relay/deploy/README.md`). The Worker reuses `core`/`relay/access` `node:crypto` via `nodejs_compat` (only `node:crypto` is pulled into the edge bundle; never `node:http`/`node:sqlite`).
 - **Agent-proxy policy format — DECIDED: reuse the `.env` manifest** (§5, spec §13). The proxy policy is expressed in the same manifest format and parser as `vault run` (a reserved `UPSTREAM=` key plus header/`?query` lines resolving `vault://` references) — no separate JSON/TOML config and no second parser. One `.env` can serve both `run` and `proxy`.
 - **Direct fallback path (§8.6)** — shipped as the **tailnet** variant. `vault serve` runs a keyless store-and-forward replica peer (works while locked) and `vault sync --tailnet[-only]` reconciles the same op-log over Tailscale, reusing `relay/handler.ts` (a peer is just another relay endpoint). Tailscale is the user's own OS install — shelled out to, not bundled, not an npm dep, so `check:deps` stays green. Pure-LAN/mDNS discovery not built.
+- **SEA module format — DECIDED: CommonJS for v1** (§7). `format:"cjs"` is the simplest SEA target and is what the bundle/`make-sea` pipeline ships; ESM (`mainFormat:"module"`) is supported by SEA but offers no benefit here. Revisit only if a future entrypoint needs top-level `await` that the bundler can't lower.
+- **Agent-proxy MITM / CONNECT mode — SHIPPED** (§5, spec §13.1). The `--connect` flag enables `HTTPS_PROXY`/`CONNECT` forward-proxy mode for clients with no base-URL override: it mints an **ephemeral, in-memory CA** (`cli/x509.ts`, hand-rolled on `node:crypto` — zero deps) and a per-host leaf, terminates the agent's TLS, and runs the decrypted request through the **same** injection / host-binding / scrubbing path as base-URL mode. Only the public CA cert touches disk; only the spawned child trusts it; the CA private key never leaves memory. Known constraints: **HTTP/1.1 only**, and cert-pinning clients correctly refuse — both documented limitations, not blockers. The reverse-proxy / base-URL mode remains the no-MITM default.
+- **Tailnet control-plane ownership — DECIDED: agnostic, default Tailscale-hosted** (§8.6, §11; spec §14). The CLI shells out to the user's own `tailscale` install and never talks to a control plane directly, so it works unchanged against **Tailscale-hosted** (default — lowest ops burden) or **self-hosted Headscale** (for users who want no third-party control plane). This is purely an operator deployment choice; the vault's confidentiality never depends on it (the tailnet is transport + access gate only). Documented in the README's "Direct tailnet fallback" section.
 
 ### Still open
 
-- **SEA module format** — CommonJS (simplest) vs ESM (`mainFormat:"module"`); CJS recommended for v1.
-- **Agent-proxy MITM mode** — the reverse-proxy / base-URL mode (spec §13.1) ships first; the `HTTPS_PROXY` / `CONNECT` mode needs a locally-trusted CA and is deferred / opt-in.
-- **Verify on the pinned Node 26 patch** — re-confirm SEA flags, `node:sqlite`, and type-stripping limits against the exact version used (these are actively evolving; see `spec.md` §13).
+- **Verify on the pinned Node 26 patch** — CI now pins an **exact** patch (`NODE_VERSION` in `.github/workflows/ci.yml`, currently `26.3.0`) for every job, and the SEA blob is built and injected on that same version (plan §11). The remaining ongoing task is to **re-confirm** SEA flags, `node:sqlite`, and type-stripping limits against the exact version on each deliberate Node bump (these are actively evolving; see `spec.md` §13).

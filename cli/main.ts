@@ -4,7 +4,9 @@
 
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
+import { ITEM_TYPES, isItemType, DEFAULT_ITEM_TYPE, type ItemType } from "../core/crdt.ts";
 import { Store } from "../core/store.ts";
+import { generateTotp, type TotpResult } from "../core/totp.ts";
 import {
 	init,
 	unlock,
@@ -57,11 +59,18 @@ Vault & items
                                Create a vault + personal keys; bootstrap the auth log
                                (--keychain folds in an OS keystore; --with-key picks
                                the Linux systemd-creds binding)
-  add <title> [--field k=v ...] [--password]   Add an item (password read from prompt)
+  add <title> [--type login|note|card|identity] [--field k=v ...] [--password]
+                               Add an item (password read from prompt; --type
+                               defaults to login)
   get <title> [--field name]   Show an item (or one field)
   list                         List item titles
-  edit <title> --field k=v...  Update fields
+  edit <title> [--type <t>] [--field k=v...]   Update fields and/or the item type
   rm <title>                   Delete (tombstone) an item
+  totp <title> [--name <field>]
+                               Print the current RFC-6238 TOTP code (default
+                               field "totp"; value is a base32 secret or an
+                               otpauth:// URI). The code goes to stdout (pipeable);
+                               the countdown to stderr. 'get' also shows it inline.
 
 Sync
   sync --relay <url> [--relay-token <t>] [--access-id <id> --access-secret <s>]
@@ -116,8 +125,12 @@ Recovery escrow (per-vault policy, spec §5)
   recover --user <id> --org-key <k>   Owner: reconstruct a locked-out member's keys
 
 Secrets into a command
-  run [--env <file>] [--vault <name>] [--allow-missing] -- <cmd> [args...]
-                               Resolve .env vars from the vault, inject, spawn
+  run [--env <file>] [--vault <name>] [--allow-missing] [--mask] -- <cmd> [args...]
+                               Resolve .env vars from the vault, inject, spawn.
+                               Emits a per-access audit line (injected var names,
+                               never values) to stderr. --mask pipes the child's
+                               stdout/stderr through the secret scrubber so an
+                               echoed secret is redacted (forgoes a child TTY).
   proxy --config <file> [--config <file> ...] [--vault <name>] [--port <n>] [--connect] [-- <cmd> [args...]]
                                Run a loopback credential-injecting proxy so an AI
                                agent USES a secret without SEEING it (spec §13).
@@ -179,6 +192,25 @@ const withSession = async (
 		await fn(session);
 	} finally {
 		store.close();
+	}
+};
+
+// Validate the optional --type flag against the item-type enum (spec §4).
+const parseItemType = (v: string | undefined): ItemType | undefined => {
+	if (v === undefined) return undefined;
+	if (!isItemType(v)) throw new Error(`invalid --type "${v}" (expected ${ITEM_TYPES.join("|")})`);
+	return v;
+};
+
+// Best-effort live TOTP for a stored secret field (used by `get`): undefined if
+// the field is absent or the secret is malformed — so `get` never fails over a
+// bad TOTP value. The dedicated `totp` command, by contrast, surfaces the error.
+const totpFor = (secret: string | undefined): TotpResult | undefined => {
+	if (secret === undefined) return undefined;
+	try {
+		return generateTotp(secret);
+	} catch {
+		return undefined;
 	}
 };
 
@@ -246,6 +278,7 @@ const main = async (): Promise<number> => {
 			vault: { type: "string" },
 			// per-command
 			field: { type: "string", multiple: true },
+			type: { type: "string" }, // add/edit: item type (login|note|card|identity)
 			password: { type: "boolean" },
 			name: { type: "string" },
 			relay: { type: "string" },
@@ -267,6 +300,7 @@ const main = async (): Promise<number> => {
 			"access-secret": { type: "string" },
 			env: { type: "string" }, // run
 			"allow-missing": { type: "boolean" }, // run
+			mask: { type: "boolean" }, // run: scrub the child's stdout/stderr
 			config: { type: "string", multiple: true }, // proxy: policy file(s)
 			connect: { type: "boolean" }, // proxy: also enable CONNECT/HTTPS_PROXY mode
 		},
@@ -310,12 +344,20 @@ const main = async (): Promise<number> => {
 		case "add":
 			await withSession(values, (s) => {
 				const title = rest[0];
-				if (!title) throw new Error("usage: vault add <title> [--field k=v ...] [--password]");
+				if (!title)
+					throw new Error(
+						"usage: vault add <title> [--type login|note|card|identity] [--field k=v ...] [--password]",
+					);
 				const fields = collectFields(values.field as string[] | undefined);
+				const itemType = parseItemType(values.type);
 				return (async () => {
 					if (values.password) fields.password = await readPassphrase("Item password: ");
-					const id = addItem(s, title, fields);
-					emit(`Added "${title}" (${id})\n`, { title, itemId: id });
+					const id = addItem(s, title, fields, itemType);
+					emit(`Added ${itemType ?? DEFAULT_ITEM_TYPE} "${title}" (${id})\n`, {
+						title,
+						itemId: id,
+						itemType: itemType ?? DEFAULT_ITEM_TYPE,
+					});
 				})();
 			});
 			return 0;
@@ -332,17 +374,34 @@ const main = async (): Promise<number> => {
 					if (v === undefined) throw new Error(`no field "${field}"`);
 					emit(`${v}\n`, { title, field, value: v });
 				} else {
-					let text = "";
+					let text = `type: ${item.itemType}\n`;
 					for (const [k, v] of Object.entries(item.fields)) text += `${k}: ${v}\n`;
 					if (item.passwords.length === 1) text += `password: ${item.passwords[0]}\n`;
 					else if (item.passwords.length > 1)
 						text += `password: <${item.passwords.length} conflicting values: ${item.passwords.join(" | ")}>\n`;
-					// JSON exposes the structured item (fields + the multi-value passwords).
+					// When a `totp` field holds a secret, surface the live code (the raw
+					// secret is still shown above as an ordinary field). A malformed
+					// secret simply omits the derived line rather than failing `get`.
+					const otp = totpFor(item.fields.totp);
+					if (otp) text += `otp: ${otp.code} (expires in ${otp.expiresInSec}s)\n`;
+					// JSON exposes the structured item (type + fields + the multi-value passwords).
 					emit(text, {
 						title,
 						itemId: item.itemId,
+						itemType: item.itemType,
 						fields: item.fields,
 						passwords: item.passwords,
+						...(otp
+							? {
+									otp: {
+										code: otp.code,
+										expiresIn: otp.expiresInSec,
+										period: otp.period,
+										digits: otp.digits,
+										algorithm: otp.algorithm,
+									},
+								}
+							: {}),
 					});
 				}
 			});
@@ -352,7 +411,11 @@ const main = async (): Promise<number> => {
 			await withSession(values, (s) => {
 				const items = listItems(s);
 				emit(items.map((i) => `${i.fields.title ?? i.itemId}\n`).join(""), {
-					items: items.map((i) => ({ itemId: i.itemId, title: i.fields.title ?? null })),
+					items: items.map((i) => ({
+						itemId: i.itemId,
+						title: i.fields.title ?? null,
+						itemType: i.itemType,
+					})),
 				});
 			});
 			return 0;
@@ -360,9 +423,13 @@ const main = async (): Promise<number> => {
 		case "edit":
 			await withSession(values, (s) => {
 				const title = rest[0];
-				if (!title) throw new Error("usage: vault edit <title> --field k=v ...");
-				editItem(s, title, collectFields(values.field as string[] | undefined));
-				emit(`Updated "${title}"\n`, { title });
+				if (!title) throw new Error("usage: vault edit <title> [--type <t>] [--field k=v ...]");
+				const itemType = parseItemType(values.type);
+				const fields = collectFields(values.field as string[] | undefined);
+				if (Object.keys(fields).length === 0 && !itemType)
+					throw new Error("nothing to update: pass --field k=v ... and/or --type <t>");
+				editItem(s, title, fields, itemType);
+				emit(`Updated "${title}"\n`, { title, ...(itemType ? { itemType } : {}) });
 			});
 			return 0;
 
@@ -372,6 +439,34 @@ const main = async (): Promise<number> => {
 				if (!title) throw new Error("usage: vault rm <title>");
 				removeItem(s, title);
 				emit(`Removed "${title}"\n`, { title });
+			});
+			return 0;
+
+		case "totp":
+			await withSession(values, (s) => {
+				const title = rest[0];
+				if (!title) throw new Error("usage: vault totp <title> [--name <field>]");
+				const item = getItem(s, title);
+				if (!item) throw new Error(`no item titled "${title}"`);
+				const fieldName = (values.name as string | undefined) ?? "totp";
+				const secret = item.fields[fieldName];
+				if (secret === undefined)
+					throw new Error(
+						`item "${title}" has no "${fieldName}" field (store a base32 secret or otpauth:// URI)`,
+					);
+				// Unlike `get`, a malformed secret surfaces as an error here.
+				const otp = generateTotp(secret);
+				// stdout gets the bare code (pipeable, e.g. `vault totp gh | pbcopy`); the
+				// human countdown goes to stderr so it never pollutes a pipe.
+				if (!values.json) process.stderr.write(`(expires in ${otp.expiresInSec}s)\n`);
+				emit(`${otp.code}\n`, {
+					title,
+					code: otp.code,
+					expiresIn: otp.expiresInSec,
+					period: otp.period,
+					digits: otp.digits,
+					algorithm: otp.algorithm,
+				});
 			});
 			return 0;
 
@@ -735,6 +830,7 @@ const main = async (): Promise<number> => {
 						envFile: (values.env as string | undefined) ?? "./.env",
 						defaultVault: (values.vault as string | undefined) ?? session.vaultId,
 						allowMissing: !!values["allow-missing"],
+						mask: !!values.mask,
 					},
 					rest[0]!,
 					rest.slice(1),

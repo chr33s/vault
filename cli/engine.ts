@@ -16,7 +16,10 @@ import {
 	VaultState,
 	buildItemOps,
 	buildDeleteOp,
+	ITEM_TYPE_FIELD,
+	DEFAULT_ITEM_TYPE,
 	type FieldOp,
+	type ItemType,
 	type ItemView,
 } from "../core/crdt.ts";
 import * as cr from "../core/crypto.ts";
@@ -583,18 +586,31 @@ export type ItemFields = Record<string, string | null>;
 const findByTitle = (s: Session, title: string): ItemView | undefined =>
 	s.state.list().find((i) => i.fields.title === title);
 
-export const addItem = (s: Session, title: string, fields: ItemFields): string => {
+export const addItem = (
+	s: Session,
+	title: string,
+	fields: ItemFields,
+	itemType: ItemType = DEFAULT_ITEM_TYPE,
+): string => {
 	const itemId = cr.randomBytes(16).toString("hex");
-	const ops = buildItemOps(itemId, { title, ...fields }, () => encodeHLC(s.clock.tick()));
+	const ops = buildItemOps(itemId, { title, ...fields, [ITEM_TYPE_FIELD]: itemType }, () =>
+		encodeHLC(s.clock.tick()),
+	);
 	emitOps(s, ops);
 	return itemId;
 };
 
-export const editItem = (s: Session, title: string, fields: ItemFields): void => {
+export const editItem = (
+	s: Session,
+	title: string,
+	fields: ItemFields,
+	itemType?: ItemType,
+): void => {
 	const item = findByTitle(s, title);
 	if (!item) throw new Error(`no item titled "${title}"`);
 	const livePw = s.state.livePasswordHlcs(item.itemId);
-	const ops = buildItemOps(item.itemId, fields, () => encodeHLC(s.clock.tick()), livePw);
+	const merged: ItemFields = itemType ? { ...fields, [ITEM_TYPE_FIELD]: itemType } : fields;
+	const ops = buildItemOps(item.itemId, merged, () => encodeHLC(s.clock.tick()), livePw);
 	emitOps(s, ops);
 };
 
@@ -652,7 +668,7 @@ export const rotate = (s: Session, membership = replay(s.store.authLog())): numb
 	// Re-encrypt existing items under the new epoch. If a concurrent rotation
 	// later wins this epoch, the next sync adopts its key and re-emits again.
 	for (const item of s.state.list()) {
-		const fields: ItemFields = { ...item.fields };
+		const fields: ItemFields = { ...item.fields, [ITEM_TYPE_FIELD]: item.itemType };
 		if (item.passwords.length > 0) fields.password = item.passwords[item.passwords.length - 1]!;
 		const livePw = s.state.livePasswordHlcs(item.itemId);
 		emitOps(

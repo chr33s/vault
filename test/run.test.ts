@@ -61,6 +61,81 @@ test("vault run fails before spawning when a required var is unresolved", async 
 	}
 });
 
+test("vault run --mask redacts an injected secret echoed by the child", async () => {
+	const dir = await tmp();
+	try {
+		const store = new Store(join(dir, "v.db"));
+		await init(store, PASS);
+		const s = await unlock(store, PASS);
+		addItem(s, "TOKEN", { password: "supersecretvalue" });
+
+		const envFile = join(dir, ".env");
+		await writeFile(envFile, "TOKEN=\n");
+
+		// Capture this process's stdout while the child echoes the secret. With
+		// --mask the child's stdout is piped through the scrubber, so the value
+		// must come out [REDACTED] rather than verbatim.
+		const chunks: string[] = [];
+		const realWrite = process.stdout.write.bind(process.stdout);
+		(process.stdout as { write: unknown }).write = (c: string | Uint8Array): boolean => {
+			chunks.push(typeof c === "string" ? c : Buffer.from(c).toString());
+			return true;
+		};
+		let code: number;
+		try {
+			code = await run(
+				s,
+				{ envFile, defaultVault: s.vaultId, allowMissing: false, mask: true },
+				process.execPath,
+				["-e", "process.stdout.write(process.env.TOKEN + '\\n')"],
+			);
+		} finally {
+			(process.stdout as { write: unknown }).write = realWrite;
+		}
+		const out = chunks.join("");
+		assert.equal(code, 0);
+		assert.ok(!out.includes("supersecretvalue"), "the echoed secret is scrubbed from child stdout");
+		assert.ok(out.includes("[REDACTED]"), "the redaction marker replaces it");
+		store.close();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("vault run emits a per-access audit line naming vars, never values", async () => {
+	const dir = await tmp();
+	try {
+		const store = new Store(join(dir, "v.db"));
+		await init(store, PASS);
+		const s = await unlock(store, PASS);
+		addItem(s, "APIKEY", { password: "do-not-leak-me" });
+
+		const envFile = join(dir, ".env");
+		await writeFile(envFile, "APIKEY=\n");
+
+		const errs: string[] = [];
+		const realWrite = process.stderr.write.bind(process.stderr);
+		(process.stderr as { write: unknown }).write = (c: string | Uint8Array): boolean => {
+			errs.push(typeof c === "string" ? c : Buffer.from(c).toString());
+			return true;
+		};
+		try {
+			await run(s, { envFile, defaultVault: s.vaultId, allowMissing: false }, process.execPath, [
+				"-e",
+				"0",
+			]);
+		} finally {
+			(process.stderr as { write: unknown }).write = realWrite;
+		}
+		const err = errs.join("");
+		assert.match(err, /audit: .* injected \[APIKEY\]/, "audit names the injected var");
+		assert.ok(!err.includes("do-not-leak-me"), "audit never contains the value");
+		store.close();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("vault run --allow-missing proceeds despite an unresolved var", async () => {
 	const dir = await tmp();
 	try {

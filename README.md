@@ -1,10 +1,10 @@
 # vault
 
 End-to-end encrypted, **local-first** credential vault — Architecture C from the
-[design spec](./vault.spec.md.md): a dependency-free core + an always-on,
+[design spec](./vault.spec.md): a dependency-free core + an always-on,
 zero-knowledge Cloudflare relay. Implemented in TypeScript on Node, with the CLI
 shipped as a single native executable and the relay as a long-lived Node process
-behind Cloudflare Tunnel + Access. See the [implementation plan](./vault.plan.md.md).
+behind Cloudflare Tunnel + Access. See the [implementation plan](./vault.plan.md).
 
 **Guiding constraint: zero runtime dependencies.** Everything resolves to
 `node:*` built-ins (crypto, sqlite, http, test, type-stripping, SEA). The only
@@ -29,7 +29,7 @@ test/    node:test specs
 
 | Milestone                      | Status | Notes                                                                                                                                                                                                                                                     |
 | ------------------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| M1 core + tests                | ✅     | crypto, sealed-box, scrypt KDF, HLC, field-level CRDT with password MV-register, signed Merkle-DAG auth log with deterministic fork reconciliation, conflict-free epochs, anti-entropy protocol, sqlite store                                             |
+| M1 core + tests                | ✅     | crypto, sealed-box, Argon2id KDF (legacy scrypt read path), HLC, field-level CRDT with password MV-register, signed Merkle-DAG auth log with deterministic fork reconciliation, conflict-free epochs, anti-entropy protocol, sqlite store                 |
 | M2 local CLI                   | ✅     | `init/add/get/list/edit/rm` + `run` against the local replica, no network                                                                                                                                                                                 |
 | M3 relay + sync                | ✅     | `node:http` relay (`/sync`, `/push`); the op log **and** the signed auth log, rotation records, and recovery grants all propagate; two CLIs converge through a relay                                                                                      |
 | M4 enrollment                  | ✅     | `auth` / `device-add` / `device-confirm` token handshake, auth-log validation, user-with-device-subkeys                                                                                                                                                   |
@@ -47,9 +47,12 @@ test/    node:test specs
 - X25519 key agreement, Ed25519 signing, AES-256-GCM AEAD, HKDF, CSPRNG.
 - **Sealed-box** (`crypto_box_seal` analog): ephemeral X25519 → ECDH → HKDF →
   AES-256-GCM, used for grants and Token B.
-- **Password KDF: scrypt** (async `crypto.scrypt`, threadpool-offloaded) — the
-  spec's documented Argon2id fallback, chosen to keep zero deps with no WASM
-  asset (plan §2). Cost params live in `kdfParams` so they can be raised later.
+- **Password KDF: Argon2id** (async `crypto.argon2`, threadpool-offloaded) — the
+  spec's preferred primitive, native in Node 26 so it stays zero-dep with no WASM
+  asset (plan §2). New vaults use 64 MiB / 3 passes / 1 lane; cost params + the
+  algorithm live in `kdfParams` so they can be raised later. **Legacy scrypt
+  vaults still unlock** (no migration): `kdfParams.algo` discriminates and the
+  scrypt path is retained, KAT-locked in tests.
 
 ## Running (dev)
 
@@ -71,6 +74,10 @@ npm run cli -- add github --field username=alice --field password=s3cr3t
 npm run cli -- list
 npm run cli -- get github
 
+# Items are typed (login|note|card|identity; default login) and support TOTP:
+npm run cli -- add github --type login --field totp=JBSWY3DPEHPK3PXP
+npm run cli -- totp github   # -> current 6-digit code on stdout (countdown on stderr)
+
 # Relay
 npm run relay               # listens on :8731
 
@@ -86,6 +93,25 @@ firing when a removal is unobserved), cross-user sharing with removal lockout,
 recovery escrow, multi-vault isolation, and a **smoke test that drives the
 generated single-file binary** through `init/add/list/get`, a relay sync round,
 and a second-device enrollment.
+
+## Typed items & TOTP (spec §4)
+
+Every item carries an `itemType` (`login` | `note` | `card` | `identity`,
+default `login`; set with `add`/`edit --type`). A `totp` field holding a
+**base32 secret** or an **`otpauth://totp/...` URI** is recognized as a
+one-time-password source:
+
+- `vault totp <title>` prints the current RFC 6238 code to **stdout** (pipeable,
+  e.g. `vault totp gh | pbcopy`) with the countdown on stderr; `--name <field>`
+  selects a different field.
+- `vault get <title>` also shows the live code inline (`otp: 123456 (expires in
+17s)`) next to the item's fields.
+
+Generation is dependency-free (`node:crypto` HMAC + a small base32 decoder):
+SHA1/SHA256/SHA512 and custom digits/period via the otpauth URI, KAT-checked
+against the RFC 6238 test vectors. Both the type (a reserved `__type__` field)
+and the TOTP secret live **inside the encrypted item content** — never plaintext
+metadata to the relay.
 
 ## `vault run` — secrets into a command, `.env` stays secret-free
 
@@ -105,6 +131,14 @@ a warning). Resolution is offline/instant (reads the local SQLite replica).
 # .env:  DATABASE_URL=  (empty → resolved from the vault)
 vault run --env .env -- ./server
 ```
+
+Every `run` emits a per-access **audit** line to stderr naming the injected
+variables and the command (never the values), for parity with `vault proxy`.
+Pass `--mask` to pipe the child's stdout/stderr through the same secret scrubber
+(`cli/scrub.ts`) the proxy uses, so a secret the child echoes is redacted to
+`[REDACTED]`. `--mask` is opt-in because piping (rather than inheriting) the
+child's output forgoes a TTY on those streams; stdin stays inherited, so
+interactive prompts still work.
 
 ## `vault proxy` — let an AI agent USE a secret without SEEING it (spec §13)
 
@@ -293,6 +327,14 @@ store-and-forward replica. Tailscale is the user's own OS install (shelled out
 to via its CLI, not bundled, not an npm dependency). Set `VAULT_TAILNET=1` to
 enable the tailnet leg of every `sync` without the flag.
 
+**Control plane is your choice.** Because the CLI only shells out to your local
+`tailscale` and never talks to a control plane directly, the tailnet leg works
+unchanged against the **Tailscale-hosted** control plane (the default, lowest
+operational burden) or a **self-hosted [Headscale](https://github.com/juanfont/headscale)**
+(no third-party control plane). This is purely an operator deployment choice —
+the control plane gates access and sees device metadata but **never** vault
+confidentiality (ops stay end-to-end encrypted regardless).
+
 ## Multiple vaults
 
 A user can belong to many vaults; each is an independent local replica.
@@ -401,7 +443,8 @@ terminal-level "secure input" exists but is narrow and platform-specific:
 
 - **No reliable key-memory zeroing in JS/V8** — accepted KNOWN ISSUE, not a
   defect. Mitigated by minimizing key lifetime and never logging secrets.
-- **At-rest keys** are sealed under the account key (scrypt-derived). Optionally,
+- **At-rest keys** are sealed under the account key (Argon2id-derived; scrypt for
+  legacy vaults). Optionally,
   `vault init --keychain` / `vault keystore enable` folds an OS keystore second
   factor into the wrap key (`HKDF(accountKey, device-unlock-key)`), so a stolen
   disk can't be brute-forced offline at any passphrase strength. Providers:

@@ -41,6 +41,34 @@ test("init + add + materialize round-trips through the store", async () => {
 	}
 });
 
+test("itemType: typed items persist, default to login, and survive rotation", async () => {
+	const dir = await tmp();
+	try {
+		const store = new Store(join(dir, "v.db"));
+		await init(store, PASS);
+		const s = await unlock(store, PASS);
+		addItem(s, "gh", { username: "alice", password: "pw" }); // default type
+		addItem(s, "card", { number: "4111" }, "card");
+		addItem(s, "ssn", {}, "identity");
+
+		const fresh = await unlock(store, PASS); // reload from disk
+		assert.equal(getItem(fresh, "gh")!.itemType, "login", "absent type defaults to login");
+		assert.equal(getItem(fresh, "card")!.itemType, "card");
+		assert.equal(getItem(fresh, "ssn")!.itemType, "identity");
+		// The reserved type field must not leak into the visible field map.
+		assert.ok(!("__type__" in getItem(fresh, "card")!.fields));
+
+		// Rotation re-encrypts every item under a new epoch; the type must survive.
+		rotate(fresh);
+		const afterRotate = await unlock(store, PASS);
+		assert.equal(getItem(afterRotate, "card")!.itemType, "card", "type preserved across rotation");
+		assert.equal(getItem(afterRotate, "card")!.fields.number, "4111");
+		store.close();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("wrong passphrase is rejected", async () => {
 	const dir = await tmp();
 	try {
