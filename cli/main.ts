@@ -118,14 +118,17 @@ Recovery escrow (per-vault policy, spec §5)
 Secrets into a command
   run [--env <file>] [--vault <name>] [--allow-missing] -- <cmd> [args...]
                                Resolve .env vars from the vault, inject, spawn
-  proxy --config <file> [--config <file> ...] [--vault <name>] [--port <n>] [-- <cmd> [args...]]
+  proxy --config <file> [--config <file> ...] [--vault <name>] [--port <n>] [--connect] [-- <cmd> [args...]]
                                Run a loopback credential-injecting proxy so an AI
                                agent USES a secret without SEEING it (spec §13).
                                The .env-format policy uses a reserved UPSTREAM=
                                line + header/?query lines (same vault:// refs as
                                run). With -- <cmd>, spawns the agent pointed at
                                the proxy (secret absent from its env); else runs
-                               in the foreground. Port default ${DEFAULT_PROXY_PORT}.
+                               in the foreground. --connect also enables
+                               HTTPS_PROXY/CONNECT mode (ephemeral in-memory CA)
+                               for clients without a base-URL override. Port
+                               default ${DEFAULT_PROXY_PORT}.
 
 Global: --vault <name> selects a vault (default "${DEFAULT_VAULT}"); --db <path> overrides the file.
   --json                       Emit one JSON object per command (machine contract for wrappers).
@@ -265,6 +268,7 @@ const main = async (): Promise<number> => {
 			env: { type: "string" }, // run
 			"allow-missing": { type: "boolean" }, // run
 			config: { type: "string", multiple: true }, // proxy: policy file(s)
+			connect: { type: "boolean" }, // proxy: also enable CONNECT/HTTPS_PROXY mode
 		},
 	});
 
@@ -755,7 +759,8 @@ const main = async (): Promise<number> => {
 				const pass = await readPassphrase();
 				const session = await unlock(store, pass, await unlockKeyStore(store));
 				const port = Number(values.port ?? DEFAULT_PROXY_PORT);
-				return await proxyCmd(session, { configFiles, port }, rest[0], rest.slice(1));
+				const connect = Boolean(values.connect);
+				return await proxyCmd(session, { configFiles, port, connect }, rest[0], rest.slice(1));
 			} finally {
 				store.close();
 			}

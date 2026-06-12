@@ -138,7 +138,53 @@ line (upstream + rule names + timestamp, never the value). Pass `--config`
 repeatedly for multiple upstreams. For known SDKs the spawned child's base-URL
 env is preset automatically (`ANTHROPIC_BASE_URL`,
 `OPENAI_BASE_URL`/`OPENAI_API_BASE`); otherwise point the agent at
-`$VAULT_PROXY_URL`. TLS-interception (CONNECT/MITM) mode is deferred (§13.1).
+`$VAULT_PROXY_URL`.
+
+For clients that have no base-URL override and only honor `HTTPS_PROXY`, pass
+`--connect` to additionally enable forward-proxy (CONNECT) mode (spec §13.1).
+The proxy mints an **ephemeral, in-memory CA** (`cli/x509.ts`, hand-rolled on
+`node:crypto` — zero deps) and, per allowlisted host, a leaf cert; it terminates
+the agent's TLS and runs the decrypted request through the **same** injection /
+host-binding / scrubbing path as base-URL mode. Only the public CA cert is ever
+written to disk, only the spawned child trusts it (via `NODE_EXTRA_CA_CERTS` /
+`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE`), and the CA private
+key never leaves memory — so there is no system trust store to install or clean
+up, and a captured cert is useless next session. A CONNECT to a non-allowlisted
+host is refused **before** TLS starts (no cert is minted), preserving the egress
+boundary. Cert-pinning clients will correctly refuse; HTTP/1.1 only for now.
+
+As a backstop to "never logged", every resolved value is registered with a
+scrubber (`cli/scrub.ts`) that redacts it — plus its URL-encoded, JSON-escaped,
+and base64 forms — to a single uniform `[REDACTED]` marker across **every** egress
+path: proxy error messages, relayed response headers (e.g. a `Location` echoing
+an injected query param), CLI error output, crash dumps (scrubbed
+`uncaughtException`/`unhandledRejection` handlers), and response bodies. Relayed
+**textual, uncompressed** response bodies (on every status, success included — a
+2xx/3xx can echo an injected credential too) run through a streaming scrubber
+(`makeScrubStream`, a `node:stream` Transform driven by `pipeline`) that never
+buffers the whole body: SSE/streaming stays responsive — it holds back only the
+minimal tail that could begin a secret, not a fixed window — and re-examines a
+carry-over across chunk boundaries so a secret split across packets is still
+caught. Because redaction changes the body length, a scrubbed body drops
+`content-length` and is sent chunked. **Compressed or binary bodies are relayed
+byte-exact** (gated on `content-type`/`content-encoding`): redaction can't help
+there — a secret isn't present as plaintext — and would risk corrupting the
+payload. The proxy refuses to start under `NODE_DEBUG` values that would enable
+Node's internal http/net/tls logging (including the `*` and `htt*` glob forms)
+beneath any scrubbing. Best-effort by design: compressed bodies, exotic
+encodings (hex), textual echoes with no `content-type`, and values shorter than
+6 chars pass through.
+
+The **relay** closes the same "an error dumps the request" leak from the other
+direction. It holds no vault secret (payloads are opaque ciphertext), so there
+is nothing to register with the scrubber — but it does see the Cloudflare Access
+credential on every request. Being zero-knowledge, it never needs to log a
+header or body, so instead of a blocklist scrubber it uses an **allowlist**: an
+unexpected error always returns a fixed `{"error":"internal error"}` (never the
+raw `err.message`), and the Node relay installs message-only fatal handlers in
+place of Node's default object-dumping crash handler (`relay/log.ts`). On the
+Worker placement the same blanket-500 keeps raw exceptions out of Workers Logs /
+`wrangler tail`.
 
 ## Device enrollment (spec §9)
 

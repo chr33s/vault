@@ -17,6 +17,7 @@ import type { GrantRow } from "../core/protocol.ts";
 import type { RotationRecord } from "../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "./access.ts";
 import { handle, type RelayStorage } from "./handler.ts";
+import { GENERIC_500, installSafeFatalHandlers } from "./log.ts";
 
 // ---- relay storage (team-partitioned opaque op log) ----
 
@@ -198,8 +199,10 @@ export const createRelay = (opts: RelayOptions = {}): { server: Server; store: R
 				},
 			);
 			send(res, status, body);
-		})().catch((err) => {
-			send(res, 500, { error: err instanceof Error ? err.message : "internal error" });
+		})().catch(() => {
+			// Never echo err.message: it could carry the request's Access credential.
+			// Diagnostics stay server-side via the safe fatal handler / process logs.
+			send(res, 500, GENERIC_500);
 		});
 	});
 
@@ -241,6 +244,8 @@ export { sdNotify, startWatchdog };
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
+	// Replace Node's default crash dumper before we hold any Access credentials.
+	installSafeFatalHandlers();
 	const port = Number(process.env.PORT ?? 8731);
 	const tokens = process.env.VAULT_RELAY_TOKENS;
 	const access: AccessConfig = {

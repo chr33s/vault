@@ -15,6 +15,7 @@ import { verifyEnvelope } from "../core/protocol.ts";
 import type { Store } from "../core/store.ts";
 import { authorizeHeaders, type AccessConfig } from "../relay/access.ts";
 import { handle } from "../relay/handler.ts";
+import { GENERIC_500 } from "../relay/log.ts";
 import { PeerStore } from "./peerstore.ts";
 
 const readBody = async (req: IncomingMessage): Promise<unknown> => {
@@ -69,8 +70,9 @@ export const createPeerServer = (
 				},
 			);
 			send(res, status, body);
-		})().catch((err) => {
-			send(res, 500, { error: err instanceof Error ? err.message : "internal error" });
+		})().catch(() => {
+			// Never echo err.message: it could carry the request's tailnet/Access token.
+			send(res, 500, GENERIC_500);
 		});
 	});
 };

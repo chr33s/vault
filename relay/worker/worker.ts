@@ -193,6 +193,15 @@ const toRelayRequest = (req: Request, access: AccessConfig) => ({
 	access,
 });
 
+// A JSON error response with a fixed, credential-free body. Errors are never
+// echoed verbatim on Workers — the runtime would log the raw exception to
+// Workers Logs / `wrangler tail`, persisted off-box (spec §8: zero-knowledge).
+const jsonError = (status: number, error: string): Response =>
+	new Response(JSON.stringify({ error }), {
+		status,
+		headers: { "content-type": "application/json" },
+	});
+
 // The Durable Object: one instance per teamId, owning that team's SQLite.
 export class RelayDO {
 	private store: DoRelayStorage;
@@ -202,17 +211,24 @@ export class RelayDO {
 		this.env = env;
 	}
 	async fetch(req: Request): Promise<Response> {
-		const access = accessFromEnv(this.env);
-		const rr = toRelayRequest(req, access);
-		const { status, body } = await handle(rr, this.store, {
-			authorize: (header) => authorizeHeaders(header, access),
-			// Cheap integrity check; clients re-verify signatures against the auth log.
-			verifyOp: (op) => verifyEnvelope(op),
-		});
-		return new Response(JSON.stringify(body), {
-			status,
-			headers: { "content-type": "application/json" },
-		});
+		try {
+			const access = accessFromEnv(this.env);
+			const rr = toRelayRequest(req, access);
+			const { status, body } = await handle(rr, this.store, {
+				authorize: (header) => authorizeHeaders(header, access),
+				// Cheap integrity check; clients re-verify signatures against the auth log.
+				verifyOp: (op) => verifyEnvelope(op),
+			});
+			return new Response(JSON.stringify(body), {
+				status,
+				headers: { "content-type": "application/json" },
+			});
+		} catch {
+			// Never surface (or let the runtime log) the raw error: on Workers it
+			// would land in Workers Logs / `wrangler tail` — persisted off-box — and
+			// could carry the request's Access credential. Return a blank 500.
+			return jsonError(500, "internal error");
+		}
 	}
 }
 
@@ -220,27 +236,30 @@ export class RelayDO {
 // directly. The teamId is read from the JSON body (or `?team=` for health checks).
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
-		const url = new URL(req.url);
-		if (req.method === "GET" && url.pathname === "/health")
-			return new Response(JSON.stringify({ ok: true }), {
-				headers: { "content-type": "application/json" },
-			});
-		if (req.method !== "POST")
-			return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405 });
-
-		// Peek the teamId to pick the DO, then replay the body to the DO via a clone.
-		const raw = await req.text();
-		let teamId = "";
 		try {
-			teamId = (JSON.parse(raw || "{}") as { teamId?: string }).teamId ?? "";
-		} catch {
-			/* fall through to 400 below */
-		}
-		if (!teamId) return new Response(JSON.stringify({ error: "teamId required" }), { status: 400 });
+			const url = new URL(req.url);
+			if (req.method === "GET" && url.pathname === "/health")
+				return new Response(JSON.stringify({ ok: true }), {
+					headers: { "content-type": "application/json" },
+				});
+			if (req.method !== "POST") return jsonError(405, "method not allowed");
 
-		const id = env.RELAY_DO.idFromName(teamId);
-		const stub = env.RELAY_DO.get(id);
-		const forwarded = new Request(req.url, { method: "POST", headers: req.headers, body: raw });
-		return stub.fetch(forwarded);
+			// Peek the teamId to pick the DO, then replay the body to the DO via a clone.
+			const raw = await req.text();
+			let teamId = "";
+			try {
+				teamId = (JSON.parse(raw || "{}") as { teamId?: string }).teamId ?? "";
+			} catch {
+				/* fall through to 400 below */
+			}
+			if (!teamId) return jsonError(400, "teamId required");
+
+			const id = env.RELAY_DO.idFromName(teamId);
+			const stub = env.RELAY_DO.get(id);
+			const forwarded = new Request(req.url, { method: "POST", headers: req.headers, body: raw });
+			return stub.fetch(forwarded);
+		} catch {
+			return jsonError(500, "internal error");
+		}
 	},
 };
