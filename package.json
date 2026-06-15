@@ -21,14 +21,17 @@
 		"check:deps": "node build/check-deps.ts"
 	},
 	"devDependencies": {
-		"@types/node": "25.9.1",
-		"esbuild": "0.28.0",
-		"oxfmt": "0.52.0",
-		"oxlint": "1.67.0",
+		"@types/node": "25.9.3",
+		"esbuild": "0.28.1",
+		"oxfmt": "0.54.0",
+		"oxlint": "1.69.0",
 		"oxlint-tsgolint": "0.23.0",
 		"typescript": "6.0.3"
 	},
 	"engines": {
 		"node": "26.3.0"
+	},
+	"allowScripts": {
+		"esbuild@0.28.1": true
 	}
 }
