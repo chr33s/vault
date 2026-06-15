@@ -43,7 +43,7 @@ import { setJsonOutput, emit, emitError } from "./output.ts";
 import { dbPath, listVaultNames, DEFAULT_VAULT } from "./paths.ts";
 import { createPeerServer } from "./peerserver.ts";
 import { readPassphrase, setPassphraseSource, closePassphraseSource } from "./prompt.ts";
-import { proxy as proxyCmd, DEFAULT_PROXY_PORT } from "./proxy.ts";
+import { proxy as proxyCmd, DEFAULT_PROXY_PORT, ensureNoCoreDumps } from "./proxy.ts";
 import { syncWithRelay, type RelayAuth } from "./relayclient.ts";
 import { run as runCmd } from "./run.ts";
 import { syncTailnet, tailscaleStatus, DEFAULT_PEER_PORT } from "./tailnet.ts";
@@ -849,6 +849,15 @@ const main = async (): Promise<number> => {
 				throw new Error(
 					"usage: vault proxy --config <file> [--config <file> ...] [--port <n>] [-- <cmd> [args...]]",
 				);
+			// Memory hygiene (spec §13.2): the proxy holds the injected secret in
+			// memory, so disable core dumps before anything is unlocked. zero-dep
+			// Node can't setrlimit in-process; this re-execs once under `ulimit -c
+			// 0`. When the re-exec'd child took over it returns that child's exit
+			// code — propagate it and stop here, so this supervising parent never
+			// opens the store or unlocks below (no key material). A `undefined`
+			// means run the proxy in this process. Done before openStore.
+			const reexecCode = await ensureNoCoreDumps();
+			if (reexecCode !== undefined) return reexecCode;
 			const store = await openStore(values);
 			try {
 				if (!isInitialized(store)) throw new Error("vault not initialized; run `vault init`");

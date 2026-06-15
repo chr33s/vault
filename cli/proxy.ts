@@ -19,6 +19,7 @@
 // messages, crash dumps, upstreams echoing the request — get redacted too.
 
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
 import { readFile } from "node:fs/promises";
 import {
@@ -76,6 +77,172 @@ const BASE_URL_ENV: Record<string, string[]> = {
 };
 
 const RESERVED_UPSTREAM = "UPSTREAM";
+
+// ── Core-dump hardening (memory hygiene) ─────────────────────────────────────
+//
+// The proxy process holds the injected credential as a plaintext string for its
+// lifetime. Scrubbing keeps the value out of logs and crash *messages*, but a
+// core dump (or a debugger-attached snapshot) of this process would still expose
+// it in the heap. zero-dep Node has no way to `setrlimit(RLIMIT_CORE)` or
+// `prctl(PR_SET_DUMPABLE)` in-process, so the only portable lever is to ensure
+// the process was *launched* with core dumps disabled. We do that by re-exec'ing
+// the CLI once under the POSIX shell's `ulimit -c 0` before anything is unlocked
+// — so the short-lived supervising parent never loads key material, and the
+// re-exec'd child that actually runs the proxy cannot leave the secret in a core
+// file. mlock'ing the pages / zeroing the string remains out of reach in JS
+// (accepted posture, see cli/scrub.ts and plan §M8) — this closes the on-disk
+// crash-image leak, which is the part we can address.
+
+// Set on the re-exec'd child so it doesn't try to re-exec again (loop guard).
+const CORE_GUARD_ENV = "VAULT_PROXY_CORE_GUARD";
+// Operator escape hatch: skip the hardening (e.g. to capture a core while
+// debugging the proxy itself). Off by default.
+const CORE_OPT_OUT_ENV = "VAULT_PROXY_ALLOW_CORE";
+
+export type CoreDumpAction = "reexec" | "note" | "skip";
+
+// Pure decision: given the environment, do we re-exec to drop the core limit,
+// just print a note (platform we can't fix automatically), or do nothing?
+export const decideCoreDumpAction = (opts: {
+	platform: NodeJS.Platform;
+	guarded: boolean; // we are already the re-exec'd child
+	optOut: boolean; // operator asked us to leave core dumps alone
+	dumpsOff: boolean | undefined; // confirmed-off (true), confirmed-on (false), unknown (undefined)
+}): CoreDumpAction => {
+	if (opts.optOut) return "skip";
+	if (opts.guarded) return "skip"; // already re-exec'd: the limit is set, don't loop
+	if (opts.dumpsOff === true) return "skip"; // already disabled (e.g. systemd LimitCORE=0)
+	// `ulimit` + a POSIX `/bin/sh` exist on these, so re-exec to lower the limit.
+	// On darwin we can't probe the current limit (no /proc), so `dumpsOff` is
+	// always undefined and we re-exec every time — one extra short-lived process
+	// even though macOS already defaults the core limit to 0. Cheap, safe, and it
+	// keeps the guarantee uniform; not worth a shell-out just to detect.
+	if (opts.platform === "linux" || opts.platform === "darwin") return "reexec";
+	return "note"; // win32 / unknown: can't auto-fix; tell the operator how.
+};
+
+// Read this process's core-dump limit on Linux via /proc/self/limits. A soft
+// limit of 0 means no core is written regardless of the hard limit. Returns
+// undefined where we can't tell (non-Linux, or /proc unreadable).
+export const coreDumpsConfirmedOff = (): boolean | undefined => {
+	if (process.platform !== "linux") return undefined;
+	let text: string;
+	try {
+		text = readFileSync("/proc/self/limits", "utf8");
+	} catch {
+		return undefined;
+	}
+	const LABEL = "Max core file size";
+	for (const line of text.split("\n")) {
+		if (!line.startsWith(LABEL)) continue;
+		// Columns after the (space-containing) label: <soft> <hard> <units>.
+		const soft = line.slice(LABEL.length).trim().split(/\s+/)[0];
+		return soft === "0";
+	}
+	return undefined;
+};
+
+// Is this build a single-file SEA binary? Governs how we reconstruct argv for
+// the re-exec (a SEA has no script path; `node script.ts` does). Loaded
+// dynamically so the module still works if node:sea is unavailable.
+const isSeaBinary = async (): Promise<boolean> => {
+	try {
+		const sea = await import("node:sea");
+		return sea.isSea();
+	} catch {
+		return false;
+	}
+};
+
+// Relaunch this exact invocation under `/bin/sh` with the core limit zeroed,
+// then act only as a thin supervisor: forward signals and propagate the child's
+// exit. Resolves with the child's exit code so the caller returns it (and stops,
+// rather than continuing to unlock in this process); for signal-death we re-raise
+// the signal on ourselves (the idiomatic way to mirror it — the codebase's
+// no-`process.exit()` rule, see main.ts, is about clean-exit paths, not signal
+// re-raising) and the promise stays pending while we terminate. On a spawn
+// failure we resolve `undefined` so the caller falls back to running un-hardened
+// rather than failing the command outright.
+const reexecUnderZeroCore = async (): Promise<number | undefined> => {
+	const sea = await isSeaBinary();
+	const relaunch = sea
+		? [process.execPath, ...process.argv.slice(1)]
+		: [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+	return new Promise<number | undefined>((resolve) => {
+		const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+		// `exec "$@"` replaces the shell with our process, so the lowered limit is
+		// inherited and no extra shell lingers. Args are passed as argv (not
+		// interpolated), so values with spaces are safe.
+		const child = spawn(
+			"/bin/sh",
+			["-c", 'ulimit -c 0 2>/dev/null; exec "$@"', "sh", ...relaunch],
+			{ stdio: "inherit", env: { ...process.env, [CORE_GUARD_ENV]: "1" } },
+		);
+		const forward = (sig: NodeJS.Signals): void => {
+			child.kill(sig);
+		};
+		const cleanup = (): void => {
+			for (const s of signals) process.removeListener(s, forward);
+		};
+		for (const s of signals) process.on(s, forward);
+		child.on("error", (err) => {
+			cleanup();
+			process.stderr.write(
+				scrub(
+					`warning: vault proxy could not disable core dumps (${(err as NodeJS.ErrnoException).code ?? err.message}); continuing without it — run under \`ulimit -c 0\` to harden\n`,
+				),
+			);
+			resolve(undefined); // fall back to running in this (un-hardened) process
+		});
+		child.on("exit", (code, signal) => {
+			cleanup();
+			if (signal) {
+				// Re-raise so this supervisor dies of the same signal; leave the
+				// promise pending — we're already terminating.
+				process.kill(process.pid, signal);
+				return;
+			}
+			resolve(code ?? 0); // hand the code up; the caller returns it, loop drains
+		});
+	});
+};
+
+// Ensure the proxy process can't leave the injected secret in a core dump.
+// Called from the CLI dispatch BEFORE the vault is unlocked. Returns the re-exec'd
+// child's exit code when it took over (the caller must propagate it and stop —
+// the proxy ran in the hardened child), or `undefined` when the proxy should run
+// in THIS process (already hardened, opted out, unsupported platform, or the
+// re-exec couldn't spawn). Kept out of `proxy()` itself so importing/calling that
+// function never re-execs the caller.
+export const ensureNoCoreDumps = async (): Promise<number | undefined> => {
+	const guarded = Boolean(process.env[CORE_GUARD_ENV]);
+	const dumpsOff = coreDumpsConfirmedOff();
+	const action = decideCoreDumpAction({
+		platform: process.platform,
+		guarded,
+		optOut: Boolean(process.env[CORE_OPT_OUT_ENV]),
+		dumpsOff,
+	});
+	if (action === "skip") {
+		// We re-exec'd but the limit still reads non-zero: `ulimit` didn't take
+		// (unusual). Warn so the leak isn't silent.
+		if (guarded && dumpsOff === false)
+			process.stderr.write(
+				"warning: vault proxy could not disable core dumps; a crash image may contain the injected secret (set a hard `ulimit -c 0`)\n",
+			);
+		return undefined;
+	}
+	if (action === "note") {
+		// We can't auto-disable core dumps here (e.g. Windows, where the lever is
+		// WER crash-dump policy, not `ulimit`). Name the platform and point at the
+		// generic POSIX knob without implying it applies everywhere.
+		process.stderr.write(
+			`note: vault proxy cannot auto-disable core dumps on ${process.platform}; a crash image of the proxy may contain the injected secret. Disable core/crash dumps for the process via your OS (on POSIX: \`ulimit -c 0\`).\n`,
+		);
+		return undefined;
+	}
+	return await reexecUnderZeroCore();
+};
 
 // Parse one `.env`-format policy manifest. The reserved `UPSTREAM=` key names
 // the destination (taken as a literal URL — never resolved from the vault); a

@@ -13,9 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { connect as tlsConnect } from "node:tls";
+import { fileURLToPath } from "node:url";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { addItem, init, unlock, type Session } from "../cli/engine.ts";
-import { createProxyServer, loadPolicies, proxy } from "../cli/proxy.ts";
+import { createProxyServer, decideCoreDumpAction, loadPolicies, proxy } from "../cli/proxy.ts";
 import { createCa } from "../cli/x509.ts";
 import { Store } from "../core/store.ts";
 
@@ -991,3 +992,145 @@ test("installScrubbedFatalHandlers scrubs an uncaught exception dump (crash back
 	assert.ok(!stderr.includes("crash-secret-abcdef"), "the secret is scrubbed from the crash dump");
 	assert.match(stderr, /\[REDACTED\]/, "redaction marker present in the dump");
 });
+
+// ── Core-dump hardening (memory hygiene) ─────────────────────────────────────
+
+test("decideCoreDumpAction: re-exec only when dumps may be on, on a fixable platform", () => {
+	const base = { platform: "linux" as NodeJS.Platform, guarded: false, optOut: false };
+	// Dumps confirmed on (or unknown) on linux/darwin -> re-exec to lower them.
+	assert.equal(decideCoreDumpAction({ ...base, dumpsOff: false }), "reexec");
+	assert.equal(decideCoreDumpAction({ ...base, dumpsOff: undefined }), "reexec");
+	assert.equal(
+		decideCoreDumpAction({ ...base, platform: "darwin", dumpsOff: undefined }),
+		"reexec",
+	);
+	// Already off (e.g. systemd LimitCORE=0) -> nothing to do.
+	assert.equal(decideCoreDumpAction({ ...base, dumpsOff: true }), "skip");
+	// We are the re-exec'd child -> don't loop, regardless of the reading.
+	assert.equal(decideCoreDumpAction({ ...base, guarded: true, dumpsOff: false }), "skip");
+	// Operator opted out -> leave core dumps alone.
+	assert.equal(decideCoreDumpAction({ ...base, optOut: true, dumpsOff: false }), "skip");
+	// A platform we can't auto-fix -> note for the operator, don't re-exec.
+	assert.equal(decideCoreDumpAction({ ...base, platform: "win32", dumpsOff: undefined }), "note");
+});
+
+test(
+	"coreDumpsConfirmedOff reflects the real `ulimit -c` of the process (linux)",
+	{ skip: process.platform !== "linux" },
+	async () => {
+		const proxyUrl = new URL("../cli/proxy.ts", import.meta.url).href;
+		const prog =
+			`import { coreDumpsConfirmedOff } from ${JSON.stringify(proxyUrl)};` +
+			`process.stdout.write(String(coreDumpsConfirmedOff()));`;
+		// Run the same probe twice under the shell, once with the core limit zeroed
+		// (what our re-exec does) and once with it raised — the reader must agree.
+		const underUlimit = (limit: string): Promise<string> =>
+			new Promise((resolve) => {
+				const child = spawn(
+					"/bin/sh",
+					[
+						"-c",
+						`ulimit -c ${limit}; exec "$@"`,
+						"sh",
+						process.execPath,
+						"--input-type=module",
+						"-e",
+						prog,
+					],
+					{ stdio: ["ignore", "pipe", "ignore"] },
+				);
+				let out = "";
+				child.stdout.on("data", (c: Buffer) => {
+					out += c.toString();
+				});
+				child.on("exit", () => resolve(out));
+			});
+		assert.equal(await underUlimit("0"), "true", "a zeroed soft core limit reads as off");
+		assert.equal(await underUlimit("unlimited"), "false", "an unlimited core limit reads as on");
+	},
+);
+
+// End-to-end: the real CLI, launched with core dumps ENABLED, must re-exec the
+// proxy process under a zeroed core limit before unlocking. We prove it by having
+// the spawned agent read its parent's (the proxy process's) /proc/<ppid>/limits.
+test(
+	"the CLI re-execs the proxy process with core dumps disabled even when launched with them on",
+	{ skip: process.platform !== "linux" },
+	async () => {
+		const dir = await tmp();
+		try {
+			const mainTs = fileURLToPath(new URL("../cli/main.ts", import.meta.url));
+			const db = join(dir, "v.db");
+			const policyFile = join(dir, "policy.env");
+			const coreOut = join(dir, "core-limit.txt");
+			const env = { ...process.env, VAULT_PASSPHRASE: PASS };
+
+			const runCli = (args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<number> =>
+				new Promise((resolve) => {
+					const c = spawn(process.execPath, [mainTs, ...args], {
+						stdio: "ignore",
+						env: { ...env, ...extraEnv },
+					});
+					c.on("exit", (code) => resolve(code ?? 0));
+				});
+
+			assert.equal(await runCli(["--db", db, "init"]), 0, "vault init");
+			assert.equal(
+				await runCli(["--db", db, "add", "anthropic", "--field", "key=sk-supersecret"]),
+				0,
+				"add item",
+			);
+			await writeFile(
+				policyFile,
+				`UPSTREAM=https://api.anthropic.com\nx-api-key=vault://personal/anthropic/key\n`,
+			);
+
+			// The agent reads its parent — the proxy process that holds the secret —
+			// and records that process's core-file limit for us to inspect.
+			const agent =
+				`const fs=require('node:fs');` +
+				`const l=fs.readFileSync('/proc/'+process.ppid+'/limits','utf8')` +
+				`.split('\\n').find(x=>x.startsWith('Max core file size'));` +
+				`fs.writeFileSync(process.env.CORE_OUT, l);`;
+
+			// Launch the whole CLI under `ulimit -c unlimited`, so without the re-exec
+			// the proxy process would inherit an unlimited (dump-enabled) core limit.
+			const exit = await new Promise<number>((resolve) => {
+				const c = spawn(
+					"/bin/sh",
+					[
+						"-c",
+						`ulimit -c unlimited; exec "$@"`,
+						"sh",
+						process.execPath,
+						mainTs,
+						"--db",
+						db,
+						"proxy",
+						"--config",
+						policyFile,
+						"--port",
+						"0",
+						"--",
+						process.execPath,
+						"-e",
+						agent,
+					],
+					{ stdio: "ignore", env: { ...env, CORE_OUT: coreOut } },
+				);
+				c.on("exit", (code) => resolve(code ?? 0));
+			});
+			assert.equal(exit, 0, "the CLI exits cleanly");
+
+			const recorded = await readFile(coreOut, "utf8");
+			const soft = recorded.slice("Max core file size".length).trim().split(/\s+/)[0];
+			assert.equal(
+				soft,
+				"0",
+				`the proxy process ran with a zeroed core limit despite \`ulimit -c unlimited\` (saw: "${recorded.trim()}")`,
+			);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	},
+);

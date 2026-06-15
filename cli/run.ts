@@ -81,6 +81,14 @@ export const resolveEnv = async (s: Session, opts: ResolveOptions): Promise<Reso
 
 // Resolve and spawn. Forwards the child's exit code; resolved secrets live only
 // in the child's in-memory environment for the process lifetime.
+//
+// Unlike `vault proxy`, `run` does NOT disable core dumps. The two have different
+// exposures: `proxy` keeps the secret OUT of the child and holds it only in its
+// own memory, so a core dump of that process is the one place it could leak;
+// `run` deliberately hands the plaintext to the child's environment, where it is
+// already readable (e.g. /proc/<child>/environ) for the child's lifetime — so a
+// core dump is not the weak link, and re-exec'ing to zero the limit would buy
+// little. Operators who want it can launch `vault run` under `ulimit -c 0`.
 export const run = async (
 	s: Session,
 	opts: ResolveOptions,

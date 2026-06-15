@@ -168,8 +168,15 @@ Hardening (spec §13.2): binds loopback only; each secret is attached to its
 upstream host only; egress is allowlisted (an unconfigured host gets `403`);
 redirects are **not** followed (a credential can't hop to another host); the
 value is never logged or persisted; and every injection emits a stderr audit
-line (upstream + rule names + timestamp, never the value). Pass `--config`
-repeatedly for multiple upstreams. For known SDKs the spawned child's base-URL
+line (upstream + rule names + timestamp, never the value). **Core dumps are
+disabled** for the proxy process before it unlocks anything, so the injected
+secret can't be recovered from a crash image: since zero-dep Node can't
+`setrlimit` in-process, `vault proxy` re-execs itself once under `ulimit -c 0`
+(skipped when dumps are already off, e.g. a systemd `LimitCORE=0` unit; the
+short-lived supervising parent never loads key material; set
+`VAULT_PROXY_ALLOW_CORE=1` to opt out while debugging). mlock'ing the pages or
+zeroing the secret string remains out of reach in JS (accepted posture). Pass
+`--config` repeatedly for multiple upstreams. For known SDKs the spawned child's base-URL
 env is preset automatically (`ANTHROPIC_BASE_URL`,
 `OPENAI_BASE_URL`/`OPENAI_API_BASE`); otherwise point the agent at
 `$VAULT_PROXY_URL`.
