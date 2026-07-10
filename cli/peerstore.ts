@@ -9,7 +9,7 @@
 // no-op), so a tailnet peer that belongs to a *different* vault can never pull or
 // inject into this one's log even if it reaches the port and guesses nothing.
 
-import { entryHash, type LogEntry } from "../core/authlog.ts";
+import { entryHash, validRootGenesis, type LogEntry } from "../core/authlog.ts";
 import {
 	rotationId,
 	type GrantRow,
@@ -23,10 +23,13 @@ import type { RelayStorage } from "../relay/handler.ts";
 export class PeerStore implements RelayStorage {
 	private readonly store: Store;
 	private readonly vaultId: string;
+	private pinnedGenesisHash: string | undefined;
 
 	constructor(store: Store, vaultId: string) {
 		this.store = store;
 		this.vaultId = vaultId;
+		const genesis = store.authLog().find((e) => validRootGenesis(e, vaultId));
+		this.pinnedGenesisHash = genesis && entryHash(genesis);
 	}
 
 	private mine(teamId: string): boolean {
@@ -51,9 +54,28 @@ export class PeerStore implements RelayStorage {
 		if (this.mine(teamId)) this.store.appendAuthEntry({ ...entry, hash: entryHash(entry) });
 	}
 
+	pinGenesis(teamId: string, entry: LogEntry): boolean {
+		if (!this.mine(teamId)) return false;
+		if (!validRootGenesis(entry, teamId)) return false;
+		const hash = entryHash(entry);
+		this.pinnedGenesisHash ??= hash;
+		return this.pinnedGenesisHash === hash;
+	}
+
 	authExcept(teamId: string, have: Set<string>): LogEntry[] {
 		if (!this.mine(teamId)) return [];
-		return this.store.authLog().filter((e) => !have.has(e.hash));
+		const seen = new Set(have);
+		return this.store.authLog().filter((entry) => {
+			const hash = entryHash(entry);
+			if (
+				entry.body.type === "genesis" &&
+				(hash !== this.pinnedGenesisHash || !validRootGenesis(entry, teamId))
+			)
+				return false;
+			if (seen.has(hash)) return false;
+			seen.add(hash);
+			return true;
+		});
 	}
 
 	putRotation(teamId: string, rec: RotationRecord): void {

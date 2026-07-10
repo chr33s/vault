@@ -66,10 +66,11 @@ test("parseDotenv: accepts proxy-policy keys (hyphens, leading ?)", () => {
 	]);
 });
 
-test("parseDotenv: ignores malformed lines (no valid key)", () => {
-	// A leading digit / lone '=' is not a valid key, so the line is dropped.
-	const decls = parseDotenv("1BAD=x\n=oops\nGOOD=y\n");
-	assert.deepEqual(decls, [{ key: "GOOD", value: "y" }]);
+test("parseDotenv: rejects malformed lines (no valid key)", () => {
+	// A leading digit / lone '=' is not a valid key. Rather than silently drop it
+	// (which would let `run` spawn missing a declared var), parsing fails loudly.
+	assert.throws(() => parseDotenv("1BAD=x\nGOOD=y\n"), /malformed \.env line: 1BAD=x/);
+	assert.throws(() => parseDotenv("=oops\n"), /malformed \.env line: =oops/);
 });
 
 test("parseVaultRef: parses vault://<vault>/<item>[/<field>]", () => {

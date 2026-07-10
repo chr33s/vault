@@ -217,3 +217,78 @@ test("tamper-evidence: mutating an ancestor orphans its descendants", () => {
 	assert.equal(m.members.size, 0, "tampering destroys the derived membership");
 	assert.equal(deviceSignKey(m, "dev1"), undefined);
 });
+
+test("an admin cannot overwrite an existing member (owner-lockout guard)", () => {
+	const owner = id();
+	const admin = id();
+	const attacker = id();
+	let chain: LogEntry[] = [];
+	chain = add(chain, genesis(owner, "owner"), "owner", "user", owner.sign.privateKey);
+	chain = add(chain, userBody("admin", admin, "admin"), "owner", "user", owner.sign.privateKey);
+	// The admin signs an add-user reusing the owner's userId with attacker keys —
+	// an attempt to replace the owner's identity/role on every replica.
+	chain = add(chain, userBody("owner", attacker, "admin"), "admin", "user", admin.sign.privateKey);
+
+	const m = replay(chain);
+	const ownerMember = m.members.get("owner")!;
+	assert.equal(ownerMember.role, "owner", "owner role is preserved");
+	assert.equal(
+		ownerMember.signPub,
+		owner.sign.publicKey.toString("base64"),
+		"owner keys are not overwritten",
+	);
+});
+
+test("an admin cannot mint another owner via add-user", () => {
+	const owner = id();
+	const admin = id();
+	const mallory = id();
+	let chain: LogEntry[] = [];
+	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
+	chain = add(chain, userBody("admin", admin, "admin"), "owner", "user", owner.sign.privateKey);
+	chain = add(
+		chain,
+		{ ...userBody("mallory", mallory), role: "owner" } as EntryBody,
+		"admin",
+		"user",
+		admin.sign.privateKey,
+	);
+	assert.equal(replay(chain).members.has("mallory"), false, "owner-role add-user is rejected");
+});
+
+test("an admin cannot remove the owner", () => {
+	const owner = id();
+	const admin = id();
+	let chain: LogEntry[] = [];
+	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
+	chain = add(chain, userBody("admin", admin, "admin"), "owner", "user", owner.sign.privateKey);
+	chain = add(
+		chain,
+		{ type: "remove-user", userId: "owner" },
+		"admin",
+		"user",
+		admin.sign.privateKey,
+	);
+	assert.equal(replay(chain).members.get("owner")!.active, true, "owner stays active");
+});
+
+test("replay pins the genesis to the expected vaultId (forged-root rejected)", () => {
+	const owner = id();
+	const attacker = id();
+	// The real vault.
+	const real = add([], genesis(owner, "owner", "v-real"), "owner", "user", owner.sign.privateKey);
+	// A forged, self-signed rival genesis for a different vault, gossiped in.
+	const forged = makeEntry(
+		[],
+		genesis(attacker, "attacker", "v-evil"),
+		"attacker",
+		"user",
+		attacker.sign.privateKey,
+	);
+	const mixed = [...real, forged];
+	// Pinned to the real vaultId, the forged root can never be selected regardless
+	// of hash order.
+	const m = replay(mixed, "v-real");
+	assert.equal(m.vaultId, "v-real");
+	assert.equal(m.members.has("attacker"), false);
+});

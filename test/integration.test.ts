@@ -194,7 +194,7 @@ test("vault run resolves env precedence correctly", async () => {
 		process.env.AMBIENT = "from-ambient";
 		const { env, missing } = await resolveEnv(s, {
 			envFile,
-			defaultVault: s.vaultId,
+			openVault: "personal",
 			allowMissing: true,
 		});
 		delete process.env.AMBIENT;

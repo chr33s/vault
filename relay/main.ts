@@ -6,7 +6,14 @@
 import { execFile } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { DatabaseSync } from "node:sqlite";
-import { entryHash, type LogEntry } from "../core/authlog.ts";
+import {
+	entryHash,
+	replay,
+	deviceSignKey,
+	validRootGenesis,
+	type LogEntry,
+	type Membership,
+} from "../core/authlog.ts";
 import {
 	verifyEnvelope,
 	rotationId,
@@ -14,7 +21,7 @@ import {
 	type VersionVector,
 } from "../core/protocol.ts";
 import type { GrantRow } from "../core/protocol.ts";
-import type { RotationRecord } from "../core/rotation.ts";
+import { verifyRotation, wellFormedRotation, type RotationRecord } from "../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "./access.ts";
 import { handle, type RelayStorage } from "./handler.ts";
 import { GENERIC_500, installSafeFatalHandlers } from "./log.ts";
@@ -44,6 +51,10 @@ class RelayStore implements RelayStorage {
       hash    TEXT NOT NULL,
       entry   TEXT NOT NULL,
       PRIMARY KEY (team_id, hash)
+    );`);
+		this.db.exec(`CREATE TABLE IF NOT EXISTS relay_roots (
+      team_id TEXT PRIMARY KEY,
+      hash    TEXT NOT NULL
     );`);
 		this.db.exec(`CREATE TABLE IF NOT EXISTS relay_rotations (
       team_id   TEXT NOT NULL,
@@ -89,13 +100,63 @@ class RelayStore implements RelayStorage {
 			.prepare(`INSERT OR IGNORE INTO relay_authlog (team_id, hash, entry) VALUES (?, ?, ?)`)
 			.run(teamId, entryHash(entry), JSON.stringify(entry));
 	}
+	private rootHashFor(teamId: string, candidate?: string): string | undefined {
+		let pinned = this.db.prepare(`SELECT hash FROM relay_roots WHERE team_id = ?`).get(teamId) as
+			| { hash: string }
+			| undefined;
+		if (!pinned) {
+			// Upgrade path: preserve the first matching genesis already stored by an
+			// older relay instead of letting the next pusher choose a new root.
+			const rows = this.db
+				.prepare(`SELECT entry FROM relay_authlog WHERE team_id = ? ORDER BY rowid`)
+				.all(teamId) as Array<{ entry: string }>;
+			let legacyHash: string | undefined;
+			for (const row of rows) {
+				try {
+					const entry = JSON.parse(row.entry) as LogEntry;
+					if (validRootGenesis(entry, teamId)) {
+						legacyHash = entryHash(entry);
+						break;
+					}
+				} catch {
+					/* skip malformed legacy rows */
+				}
+			}
+			const initial = legacyHash ?? candidate;
+			if (!initial) return undefined;
+			this.db
+				.prepare(`INSERT OR IGNORE INTO relay_roots (team_id, hash) VALUES (?, ?)`)
+				.run(teamId, initial);
+			pinned = this.db.prepare(`SELECT hash FROM relay_roots WHERE team_id = ?`).get(teamId) as {
+				hash: string;
+			};
+		}
+		return pinned.hash;
+	}
+	pinGenesis(teamId: string, entry: LogEntry): boolean {
+		if (!validRootGenesis(entry, teamId)) return false;
+		const hash = entryHash(entry);
+		return this.rootHashFor(teamId, hash) === hash;
+	}
 	authExcept(teamId: string, haveHashes: Set<string>): LogEntry[] {
 		const rows = this.db
-			.prepare(`SELECT hash, entry FROM relay_authlog WHERE team_id = ?`)
-			.all(teamId) as Array<Record<string, unknown>>;
-		return rows
-			.filter((r) => !haveHashes.has(r.hash as string))
-			.map((r) => JSON.parse(r.entry as string) as LogEntry);
+			.prepare(`SELECT entry FROM relay_authlog WHERE team_id = ?`)
+			.all(teamId) as Array<{ entry: string }>;
+		const pinned = this.rootHashFor(teamId);
+		const seen = new Set(haveHashes);
+		return rows.flatMap((row) => {
+			try {
+				const entry = JSON.parse(row.entry) as LogEntry;
+				const hash = entryHash(entry);
+				if (entry.body.type === "genesis" && (hash !== pinned || !validRootGenesis(entry, teamId)))
+					return [];
+				if (seen.has(hash)) return [];
+				seen.add(hash);
+				return [entry];
+			} catch {
+				return [];
+			}
+		});
 	}
 	putRotation(teamId: string, rec: RotationRecord): void {
 		this.db
@@ -150,7 +211,48 @@ class RelayStore implements RelayStorage {
 		for (const r of rows) v[r.device_id as string] = r.m as number;
 		return v;
 	}
+
+	// Membership derived from the team's auth log, used to authenticate incoming
+	// op and rotation signatures (see the verifyOp/verifyRotation notes). The auth
+	// log only grows (INSERT OR IGNORE), so it is memoized by entry count and
+	// recomputed only when a new entry lands — a burst of ops in one push doesn't
+	// re-replay the DAG per op.
+	private memberCache = new Map<string, { count: number; membership: Membership }>();
+	membershipFor(teamId: string): Membership | undefined {
+		const count = (
+			this.db.prepare(`SELECT COUNT(*) AS c FROM relay_authlog WHERE team_id = ?`).get(teamId) as {
+				c: number;
+			}
+		).c;
+		let cached = this.memberCache.get(teamId);
+		if (!cached || cached.count !== count) {
+			try {
+				// teamId === vaultId: pin the genesis so a gossiped rival root can't
+				// change which keys authenticate ops.
+				cached = { count, membership: replay(this.authExcept(teamId, new Set()), teamId) };
+			} catch {
+				return undefined; // no valid genesis yet — nothing is authorized
+			}
+			this.memberCache.set(teamId, cached);
+		}
+		return cached.membership;
+	}
 }
+
+// An op is authentic iff signed by the author device's (currently-active) key.
+const opAuthentic = (store: RelayStore, op: OpEnvelope, teamId: string): boolean => {
+	const m = store.membershipFor(teamId);
+	const key = m && deviceSignKey(m, op.deviceId);
+	return !!key && verifyEnvelope(op, key);
+};
+
+// A rotation is accepted iff well-formed and signed by a device the auth log has
+// ever validly held (deviceKeys is retained across removal so a historically
+// valid rotation still verifies — matching the client's rule).
+const rotationAuthentic = (store: RelayStore, rec: RotationRecord, teamId: string): boolean => {
+	const key = store.membershipFor(teamId)?.deviceKeys.get(rec.signerId);
+	return !!key && wellFormedRotation(rec) && verifyRotation(rec, key);
+};
 
 const readBody = async (req: IncomingMessage): Promise<unknown> => {
 	const chunks: Buffer[] = [];
@@ -194,8 +296,11 @@ export const createRelay = (opts: RelayOptions = {}): { server: Server; store: R
 				store,
 				{
 					authorize: (header) => authorizeHeaders(header, access),
-					// Cheap integrity check; clients re-verify signatures against the auth log.
-					verifyOp: (op) => verifyEnvelope(op),
+					// Authenticate authorship: verify the op's signature against the
+					// author device's key in the auth log, so a member can't pre-claim
+					// (and thereby censor) another device's (deviceId, seq) slot.
+					verifyOp: (op, teamId) => opAuthentic(store, op, teamId),
+					verifyRotation: (rec, teamId) => rotationAuthentic(store, rec, teamId),
 				},
 			);
 			send(res, status, body);

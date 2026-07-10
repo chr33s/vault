@@ -141,7 +141,9 @@ struct ItemDetailView: View {
 		Section(passwords.count > 1 ? "Password (conflicting!)" : "Password") {
 			ForEach(Array(passwords.enumerated()), id: \.offset) { _, pw in
 				HStack {
-					Text(revealPassword ? pw : String(repeating: "•", count: max(pw.count, 8)))
+					// Fixed-width mask: never encode the true length (a screenshot /
+					// shoulder-surf of the dots would otherwise narrow a brute-force).
+					Text(revealPassword ? pw : "••••••••••")
 						.font(.system(.body, design: .monospaced))
 					Spacer()
 					Button(revealPassword ? "Hide" : "Reveal") { revealPassword.toggle() }

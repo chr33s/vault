@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile as execFileCb } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +23,26 @@ import { Store } from "../core/store.ts";
 
 const tmp = (): Promise<string> => mkdtemp(join(tmpdir(), "vault-"));
 const PASS = "test-passphrase";
+
+const runCli = (
+	args: string[],
+	env: NodeJS.ProcessEnv,
+): Promise<{ stdout: string; stderr: string; code: number }> =>
+	new Promise((resolve, reject) => {
+		execFileCb(
+			process.execPath,
+			[join(process.cwd(), "cli", "main.ts"), ...args],
+			{ env, encoding: "utf8", timeout: 15_000 },
+			(err, stdout, stderr) => {
+				if (err && typeof (err as { code?: unknown }).code !== "number") return reject(err);
+				resolve({
+					stdout: stdout as string,
+					stderr: stderr as string,
+					code: (err as { code?: number } | null)?.code ?? 0,
+				});
+			},
+		);
+	});
 
 test("parseStatus extracts self IPv4 and only online peers", () => {
 	const json = JSON.stringify({
@@ -125,6 +146,46 @@ test("peer server with a token rejects unauthenticated sync", async () => {
 
 		server.close();
 		store.close();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("tailnet-only CLI fails when every discovered peer is unreachable", async () => {
+	const dir = await tmp();
+	try {
+		const tailscale = join(dir, "tailscale-stub");
+		const status = JSON.stringify({
+			Self: { TailscaleIPs: ["127.0.0.2"] },
+			Peer: {
+				peer: {
+					TailscaleIPs: ["127.0.0.1"],
+					DNSName: "unreachable-peer.",
+					Online: true,
+				},
+			},
+		});
+		await writeFile(tailscale, `#!/bin/sh\nprintf '%s\\n' '${status}'\n`, { mode: 0o755 });
+
+		const env = {
+			...process.env,
+			VAULT_HOME: dir,
+			VAULT_PASSPHRASE: PASS,
+			TAILSCALE_BIN: tailscale,
+		};
+		assert.equal((await runCli(["--json", "init"], env)).code, 0);
+
+		// Port 1 on loopback has no peer server, so syncTailnet returns one
+		// per-peer failure instead of throwing. That still makes the only leg fail.
+		const result = await runCli(["--json", "sync", "--tailnet-only", "--port", "1"], env);
+		const output = JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+			ok: boolean;
+			error: string;
+		};
+		assert.equal(result.code, 1);
+		assert.equal(output.ok, false);
+		assert.match(output.error, /sync failed on all transports/);
+		assert.match(output.error, /tailnet: reached 0 peer\(s\), 1 unreachable/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

@@ -57,7 +57,11 @@ export const parseDotenv = (text: string): EnvDecl[] => {
 		const line = stripComment(rawLine); // strip trailing comments (quote-aware)
 		if (!line.trim()) continue;
 		const m = LINE.exec(line);
-		if (!m) continue;
+		// A non-empty, non-comment line that isn't a valid declaration (e.g. an
+		// invalid key like `2FA_TOKEN=`) must fail loudly: silently dropping it would
+		// bypass `run`'s "unresolved variables" guard and spawn the child missing a
+		// var the manifest declared.
+		if (!m) throw new Error(`malformed .env line: ${line.trim()}`);
 		const key = m[1]!;
 		if (m[2] === undefined) {
 			decls.push({ key, value: undefined }); // bare KEY

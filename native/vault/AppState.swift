@@ -47,7 +47,15 @@ final class AppState: ObservableObject {
 			vaults = try await cli.run(["vaults"], as: VaultsResponse.self).vaults
 			if selectedVault == nil, let first = vaults.first { select(vault: first) }
 		} catch {
-			vaults = []  // none yet / not initialized
+			vaults = []
+			// `vault vaults` returns {vaults:[]} for an empty-but-healthy state, so a
+			// thrown error here is not "no vaults yet" — it's a spawn/exec failure
+			// (missing or non-executable CLI binary) or unparseable output. Surface it
+			// instead of masquerading as an empty device, which would leave the user
+			// staring at a disabled "create a vault" screen with no diagnostic.
+			errorMessage =
+				(error as? CLIError)?.message
+				?? "could not run the vault CLI: \(error.localizedDescription)"
 		}
 	}
 
@@ -98,12 +106,17 @@ final class AppState: ObservableObject {
 	func createVault(name: String, passphrase pass: String, useKeychain: Bool) async {
 		phase = .unlocking
 		errorMessage = nil
+		let previous = selectedVault
 		select(vault: name)
 		do {
 			_ = try await cli.run(
 				["init"] + (useKeychain ? ["--keychain"] : []), passphrases: [pass], as: InitResponse.self)
 			await enterUnlocked(passphrase: pass)
 		} catch {
+			// Roll back the optimistic selection: the vault was never created, so
+			// leaving it selected would point every later unlock at a nonexistent
+			// vault while the picker appears to show a real one.
+			select(vault: previous)
 			phase = .locked
 			report(error)
 		}
@@ -119,7 +132,9 @@ final class AppState: ObservableObject {
 
 	func detail(for title: String) async -> ItemDetail? {
 		do {
-			return try await cli.run(["get", title], passphrases: passphrases(), as: ItemDetail.self)
+			// `--` terminates option parsing so a title like "--json" or "--vault" is
+			// treated as a positional, never spliced in as a flag.
+			return try await cli.run(["get", "--", title], passphrases: passphrases(), as: ItemDetail.self)
 		} catch {
 			report(error)
 			return nil
@@ -127,13 +142,21 @@ final class AppState: ObservableObject {
 	}
 
 	func add(title: String, fields: [String: String], password: String?) async {
-		var args = ["add", title]
-		for (k, v) in fields { args += ["--field", "\(k)=\(v)"] }
+		// Field values may hold secrets (PINs, security answers) and titles are
+		// attacker-influenced, so keep field VALUES off argv (over stdin via
+		// --field-stdin) and put the title after `--` so it can't be read as a flag.
+		var args = ["add"]
 		var extra: [String] = []
+		let fieldLines = fields.map { "\($0.key)=\($0.value)" }
+		if !fieldLines.isEmpty {
+			args += ["--field-stdin", String(fieldLines.count)]
+			extra += fieldLines
+		}
 		if let password, !password.isEmpty {
 			args.append("--password")
-			extra.append(password)  // item password is the second stdin line
+			extra.append(password)  // item password is a further stdin line
 		}
+		args += ["--", title]
 		do {
 			try await cli.run(args, passphrases: passphrases(extra: extra))
 			await refresh()
@@ -143,10 +166,16 @@ final class AppState: ObservableObject {
 	}
 
 	func edit(title: String, fields: [String: String]) async {
-		var args = ["edit", title]
-		for (k, v) in fields { args += ["--field", "\(k)=\(v)"] }
+		var args = ["edit"]
+		var extra: [String] = []
+		let fieldLines = fields.map { "\($0.key)=\($0.value)" }
+		if !fieldLines.isEmpty {
+			args += ["--field-stdin", String(fieldLines.count)]
+			extra += fieldLines
+		}
+		args += ["--", title]
 		do {
-			try await cli.run(args, passphrases: passphrases())
+			try await cli.run(args, passphrases: passphrases(extra: extra))
 			await refresh()
 		} catch {
 			report(error)
@@ -155,7 +184,7 @@ final class AppState: ObservableObject {
 
 	func remove(title: String) async {
 		do {
-			try await cli.run(["rm", title], passphrases: passphrases())
+			try await cli.run(["rm", "--", title], passphrases: passphrases())
 			await refresh()
 		} catch {
 			report(error)
@@ -200,12 +229,14 @@ final class AppState: ObservableObject {
 	// This device announces itself into a (possibly new) local vault: returns Token
 	// A (base64) to render as a QR. The passphrase is cached for the later confirm.
 	func startNewDeviceEnrollment(vault name: String?, passphrase candidate: String) async -> String? {
+		let previous = selectedVault
 		select(vault: name)
 		do {
 			let r = try await cli.run(["auth"], passphrases: [candidate], as: AuthResponse.self)
 			passphrase = candidate
 			return r.tokenA
 		} catch {
+			select(vault: previous)  // undo the optimistic selection on failure
 			report(error)
 			return nil
 		}
@@ -245,12 +276,14 @@ final class AppState: ObservableObject {
 	// Joiner side, step 1: generate this person's identity into a local vault slot
 	// and emit an Invite Token to hand to an admin. Caches the new passphrase.
 	func startInvite(vault name: String?, passphrase candidate: String) async -> String? {
+		let previous = selectedVault
 		select(vault: name)
 		do {
 			let r = try await cli.run(["invite"], passphrases: [candidate], as: InviteResponse.self)
 			passphrase = candidate
 			return r.inviteToken
 		} catch {
+			select(vault: previous)  // undo the optimistic selection on failure
 			report(error)
 			return nil
 		}

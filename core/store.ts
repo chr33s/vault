@@ -3,8 +3,9 @@
 // relay (the opaque `ops` table only). No decryption happens here — payloads are
 // opaque blobs; the store is a persistence layer over the protocol types.
 
+import { chmodSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import type { LogEntry } from "./authlog.ts";
+import { entryHash, type LogEntry } from "./authlog.ts";
 import type { OpEnvelope, VersionVector } from "./protocol.ts";
 
 const SCHEMA = `
@@ -54,6 +55,18 @@ export class Store {
 
 	constructor(path: string, _opts: StoreOptions = {}) {
 		this.db = new DatabaseSync(path);
+		// The replica holds ciphertext plus cleartext membership/relay metadata;
+		// default file perms are world-readable (0644 under umask 022). Tighten to
+		// owner-only so another local user cannot copy it for offline attack. The
+		// enclosing dir is already 0700 (see paths.ts), which also covers the derived
+		// -wal/-shm files. Best-effort: skip in-memory and ignore Windows/no-op.
+		if (path !== ":memory:") {
+			try {
+				chmodSync(path, 0o600);
+			} catch {
+				/* non-fatal: Windows / unsupported fs */
+			}
+		}
 		this.db.exec("PRAGMA journal_mode = WAL;");
 		this.db.exec(SCHEMA);
 	}
@@ -137,11 +150,15 @@ export class Store {
 	// ---- auth log ----
 
 	// Idempotent by content hash; entry order is derived at replay (DAG), not
-	// stored. Insert-or-ignore so a re-seen entry never overwrites.
+	// stored. Insert-or-ignore so a re-seen entry never overwrites. The key is the
+	// *recomputed* hash, never the client-supplied `e.hash` field — a synced entry
+	// that lies about its hash must not be able to occupy another entry's slot or
+	// masquerade as already-held (the relay/worker path recomputes for the same
+	// reason).
 	appendAuthEntry(e: LogEntry): void {
 		this.db
 			.prepare(`INSERT OR IGNORE INTO authlog (hash, entry) VALUES (?, ?)`)
-			.run(e.hash, JSON.stringify(e));
+			.run(entryHash(e), JSON.stringify(e));
 	}
 
 	authLog(): LogEntry[] {

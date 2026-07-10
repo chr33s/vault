@@ -24,11 +24,38 @@ test("vault run injects resolved secrets and forwards the child exit code", asyn
 		// Child exits 7 iff both vars arrived correctly in its environment.
 		const code = await run(
 			s,
-			{ envFile, defaultVault: s.vaultId, allowMissing: false },
+			{ envFile, openVault: "personal", allowMissing: false },
 			process.execPath,
 			["-e", "process.exit(process.env.TOKEN === 's3cr3t' && process.env.PLAIN === 'hi' ? 7 : 8)"],
 		);
 		assert.equal(code, 7, "resolved + literal env injected; child exit code forwarded");
+		store.close();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("vault run rejects a vault:// reference to a different vault", async () => {
+	const dir = await tmp();
+	try {
+		const store = new Store(join(dir, "v.db"));
+		await init(store, PASS);
+		const s = await unlock(store, PASS);
+		addItem(s, "db", { password: "personal-secret" });
+
+		const envFile = join(dir, ".env");
+		// Reference names the "prod" vault, but the open vault is "personal".
+		await writeFile(envFile, "DB_PASS=vault://prod/db/password\n");
+
+		const marker = join(dir, "spawned.marker");
+		await assert.rejects(
+			run(s, { envFile, openVault: "personal", allowMissing: false }, process.execPath, [
+				"-e",
+				`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x')`,
+			]),
+			/targets vault "prod" but "personal" is open/,
+		);
+		await assert.rejects(rm(marker), /ENOENT/, "child must not have spawned");
 		store.close();
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -48,7 +75,7 @@ test("vault run fails before spawning when a required var is unresolved", async 
 		// A side-effect file the child would create — must NOT exist if we fail first.
 		const marker = join(dir, "spawned.marker");
 		await assert.rejects(
-			run(s, { envFile, defaultVault: s.vaultId, allowMissing: false }, process.execPath, [
+			run(s, { envFile, openVault: "personal", allowMissing: false }, process.execPath, [
 				"-e",
 				`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x')`,
 			]),
@@ -85,7 +112,7 @@ test("vault run --mask redacts an injected secret echoed by the child", async ()
 		try {
 			code = await run(
 				s,
-				{ envFile, defaultVault: s.vaultId, allowMissing: false, mask: true },
+				{ envFile, openVault: "personal", allowMissing: false, mask: true },
 				process.execPath,
 				["-e", "process.stdout.write(process.env.TOKEN + '\\n')"],
 			);
@@ -120,7 +147,7 @@ test("vault run emits a per-access audit line naming vars, never values", async 
 			return true;
 		};
 		try {
-			await run(s, { envFile, defaultVault: s.vaultId, allowMissing: false }, process.execPath, [
+			await run(s, { envFile, openVault: "personal", allowMissing: false }, process.execPath, [
 				"-e",
 				"0",
 			]);
@@ -147,7 +174,7 @@ test("vault run --allow-missing proceeds despite an unresolved var", async () =>
 		await writeFile(envFile, "MISSING=\n");
 		const code = await run(
 			s,
-			{ envFile, defaultVault: s.vaultId, allowMissing: true },
+			{ envFile, openVault: "personal", allowMissing: true },
 			process.execPath,
 			["-e", "process.exit(process.env.MISSING === undefined ? 0 : 1)"],
 		);

@@ -45,7 +45,7 @@
 // and weak-passphrase resistance. See the README threat model.
 
 import { execFile as execFileCb, spawn } from "node:child_process";
-import { access, mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile, unlink, chmod } from "node:fs/promises";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -112,17 +112,20 @@ export const macKeychain: KeyStore = {
 		}
 	},
 	async put(id: string, secret: Buffer): Promise<void> {
+		// Feed the DUK over stdin, NOT on argv: `-w <value>` puts the base64 DUK in
+		// the process table (`ps`, /proc/<pid>/cmdline) for every local user during
+		// the write, degrading the keystore back to passphrase-only strength — the
+		// exact co-resident threat the DUK defends against. Passing `-w` with no
+		// value makes `security` read the secret (and its confirmation) from stdin.
 		// -U updates in place if the item already exists.
-		await execFile(SECURITY, [
-			"add-generic-password",
-			"-U",
-			"-a",
-			id,
-			"-s",
-			SERVICE,
-			"-w",
-			secret.toString("base64"),
-		]);
+		const b64 = `${secret.toString("base64")}\n`;
+		const { code, stderr } = await spawnCollect(
+			SECURITY,
+			["add-generic-password", "-U", "-a", id, "-s", SERVICE, "-w"],
+			{ input: Buffer.from(b64 + b64) }, // value + confirmation prompt
+		);
+		if (code !== 0)
+			throw new Error(`security add-generic-password failed: ${stderr.toString().trim()}`);
 	},
 	async get(id: string): Promise<Buffer | undefined> {
 		try {
@@ -238,7 +241,8 @@ export type BlobCipher = {
 
 const blobDir = async (subdir: string): Promise<string> => {
 	const dir = join(configDir(), subdir);
-	await mkdir(dir, { recursive: true });
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	await chmod(dir, 0o700).catch(() => {});
 	return dir;
 };
 
@@ -257,7 +261,10 @@ export const makeBlobKeyStore = ({ name, subdir, ext, cipher }: BlobStoreOptions
 	available: () => cipher.available(),
 	...(cipher.bindingMode ? { bindingMode: () => cipher.bindingMode!() } : {}),
 	async put(id: string, secret: Buffer): Promise<void> {
-		await writeFile(await blobPath(subdir, ext, id), await cipher.protect(secret, id));
+		// 0600: the blob is the at-rest-wrapped DUK; never leave it world-readable.
+		await writeFile(await blobPath(subdir, ext, id), await cipher.protect(secret, id), {
+			mode: 0o600,
+		});
 	},
 	async get(id: string): Promise<Buffer | undefined> {
 		let blob: Buffer;

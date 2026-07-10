@@ -9,16 +9,29 @@ export type HLC = {
 };
 
 const MILLIS_WIDTH = 15; // ample room for ms timestamps
+const MILLIS_MAX = 10 ** MILLIS_WIDTH - 1; // 999999999999999 (~year 33658); beyond
+// this the fixed-width encoding would widen and break the lexicographic ==
+// logical-order invariant that string comparisons of encoded HLCs rely on.
 const COUNTER_WIDTH = 6;
 const COUNTER_MAX = 10 ** COUNTER_WIDTH - 1; // 999999; beyond this the fixed-width
 // encoding would widen and break lexicographic == logical order, so we carry the
 // overflow into the millis component (advancing logical time) instead.
+const MAX_FORWARD_DRIFT_MS = 24 * 60 * 60 * 1000;
 
-export const encodeHLC = (h: HLC): string =>
-	`${String(h.millis).padStart(MILLIS_WIDTH, "0")}:${String(h.counter).padStart(
+// Callers that ingest remote state use this before applying it. Keeping the
+// policy outside observe() is important: every timestamp that is accepted must
+// still advance the clock past the exact receive event for HLC causality.
+export const isWithinForwardDrift = (remote: HLC, now: number = Date.now()): boolean =>
+	remote.millis <= now + MAX_FORWARD_DRIFT_MS;
+
+export const encodeHLC = (h: HLC): string => {
+	if (h.millis > MILLIS_MAX)
+		throw new Error(`HLC millis ${h.millis} exceeds encodable width (clock skew?)`);
+	return `${String(h.millis).padStart(MILLIS_WIDTH, "0")}:${String(h.counter).padStart(
 		COUNTER_WIDTH,
 		"0",
 	)}:${h.deviceId}`;
+};
 
 export const decodeHLC = (s: string): HLC => {
 	const [m, c, ...rest] = s.split(":");

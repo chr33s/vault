@@ -5,12 +5,28 @@
 // the serverless placement produces identical protocol results to the Node path.
 
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import {
+	makeEntry,
+	heads,
+	entryHash,
+	validRootGenesis,
+	replay,
+	deviceSignKey,
+	type EntryBody,
+	type LogEntry,
+} from "../core/authlog.ts";
 import * as cr from "../core/crypto.ts";
 import { makeEnvelope } from "../core/protocol.ts";
 import { verifyEnvelope } from "../core/protocol.ts";
 import { authorizeHeaders } from "../relay/access.ts";
 import { handle, type RelayStorage } from "../relay/handler.ts";
+import { createRelay } from "../relay/main.ts";
+import worker from "../relay/worker/worker.ts";
 
 // A tiny in-memory RelayStorage standing in for the Durable Object SQLite.
 const memStore = (): RelayStorage => {
@@ -18,6 +34,7 @@ const memStore = (): RelayStorage => {
 	const auth = new Map<string, Map<string, import("../core/authlog.ts").LogEntry>>();
 	const rots = new Map<string, Map<string, import("../core/rotation.ts").RotationRecord>>();
 	const grants = new Map<string, import("../core/protocol.ts").GrantRow[]>();
+	const roots = new Map<string, string>();
 	const m = <V>(map: Map<string, Map<string, V>>, t: string) => {
 		let x = map.get(t);
 		if (!x) map.set(t, (x = new Map()));
@@ -41,10 +58,24 @@ const memStore = (): RelayStorage => {
 			return v;
 		},
 		putAuth(t, e) {
-			m(auth, t).set(e.hash, e);
+			m(auth, t).set(entryHash(e), e);
+		},
+		pinGenesis(t, entry) {
+			if (!validRootGenesis(entry, t)) return false;
+			const hash = entryHash(entry);
+			const pinned = roots.get(t);
+			if (pinned) return pinned === hash;
+			roots.set(t, hash);
+			return true;
 		},
 		authExcept(t, have) {
-			return [...m(auth, t).values()].filter((e) => !have.has(e.hash));
+			const seen = new Set(have);
+			return [...m(auth, t).values()].filter((entry) => {
+				const hash = entryHash(entry);
+				if (seen.has(hash)) return false;
+				seen.add(hash);
+				return true;
+			});
 		},
 		putRotation(t, r) {
 			m(rots, t).set(`${r.epoch}:${r.deviceId}`, r);
@@ -118,6 +149,131 @@ test("worker handler: a tampered op is rejected by the op-hash check", async () 
 	assert.deepEqual(r.body, { accepted: 0 }, "hash mismatch -> not accepted");
 });
 
+test("relay authenticates op authorship: a forged (deviceId,seq) claim is rejected", async () => {
+	// Build a minimal auth log: owner user 'u1' with device 'devA'.
+	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const devA = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const gen: EntryBody = {
+		type: "genesis",
+		vaultId: "t1",
+		userId: "u1",
+		userSignPub: owner.sign.publicKey.toString("base64"),
+		userEncPub: owner.enc.publicKey.toString("base64"),
+		role: "owner",
+	};
+	let chain: LogEntry[] = [makeEntry([], gen, "u1", "user", owner.sign.privateKey)];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "u1",
+				deviceId: "devA",
+				deviceSignPub: devA.sign.publicKey.toString("base64"),
+				deviceEncPub: devA.enc.publicKey.toString("base64"),
+			},
+			"u1",
+			"user",
+			owner.sign.privateKey,
+		),
+	];
+
+	const store = memStore();
+	// The transport's real authorship check: teamId===vaultId pins the genesis.
+	const verifyOp = (op: import("../core/protocol.ts").OpEnvelope, teamId: string) => {
+		const m = replay(store.authExcept(teamId, new Set()) as LogEntry[], teamId);
+		const key = deviceSignKey(m, op.deviceId);
+		return !!key && verifyEnvelope(op, key);
+	};
+
+	// An attacker (not devA) forges an op claiming devA's slot (devA, seq 1).
+	const attacker = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const forged = makeEnvelope("devA", 1, Buffer.from("garbage"), attacker.sign.privateKey);
+	const genuine = makeEnvelope("devA", 1, Buffer.from("real"), devA.sign.privateKey);
+
+	// An invalid first root must not claim an otherwise-empty team. Its body hash
+	// differs from the real root, while its stale signature no longer authenticates it.
+	const invalidRoot: LogEntry = {
+		...chain[0]!,
+		body: { ...gen, userId: "forged-owner" },
+	};
+	assert.equal(validRootGenesis(invalidRoot, "t1"), false);
+	await handle(req("POST", "/push", { teamId: "t1", ops: [], authLog: [invalidRoot] }), store, {
+		authorize: async () => true,
+		verifyOp,
+	});
+	assert.deepEqual(
+		store.authExcept("t1", new Set()),
+		[],
+		"an invalid genesis is not pinned or stored",
+	);
+
+	// Push carries the auth log so membership is known; the forged op is rejected.
+	const r1 = await handle(
+		req("POST", "/push", { teamId: "t1", ops: [forged], authLog: chain }),
+		store,
+		{ authorize: async () => true, verifyOp },
+	);
+	assert.deepEqual(r1.body, { accepted: 0 }, "forged authorship is rejected");
+
+	// A later self-signed genesis for the same team can sort below the real root.
+	// It must not enter storage or authorize the attacker's key for devA.
+	let rivalRoot: LogEntry | undefined;
+	let rivalUserId = "";
+	for (let nonce = 0; !rivalRoot; nonce++) {
+		rivalUserId = `attacker-${nonce}`;
+		const candidate = makeEntry(
+			[],
+			{
+				type: "genesis",
+				vaultId: "t1",
+				userId: rivalUserId,
+				userSignPub: attacker.sign.publicKey.toString("base64"),
+				userEncPub: attacker.enc.publicKey.toString("base64"),
+				role: "owner",
+			},
+			rivalUserId,
+			"user",
+			attacker.sign.privateKey,
+		);
+		if (entryHash(candidate) < entryHash(chain[0]!)) rivalRoot = candidate;
+	}
+	const rivalChain = [
+		rivalRoot,
+		makeEntry(
+			[rivalRoot.hash],
+			{
+				type: "add-device",
+				userId: rivalUserId,
+				deviceId: "devA",
+				deviceSignPub: attacker.sign.publicKey.toString("base64"),
+				deviceEncPub: attacker.enc.publicKey.toString("base64"),
+			},
+			rivalUserId,
+			"user",
+			attacker.sign.privateKey,
+		),
+	];
+	const rival = await handle(
+		req("POST", "/push", { teamId: "t1", ops: [forged], authLog: rivalChain }),
+		store,
+		{ authorize: async () => true, verifyOp },
+	);
+	assert.deepEqual(rival.body, { accepted: 0 }, "a rival root cannot authorize forged ops");
+	const storedGenesis = (store.authExcept("t1", new Set()) as LogEntry[]).filter(
+		(e) => e.body.type === "genesis",
+	);
+	assert.deepEqual(storedGenesis.map(entryHash), [entryHash(chain[0]!)]);
+
+	// The genuine device's real op for the same seq is accepted (slot not stolen).
+	const r2 = await handle(req("POST", "/push", { teamId: "t1", ops: [genuine] }), store, {
+		authorize: async () => true,
+		verifyOp,
+	});
+	assert.deepEqual(r2.body, { accepted: 1 }, "the real device's op is not censored");
+});
+
 test("worker handler: health + auth gate (shared authorizeHeaders)", async () => {
 	const store = memStore();
 	assert.deepEqual(
@@ -143,4 +299,99 @@ test("worker handler: health + auth gate (shared authorizeHeaders)", async () =>
 		{ authorize: (h) => authorizeHeaders(h, cfg) },
 	);
 	assert.equal(ok.status, 200);
+});
+
+test("worker edge stops reading a chunked body once the byte limit is exceeded", async () => {
+	const chunk = new Uint8Array(1024 * 1024);
+	let pulls = 0;
+	let cancelled = false;
+	const body = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				pulls++;
+				if (pulls > 17) throw new Error("reader consumed past the oversized chunk");
+				controller.enqueue(chunk);
+			},
+			cancel() {
+				cancelled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	const request = new Request("https://relay.test/push", {
+		method: "POST",
+		body,
+		duplex: "half",
+	} as RequestInit & { duplex: "half" });
+	let routed = false;
+	const env = {
+		RELAY_DO: {
+			idFromName() {
+				routed = true;
+				return "unused";
+			},
+			get() {
+				return { fetch: async () => new Response(null, { status: 204 }) };
+			},
+		},
+	};
+
+	const response = await worker.fetch(request, env);
+	assert.equal(response.status, 413);
+	assert.equal(cancelled, true, "the unread remainder is cancelled");
+	assert.equal(pulls, 17, "only enough chunks to detect overflow are read");
+	assert.equal(routed, false, "oversized requests never create or reach a Durable Object");
+});
+
+test("Node relay migrates and deduplicates a legacy root by its recomputed hash", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "vault-relay-root-"));
+	const dbPath = join(dir, "relay.db");
+	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const root = makeEntry(
+		[],
+		{
+			type: "genesis",
+			vaultId: "legacy-team",
+			userId: "owner",
+			userSignPub: owner.sign.publicKey.toString("base64"),
+			userEncPub: owner.enc.publicKey.toString("base64"),
+			role: "owner",
+		},
+		"owner",
+		"user",
+		owner.sign.privateKey,
+	);
+	const legacyEntry = { ...root, hash: "client-supplied-spoof" };
+	const invalidDuplicate = { ...legacyEntry, sig: "invalid-signature" };
+	const db = new DatabaseSync(dbPath);
+	db.exec(`CREATE TABLE relay_authlog (
+      team_id TEXT NOT NULL, hash TEXT NOT NULL, entry TEXT NOT NULL,
+      PRIMARY KEY (team_id, hash));`);
+	const insert = db.prepare(`INSERT INTO relay_authlog (team_id, hash, entry) VALUES (?, ?, ?)`);
+	insert.run("legacy-team", "legacy-row-key-1", JSON.stringify(invalidDuplicate));
+	insert.run("legacy-team", "legacy-row-key-2", JSON.stringify(legacyEntry));
+	insert.run("legacy-team", "legacy-row-key-3", JSON.stringify(legacyEntry));
+	db.close();
+
+	const { store } = createRelay({ dbPath });
+	const sync = (authHashes: string[]) => store.authExcept("legacy-team", new Set(authHashes));
+
+	try {
+		const initial = sync([]);
+		assert.equal(initial.length, 1, "duplicate legacy rows collapse by canonical hash");
+		assert.equal(entryHash(initial[0]!), entryHash(root));
+		assert.equal(
+			validRootGenesis(initial[0]!, "legacy-team"),
+			true,
+			"an invalid duplicate cannot shadow the root",
+		);
+		assert.equal(sync([entryHash(root)]).length, 0, "have uses the canonical hash");
+
+		assert.equal(store.pinGenesis("legacy-team", root), true, "the genuine root matches the pin");
+		store.putAuth("legacy-team", root);
+		assert.equal(sync([]).length, 1, "a canonical reinsert remains deduplicated");
+	} finally {
+		store.close();
+		await rm(dir, { recursive: true, force: true });
+	}
 });

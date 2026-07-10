@@ -215,6 +215,34 @@ test("--passphrase-stdin reads secrets from stdin (one line per prompt)", async 
 	});
 });
 
+test("--field-stdin reads field values from stdin, keeping them off argv", async () => {
+	await withHome(async (home) => {
+		const env = {} as Record<string, string>;
+		delete (env as Record<string, string>).VAULT_PASSPHRASE;
+
+		await execFile(["--json", "--passphrase-stdin", "init"], { home, input: "mypass\n", env });
+
+		// Order over stdin: account passphrase, then N field lines, then item password.
+		await execFile(
+			["--json", "--passphrase-stdin", "add", "gh", "--field-stdin", "2", "--password", "--", "gh"],
+			{ home, input: "mypass\nusername=alice\npin=1234\nitemsecret\n", env },
+		);
+
+		const got = lastJson(
+			(
+				await execFile(["--json", "--passphrase-stdin", "get", "gh"], {
+					home,
+					input: "mypass\n",
+					env,
+				})
+			).stdout,
+		);
+		assert.equal((got.fields as Record<string, string>).username, "alice");
+		assert.equal((got.fields as Record<string, string>).pin, "1234");
+		assert.deepEqual(got.passwords, ["itemsecret"]);
+	});
+});
+
 test("--passphrase-stdin: wrong passphrase yields an error envelope", async () => {
 	await withHome(async (home) => {
 		await execFile(["--json", "--passphrase-stdin", "init"], { home, input: "right\n" });

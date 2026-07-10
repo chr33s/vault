@@ -116,8 +116,19 @@ on a single reflexive tap. The helper therefore also authenticates its caller: b
 `get`/`put`/`del` (not the side-effect-free `available`) it requires the **parent
 process** to be signed by the **same Apple Developer Team** as the helper itself
 (`anchor apple generic and certificate leaf[subject.OU] = <our team>`). Code signed by
-another identity — or unsigned malware — is rejected _before_ the Touch ID prompt is
-ever shown.
+another identity — or unsigned malware — that goes **through the helper** is rejected
+_before_ the Touch ID prompt is ever shown.
+
+> **Scope — this is defense-in-depth, not a boundary.** The enclave key is stored as a
+> plain `dataRepresentation` file (`device.sekey`), because a keychain-backed permanent
+> key needs entitlements an unprofiled helper can't carry. That blob is bound to this
+> enclave and to `.userPresence`, but **not** to any calling code — so a same-user
+> process can **bypass the helper entirely**, load the key with its own CryptoKit call,
+> and show its own Touch ID prompt. Caller authentication only guards the helper's front
+> door; it does **not** make the on-disk key unusable by other local code. The
+> protection that still holds against such an attacker is the **user-presence tap**
+> itself (you must approve each unseal), not code identity. Fully closing this needs a
+> keychain ACL / access group — i.e. a provisioned, entitled build.
 
 Caveats (all deliberate):
 

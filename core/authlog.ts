@@ -178,11 +178,31 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 			if (e.signerKind !== "user" || e.signerId !== b.userId)
 				throw new Error("genesis must be self-signed by creator");
 			return b.userSignPub;
-		case "add-user":
+		case "add-user": {
+			const signer = state.members.get(e.signerId);
+			if (e.signerKind !== "user" || !isAdmin(signer))
+				throw new Error("add-user requires an admin signer");
+			// An add-user must not overwrite a live member: without this, an
+			// admin-signed entry reusing an existing userId (e.g. the owner's, which
+			// is public in every enrollment token) replaces that member's keys and
+			// role on every replica — an owner-lockout / impersonation. A userId that
+			// exists only as an inactive (removed) member may be re-added (rejoin).
+			const existing = state.members.get(b.userId);
+			if (existing?.active) throw new Error("add-user cannot overwrite an existing member");
+			// Only the genesis mints an owner; add-user is member|admin (spec §9).
+			if (b.role === "owner") throw new Error("add-user cannot grant the owner role");
+			return signer!.signPub;
+		}
 		case "remove-user": {
 			const signer = state.members.get(e.signerId);
 			if (e.signerKind !== "user" || !isAdmin(signer))
-				throw new Error(`${b.type} requires an admin signer`);
+				throw new Error("remove-user requires an admin signer");
+			// The owner is the root of authority and cannot be removed by an admin
+			// (ownership transfer is not a supported operation); otherwise an admin
+			// could deactivate the owner and seize sole control.
+			const target = state.members.get(b.userId);
+			if (target?.role === "owner" && e.signerId !== b.userId)
+				throw new Error("the owner cannot be removed");
 			return signer!.signPub;
 		}
 		case "add-device": {
@@ -197,6 +217,11 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 			if (!signer || !signer.active) throw new Error("unknown signer");
 			if (e.signerId !== b.userId && !isAdmin(signer))
 				throw new Error("remove-device requires owner-of-device or admin");
+			// An admin cannot strip the owner's devices (would let an admin lock the
+			// owner out of their own vault); only the owner may remove their own.
+			const target = state.members.get(b.userId);
+			if (target?.role === "owner" && e.signerId !== b.userId)
+				throw new Error("only the owner may remove the owner's device");
 			return signer.signPub;
 		}
 	}
@@ -255,9 +280,24 @@ const applyEntry = (state: Membership, e: LogEntry): void => {
 // Validate and fold the DAG into a membership state. Every honest replica
 // computes the same result regardless of the order entries arrived in. Invalid
 // or unauthorized entries are skipped; only a missing genesis is fatal.
-export const replay = (entries: LogEntry[]): Membership => {
+//
+// `expectedVaultId` pins the root: a genesis is self-signed by whoever authored
+// it, so a hostile relay/peer can gossip a rival genesis whose content hash
+// sorts below the real one and — since the root was previously chosen purely by
+// hash order — hijack the log (every honest membership entry then fails
+// authority and the vault goes unusable). When the caller knows which vault it
+// is replaying (the common case: an established replica, or a token whose
+// vaultId is authenticated by the enrollment ceremony), only a genesis for that
+// vault is accepted. The store-level import guard (engine.importAuthAndRotations)
+// additionally refuses any second genesis, so a same-vaultId forgery can never
+// enter a replica in the first place.
+export const replay = (entries: LogEntry[], expectedVaultId?: string): Membership => {
 	const order = linearize(entries);
-	const genesis = order.find((e) => e.body.type === "genesis" && e.parents.length === 0);
+	const isRootGenesis = (e: LogEntry): boolean =>
+		e.body.type === "genesis" &&
+		e.parents.length === 0 &&
+		(expectedVaultId === undefined || e.body.vaultId === expectedVaultId);
+	const genesis = order.find(isRootGenesis);
 	if (!genesis || genesis.body.type !== "genesis") throw new Error("auth log has no genesis");
 
 	const state: Membership = {
@@ -282,6 +322,30 @@ export const replay = (entries: LogEntry[]): Membership => {
 		}
 	}
 	return state;
+};
+
+// A root is trusted for relay pinning only when its self-signature actually
+// materializes the claimed creator. replay() intentionally skips bad signatures
+// rather than throwing, so merely returning a Membership is not sufficient.
+export const validRootGenesis = (entry: LogEntry, expectedVaultId: string): boolean => {
+	try {
+		if (
+			entry.body.type !== "genesis" ||
+			entry.body.vaultId !== expectedVaultId ||
+			entry.parents.length !== 0
+		)
+			return false;
+		const membership = replay([entry], expectedVaultId);
+		const creator = membership.members.get(entry.body.userId);
+		return (
+			creator?.active === true &&
+			creator.role === "owner" &&
+			creator.signPub === entry.body.userSignPub &&
+			creator.encPub === entry.body.userEncPub
+		);
+	} catch {
+		return false;
+	}
 };
 
 // Resolve a device's signing public key (for op verification), if authorized.

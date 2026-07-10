@@ -248,7 +248,7 @@ export const ensureNoCoreDumps = async (): Promise<number | undefined> => {
 // the destination (taken as a literal URL — never resolved from the vault); a
 // `?name` key is a query-param injection; every other key is a request header.
 // Injection values resolve with `run`'s precedence (ambient -> literal -> vault).
-export const parseProxyPolicy = (s: Session, text: string): Policy => {
+export const parseProxyPolicy = (s: Session, text: string, openVault?: string): Policy => {
 	const decls = parseDotenv(text);
 	let upstream: URL | undefined;
 	const injections: Injection[] = [];
@@ -275,7 +275,7 @@ export const parseProxyPolicy = (s: Session, text: string): Policy => {
 		const isQuery = decl.key.startsWith("?");
 		const name = isQuery ? decl.key.slice(1) : decl.key;
 		if (!name) throw new Error(`bad policy key: ${decl.key}`);
-		const value = resolveOne(s, decl);
+		const value = resolveOne(s, decl, openVault);
 		// Fail fast: a proxy that can't resolve a declared secret must not start
 		// (otherwise it would silently inject nothing — worse than an error).
 		if (value === undefined)
@@ -297,14 +297,18 @@ export const parseProxyPolicy = (s: Session, text: string): Policy => {
 };
 
 // Load one-or-more policy files (repeated --config = multiple upstreams).
-export const loadPolicies = async (s: Session, configFiles: string[]): Promise<LoadedPolicies> => {
+export const loadPolicies = async (
+	s: Session,
+	configFiles: string[],
+	openVault?: string,
+): Promise<LoadedPolicies> => {
 	if (configFiles.length === 0) throw new Error("no --config policy file given");
 	const byHost = new Map<string, Policy>();
 	const byHostname = new Map<string, Policy>();
 	let defaultPolicy: Policy | undefined;
 	for (const f of configFiles) {
 		const text = await readFile(f, "utf8");
-		const policy = parseProxyPolicy(s, text);
+		const policy = parseProxyPolicy(s, text, openVault);
 		byHost.set(policy.upstream.host, policy);
 		byHostname.set(policy.upstream.hostname, policy);
 		defaultPolicy ??= policy;
@@ -636,7 +640,12 @@ const connectEnv = (proxyUrl: string, caFile: string): Record<string, string> =>
 	CURL_CA_BUNDLE: caFile, // curl
 });
 
-export type ProxyOptions = { configFiles: string[]; port: number; connect?: boolean };
+export type ProxyOptions = {
+	configFiles: string[];
+	port: number;
+	connect?: boolean;
+	openVault?: string;
+};
 
 // Load policies, stand up the loopback proxy, and either spawn the agent (with
 // the base-URL env preset and the secret absent) or run in the foreground for an
@@ -658,7 +667,7 @@ export const proxy = async (
 			`refusing to start: NODE_DEBUG="${nodeDebug}" would log injected secrets to stderr`,
 		);
 
-	const policies = await loadPolicies(s, opts.configFiles);
+	const policies = await loadPolicies(s, opts.configFiles, opts.openVault);
 	// From here on, resolved secrets are in memory: replace Node's default crash
 	// dumpers with scrubbed ones for the proxy's lifetime.
 	const unscrub = installScrubbedFatalHandlers();

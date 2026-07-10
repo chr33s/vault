@@ -49,7 +49,12 @@ func storeDir() -> URL {
 		fail("VAULT_SE_DIR is not set")
 	}
 	let url = URL(fileURLWithPath: dir, isDirectory: true)
-	try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+	// Owner-only. This doesn't stop a same-user attacker (see the caller-auth note),
+	// but keeps the enclave key blob off other accounts and out of default-readable
+	// backups — matching the CLI's 0700 config tree.
+	try? FileManager.default.createDirectory(
+		at: url, withIntermediateDirectories: true,
+		attributes: [.posixPermissions: 0o700])
 	return url
 }
 
@@ -125,16 +130,27 @@ func deriveKey(_ shared: SharedSecret, ephemeralPub: Data) -> SymmetricKey {
 		using: SHA256.self, salt: ephemeralPub, sharedInfo: hkdfInfo, outputByteCount: 32)
 }
 
-// ---- caller authentication ----
+// ---- caller authentication (best-effort; scope below) ----
 //
-// Closes the keystore's biggest gap. By itself, CryptoKit's `.userPresence` gate
-// authenticates the *human* (Touch ID) but NOT the *calling code*: any process
-// running as this user could spawn the helper and, on a single reflexive tap,
-// unseal the DUK. Here we additionally require the parent process — the one that
-// spawned us — to be signed by the same Apple Developer Team as this helper. Under
-// real (Developer ID) signing that restricts the unseal to our own CLI/app; code
-// signed by a different identity, or unsigned malware, is rejected before the
-// Touch ID prompt is ever shown.
+// By itself, CryptoKit's `.userPresence` gate authenticates the *human* (Touch
+// ID) but NOT the *calling code*: any process running as this user could spawn the
+// helper and, on a single reflexive tap, unseal the DUK. When invoked THROUGH the
+// helper, we additionally require the parent process to be signed by the same
+// Apple Developer Team, so under real (Developer ID) signing a differently-signed
+// or unsigned caller is rejected before the Touch ID prompt.
+//
+// IMPORTANT — what this does NOT protect. The enclave key is persisted as a plain
+// `dataRepresentation` file (device.sekey), because a keychain-backed permanent
+// SecKey needs entitlements this unprofiled helper can't carry (see the top-of-
+// file note). That blob is bound to THIS enclave and to `.userPresence`, but NOT
+// to any calling code — so a same-user process can bypass this helper entirely,
+// load the key with its own CryptoKit call, and present its own Touch ID prompt.
+// verifyCaller() therefore only guards the helper's front door; it does NOT make
+// the on-disk key unusable by other local code. The load-bearing protection that
+// still holds against such an attacker is the Touch ID *user-presence* tap (the
+// human must approve each unseal) — not code identity. Treat caller
+// authentication as defense-in-depth, not a boundary. Closing it fully requires a
+// keychain ACL / access group (i.e. a provisioned, entitled build).
 //
 // Tradeoffs (deliberate):
 //   * Binds to Team, not a single binary — any of our own signed code qualifies,

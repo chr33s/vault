@@ -12,7 +12,10 @@ import { installScrubbedFatalHandlers, makeScrubStream, registerSecret } from ".
 
 export type ResolveOptions = {
 	envFile: string;
-	defaultVault: string;
+	// The NAME of the vault currently open. A `vault://<vault>/…` reference whose
+	// vault component names a *different* vault is rejected rather than silently
+	// resolved against the open one (which would inject the wrong secret).
+	openVault: string;
 	allowMissing: boolean;
 	// --mask: pipe the child's stdout/stderr through the secret scrubber so a
 	// child that echoes an injected value gets it redacted (plan §11). Opt-in
@@ -41,7 +44,7 @@ const fieldValue = (item: ItemView, field: string): string | undefined => {
 // Resolve a single declaration against ambient env + the vault. Exported so
 // `vault proxy` resolves its injection values with the identical precedence
 // (ambient non-empty -> literal -> vault lookup), per spec §13.1 / plan §5.
-export const resolveOne = (s: Session, decl: EnvDecl): string | undefined => {
+export const resolveOne = (s: Session, decl: EnvDecl, openVault?: string): string | undefined => {
 	const ambient = process.env[decl.key];
 
 	// 1. Ambient non-empty value always wins (local override).
@@ -51,6 +54,14 @@ export const resolveOne = (s: Session, decl: EnvDecl): string | undefined => {
 	if (decl.value && decl.value.startsWith("vault://")) {
 		const ref = parseVaultRef(decl.value);
 		if (!ref) throw new Error(`bad vault reference for ${decl.key}: ${decl.value}`);
+		// The reference names a specific vault; resolution reads only the open
+		// replica, so a ref to a different vault must fail loudly rather than pull a
+		// same-named item out of the wrong vault (e.g. injecting the personal `db`
+		// password into a prod command).
+		if (openVault !== undefined && ref.vault !== openVault)
+			throw new Error(
+				`${decl.key}: reference targets vault "${ref.vault}" but "${openVault}" is open — open that vault with --vault ${ref.vault}`,
+			);
 		const item = getItem(s, ref.item);
 		if (!item) return undefined;
 		return fieldValue(item, ref.field ?? "password");
@@ -72,7 +83,7 @@ export const resolveEnv = async (s: Session, opts: ResolveOptions): Promise<Reso
 	const env: Record<string, string> = {};
 	const missing: string[] = [];
 	for (const decl of decls) {
-		const v = resolveOne(s, decl);
+		const v = resolveOne(s, decl, opts.openVault);
 		if (v === undefined) missing.push(decl.key);
 		else env[decl.key] = v;
 	}

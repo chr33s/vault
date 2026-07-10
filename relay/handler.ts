@@ -19,6 +19,9 @@ export type RelayStorage = {
 	allOps(teamId: string): Promise<OpEnvelope[]> | OpEnvelope[];
 	vector(teamId: string): Promise<VersionVector> | VersionVector;
 	putAuth(teamId: string, entry: LogEntry): Promise<void> | void;
+	// Recompute and atomically pin the first root genesis hash seen for a team.
+	// Returns false when another root is already pinned.
+	pinGenesis(teamId: string, entry: LogEntry): Promise<boolean> | boolean;
 	authExcept(teamId: string, have: Set<string>): Promise<LogEntry[]> | LogEntry[];
 	putRotation(teamId: string, rec: RotationRecord): Promise<void> | void;
 	rotationsExcept(teamId: string, have: Set<string>): Promise<string[]> | string[];
@@ -38,9 +41,18 @@ export type RelayResponse = { status: number; body: unknown };
 export type RelayDeps = {
 	// Returns true if the request is allowed (network/Access gate). Open in dev.
 	authorize: (header: (name: string) => string | undefined) => Promise<boolean>;
-	// Cheap junk filter on incoming ops; correctness never depends on it (clients
-	// re-verify signatures against the auth log). Default accepts everything.
-	verifyOp?: (op: OpEnvelope) => boolean | Promise<boolean>;
+	// Accept an incoming op only if it is authentic: the transport verifies the
+	// op's Ed25519 signature against the author device's key in the (already
+	// relay-visible) auth log. This is NOT just a junk filter — it stops a
+	// malicious writer from pre-claiming another device's (deviceId, seq) slot
+	// under the UNIQUE constraint and thereby censoring that device's real op.
+	// Default accepts everything (dev/no-auth-log transports).
+	verifyOp?: (op: OpEnvelope, teamId: string) => boolean | Promise<boolean>;
+	// Accept a rotation record only if it is well-formed and signed by a device
+	// known to the auth log. Bounds a metadata-flood DoS where an authenticated
+	// writer pushes unbounded synthetic rotations (unique epoch/deviceId) that
+	// would otherwise persist to the store. Default accepts everything.
+	verifyRotation?: (rec: RotationRecord, teamId: string) => boolean | Promise<boolean>;
 };
 
 // Pure helpers (inlined from core/protocol so this module pulls no crypto).
@@ -76,21 +88,41 @@ export const handle = async (
 		const body = (await req.body()) as PushRequest;
 		if (!body.teamId || !Array.isArray(body.ops))
 			return { status: 400, body: { error: "teamId and ops required" } };
-		const verifyOp = deps.verifyOp ?? (() => true);
-		let accepted = 0;
-		for (const op of body.ops) {
-			if (!(await verifyOp(op))) continue;
-			if (await store.putOp(body.teamId, op)) accepted++;
+		// Ingest membership/rotations/grants BEFORE verifying ops: a device's first
+		// ops travel in the same push as the add-device entry that authorizes them,
+		// so op verification must see the just-added key.
+		for (const entry of body.authLog ?? []) {
+			if (entry.body.type === "genesis") {
+				// A genesis is self-authorizing, so teamId alone cannot distinguish a
+				// later rival root. Recompute its hash (the cached field is untrusted) and
+				// let storage atomically pin the first well-scoped root before persisting.
+				if (
+					entry.body.vaultId !== body.teamId ||
+					entry.parents.length !== 0 ||
+					!(await store.pinGenesis(body.teamId, entry))
+				)
+					continue;
+			}
+			await store.putAuth(body.teamId, entry);
 		}
-		for (const entry of body.authLog ?? []) await store.putAuth(body.teamId, entry);
+		const verifyRotation = deps.verifyRotation ?? (() => true);
 		for (const rec of body.rotations ?? []) {
 			try {
-				await store.putRotation(body.teamId, JSON.parse(rec) as RotationRecord);
+				const parsed = JSON.parse(rec) as RotationRecord;
+				if (!(await verifyRotation(parsed, body.teamId))) continue;
+				await store.putRotation(body.teamId, parsed);
 			} catch {
 				/* skip malformed */
 			}
 		}
 		for (const g of body.grants ?? []) await store.putGrant(body.teamId, g);
+
+		const verifyOp = deps.verifyOp ?? (() => true);
+		let accepted = 0;
+		for (const op of body.ops) {
+			if (!(await verifyOp(op, body.teamId))) continue;
+			if (await store.putOp(body.teamId, op)) accepted++;
+		}
 		return { status: 200, body: { accepted } };
 	}
 

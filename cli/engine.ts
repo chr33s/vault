@@ -7,6 +7,7 @@ import {
 	makeEntry,
 	heads,
 	deviceSignKey,
+	entryHash,
 	type LogEntry,
 	type EntryBody,
 	type Role,
@@ -23,7 +24,7 @@ import {
 	type ItemView,
 } from "../core/crdt.ts";
 import * as cr from "../core/crypto.ts";
-import { Clock, encodeHLC, decodeHLC } from "../core/hlc.ts";
+import { Clock, encodeHLC, decodeHLC, isWithinForwardDrift } from "../core/hlc.ts";
 import { deriveKeys, DEFAULT_KDF_PARAMS, type KdfParams } from "../core/kdf.ts";
 import { makeEnvelope, rotationId, verifyEnvelope, type OpEnvelope } from "../core/protocol.ts";
 import {
@@ -123,7 +124,17 @@ const createWrapKey = async (
 	accountKey: Buffer,
 	keystore: KeyStore | undefined,
 ): Promise<{ wrap: Buffer; meta: WrapMeta }> => {
-	if (keystore && (await keystore.available())) {
+	if (keystore) {
+		// A keystore is only ever passed here when the user requested it (--keychain /
+		// keystore enable). If it exists as a provider but isn't usable on this device
+		// (e.g. the SE helper binary is missing), fail loudly rather than silently
+		// sealing under the account key alone — a silent downgrade defeats the
+		// protection that was explicitly asked for.
+		if (!(await keystore.available()))
+			throw new Error(
+				`the "${keystore.name}" keystore was requested but is unavailable on this device; ` +
+					`re-run without --keychain for a passphrase-only vault`,
+			);
 		const id = `vault-${cr.randomBytes(8).toString("hex")}`;
 		const duk = cr.randomBytes(32);
 		await keystore.put(id, duk);
@@ -517,12 +528,20 @@ export const importAuthAndRotations = (
 ): { authImported: number; rotationsImported: number } => {
 	let authImported = 0;
 	const have = new Set(s.store.authHashes());
+	// The vault's root genesis is fixed at init/join through a trusted path (the
+	// enrollment ceremony authenticates it out-of-band via the SAS). Never accept a
+	// *second* genesis over sync: a malicious relay/peer can otherwise inject a
+	// self-signed rival genesis (same or different vaultId) whose hash sorts below
+	// the real one and hijack the auth-log root, an integrity break the relay is
+	// explicitly not trusted to cause. Recompute the hash so a spoofed `e.hash`
+	// can't slip past the dedupe set either.
 	for (const e of incomingAuth) {
-		if (!have.has(e.hash)) {
-			s.store.appendAuthEntry(e);
-			have.add(e.hash);
-			authImported++;
-		}
+		const h = entryHash(e);
+		if (have.has(h)) continue;
+		if (e.body.type === "genesis") continue; // exactly one genesis; we already hold it
+		s.store.appendAuthEntry(e);
+		have.add(h);
+		authImported++;
 	}
 
 	let rotationsImported = 0;
@@ -543,7 +562,7 @@ export const importAuthAndRotations = (
 };
 
 // Verify every op's signature against the auth log, decrypt, and merge.
-const rebuildState = (s: Session, membership = replay(s.store.authLog())): void => {
+const rebuildState = (s: Session, membership = replay(s.store.authLog(), s.vaultId)): void => {
 	s.state = new VaultState();
 	let maxHlc = "";
 	for (const op of s.store.allOps()) {
@@ -552,6 +571,10 @@ const rebuildState = (s: Session, membership = replay(s.store.authLog())): void 
 		if (!verifyEnvelope(op, signPub)) continue;
 		const field = decryptOp(op.payload, s.keys);
 		if (field) {
+			// Reject implausibly future-dated writes before they enter the CRDT. Once
+			// accepted, observe() must preserve their exact causal order rather than
+			// clamping the local clock below an already-applied LWW timestamp.
+			if (op.deviceId !== s.deviceId && !isWithinForwardDrift(decodeHLC(field.hlc))) continue;
 			s.state.apply(field);
 			if (field.hlc > maxHlc) maxHlc = field.hlc; // encodeHLC is fixed-width: string max == logical max
 		}
@@ -790,12 +813,17 @@ export const authNewDevice = async (store: Store, password: string): Promise<Tok
 		),
 	);
 
-	store.setMeta("pending", "1");
-	store.setMeta("deviceId", deviceId);
-	store.setMeta("kdfParams", JSON.stringify(kdfParams));
-	store.setMeta("deviceSignPub", deviceSign.publicKey.toString("base64"));
-	store.setMeta("deviceEncPub", deviceEnc.publicKey.toString("base64"));
-	store.setMeta("pendingPriv", JSON.stringify(cr.encodeBox(blob)));
+	// Commit the pending-enrollment record atomically: a crash between the marker
+	// and pendingPriv would otherwise leave a half-pending vault whose
+	// device-confirm fails with a misleading "missing pendingPriv".
+	store.transaction(() => {
+		store.setMeta("pending", "1");
+		store.setMeta("deviceId", deviceId);
+		store.setMeta("kdfParams", JSON.stringify(kdfParams));
+		store.setMeta("deviceSignPub", deviceSign.publicKey.toString("base64"));
+		store.setMeta("deviceEncPub", deviceEnc.publicKey.toString("base64"));
+		store.setMeta("pendingPriv", JSON.stringify(cr.encodeBox(blob)));
+	});
 
 	return {
 		deviceId,
@@ -973,28 +1001,30 @@ export const inviteInit = async (store: Store, password: string): Promise<Invite
 	const userId = idFromPub(userSign.publicKey);
 	const deviceId = idFromPub(deviceSign.publicKey);
 
-	store.setMeta("pending", "invite");
-	store.setMeta("kdfParams", JSON.stringify(kdfParams));
-	store.setMeta("userId", userId);
-	store.setMeta("deviceId", deviceId);
-	store.setMeta("userSignPub", userSign.publicKey.toString("base64"));
-	store.setMeta("userEncPub", userEnc.publicKey.toString("base64"));
-	store.setMeta("deviceSignPub", deviceSign.publicKey.toString("base64"));
-	store.setMeta("deviceEncPub", deviceEnc.publicKey.toString("base64"));
-	store.setMeta(
-		"pendingInvitePriv",
-		JSON.stringify(
-			sealPrivUnderAccountKey(
-				{
-					userSign: userSign.privateKey,
-					userEnc: userEnc.privateKey,
-					deviceSign: deviceSign.privateKey,
-					deviceEnc: deviceEnc.privateKey,
-				},
-				accountKey,
-			),
+	// Atomic: a crash mid-write must not leave a partial pending-invite record
+	// (which would fail joinConfirm with a misleading "missing" error).
+	const pendingInvitePriv = JSON.stringify(
+		sealPrivUnderAccountKey(
+			{
+				userSign: userSign.privateKey,
+				userEnc: userEnc.privateKey,
+				deviceSign: deviceSign.privateKey,
+				deviceEnc: deviceEnc.privateKey,
+			},
+			accountKey,
 		),
 	);
+	store.transaction(() => {
+		store.setMeta("pending", "invite");
+		store.setMeta("kdfParams", JSON.stringify(kdfParams));
+		store.setMeta("userId", userId);
+		store.setMeta("deviceId", deviceId);
+		store.setMeta("userSignPub", userSign.publicKey.toString("base64"));
+		store.setMeta("userEncPub", userEnc.publicKey.toString("base64"));
+		store.setMeta("deviceSignPub", deviceSign.publicKey.toString("base64"));
+		store.setMeta("deviceEncPub", deviceEnc.publicKey.toString("base64"));
+		store.setMeta("pendingInvitePriv", pendingInvitePriv);
+	});
 
 	return {
 		userId,
@@ -1015,6 +1045,10 @@ export const shareVault = (
 ): JoinToken => {
 	if (s.role !== "owner" && s.role !== "admin") throw new Error("only admins may share a vault");
 	const role: Role = opts.role ?? "member";
+	// A shared user is member|admin only; `owner` is minted solely by the genesis
+	// and would be rejected at replay anyway (validate here for a clean error).
+	if (role !== "member" && role !== "admin")
+		throw new Error(`invalid role: ${String(role)} (expected "member" or "admin")`);
 
 	const chain = s.store.authLog();
 	const entry = signedEntry(

@@ -11,7 +11,9 @@
 // rests on either gate: ops stay end-to-end encrypted and signed.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { replay, deviceSignKey, type Membership } from "../core/authlog.ts";
 import { verifyEnvelope } from "../core/protocol.ts";
+import { verifyRotation, wellFormedRotation } from "../core/rotation.ts";
 import type { Store } from "../core/store.ts";
 import { authorizeHeaders, type AccessConfig } from "../relay/access.ts";
 import { handle } from "../relay/handler.ts";
@@ -49,6 +51,23 @@ export const createPeerServer = (
 		? { serviceTokens: new Set([opts.token]), requireAccess: true }
 		: {};
 
+	// Membership from this device's own auth log, used to authenticate incoming op
+	// and rotation signatures so a tailnet peer can't censor a device's (deviceId,
+	// seq) slot or flood the local store with synthetic rotation records. Memoized
+	// by auth-entry count (the log only grows).
+	let memberCache: { count: number; membership: Membership } | undefined;
+	const membership = (): Membership | undefined => {
+		const count = store.authHashes().length;
+		if (!memberCache || memberCache.count !== count) {
+			try {
+				memberCache = { count, membership: replay(store.authLog(), vaultId) };
+			} catch {
+				return undefined;
+			}
+		}
+		return memberCache.membership;
+	};
+
 	return createServer((req, res) => {
 		(async () => {
 			const url = new URL(req.url ?? "/", "http://localhost");
@@ -65,8 +84,16 @@ export const createPeerServer = (
 				peer,
 				{
 					authorize: (header) => authorizeHeaders(header, access),
-					// Cheap integrity check; the owner re-verifies signatures at replay.
-					verifyOp: (op) => verifyEnvelope(op),
+					// Authenticate authorship against this device's auth log.
+					verifyOp: (op) => {
+						const m = membership();
+						const key = m && deviceSignKey(m, op.deviceId);
+						return !!key && verifyEnvelope(op, key);
+					},
+					verifyRotation: (rec) => {
+						const key = membership()?.deviceKeys.get(rec.signerId);
+						return !!key && wellFormedRotation(rec) && verifyRotation(rec, key);
+					},
 				},
 			);
 			send(res, status, body);

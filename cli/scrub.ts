@@ -49,7 +49,12 @@ const addPattern = (utf8: string): void => {
 export const registerSecret = (value: string): void => {
 	if (value.length < MIN_LEN) return;
 	addPattern(value);
-	addPattern(encodeURIComponent(value)); // URL / query-string form
+	addPattern(encodeURIComponent(value)); // URL path / component form (%20, keeps ! ' ( ) ~)
+	// application/x-www-form-urlencoded form — how a value put on a URL via
+	// URLSearchParams.set() actually serializes (space -> '+', and ! ' ( ) ~
+	// percent-encoded). This diverges from encodeURIComponent, so without it a
+	// query-injected secret reflected by the upstream would slip past the backstop.
+	addPattern(new URLSearchParams([["v", value]]).toString().slice(2));
 	addPattern(JSON.stringify(value).slice(1, -1)); // JSON-escaped form
 	addPattern(Buffer.from(value, "utf8").toString("base64")); // Basic-auth form
 };

@@ -49,7 +49,9 @@ Environment=RELAY_DB=/var/lib/vault/relay.db
 # Environment=CF_ACCESS_TEAM_DOMAIN=myteam.cloudflareaccess.com
 # Environment=CF_ACCESS_AUD=<application-audience-tag>
 
-# Hardening.
+# Hardening. The relay is internet-reachable, so confine the kernel/syscall
+# surface too: given a memory-safety bug in the Node process, these cut off the
+# usual escalation paths (raw syscalls, /dev, new namespaces, kernel tunables).
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -58,6 +60,28 @@ ReadWritePaths=/var/lib/vault
 StateDirectory=vault
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6
+# Restrict syscalls to the service baseline and block privilege-escalation calls.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# No device access, no setuid/setgid binaries, no new namespaces.
+PrivateDevices=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+# (MemoryDenyWriteExecute is intentionally omitted: it breaks V8's JIT.)
+# Block writes to kernel tunables/modules and hide other processes.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

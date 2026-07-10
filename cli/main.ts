@@ -42,7 +42,12 @@ import { defaultKeyStore, keyStoreByName, systemdCredsKeyMode, type KeyStore } f
 import { setJsonOutput, emit, emitError } from "./output.ts";
 import { dbPath, listVaultNames, DEFAULT_VAULT } from "./paths.ts";
 import { createPeerServer } from "./peerserver.ts";
-import { readPassphrase, setPassphraseSource, closePassphraseSource } from "./prompt.ts";
+import {
+	readPassphrase,
+	readStdinLine,
+	setPassphraseSource,
+	closePassphraseSource,
+} from "./prompt.ts";
 import { proxy as proxyCmd, DEFAULT_PROXY_PORT, ensureNoCoreDumps } from "./proxy.ts";
 import { syncWithRelay, type RelayAuth } from "./relayclient.ts";
 import { run as runCmd } from "./run.ts";
@@ -161,6 +166,22 @@ const readToken = async <T>(values: Record<string, unknown>): Promise<T> => {
 	throw new Error("provide --token <base64> or --token-file <path>");
 };
 
+// Resolve a secret flag WITHOUT requiring it on argv (which is world-readable via
+// `ps` / /proc/<pid>/cmdline and lands in shell history). Priority:
+// `--<name>-file <path>`  >  env `<ENV>`  >  inline `--<name>` (kept for
+// compatibility but discouraged). Returns undefined if none is set.
+const readSecretFlag = async (
+	values: Record<string, unknown>,
+	name: string,
+	env?: string,
+): Promise<string | undefined> => {
+	const file = values[`${name}-file`];
+	if (typeof file === "string") return (await readFile(file, "utf8")).trim();
+	if (env && process.env[env] !== undefined) return process.env[env];
+	const inline = values[name];
+	return typeof inline === "string" ? inline : undefined;
+};
+
 const openStore = async (values: Record<string, unknown>): Promise<Store> =>
 	new Store(
 		typeof values.db === "string"
@@ -178,6 +199,23 @@ const unlockKeyStore = async (store: Store): Promise<KeyStore | undefined> => {
 	return provider
 		? await keyStoreByName(provider, store.getMeta("keystoreKeyMode") || undefined)
 		: undefined;
+};
+
+// Resolve the keystore for a vault-creating command (init/device-confirm/join).
+// When --keychain is requested but NO OS keystore is available, fail loudly
+// instead of silently creating a passphrase-only vault: a silent downgrade
+// defeats the exact protection the flag asked for, and (in --json) a wrapper has
+// no way to detect it. Callers that don't pass --keychain get undefined.
+const requestedKeyStore = async (
+	values: Record<string, unknown>,
+): Promise<KeyStore | undefined> => {
+	if (!values.keychain) return undefined;
+	const ks = await defaultKeyStore();
+	if (!ks)
+		throw new Error(
+			"no OS keystore available here; re-run without --keychain for a passphrase-only vault",
+		);
+	return ks;
 };
 
 const withSession = async (
@@ -223,6 +261,26 @@ const collectFields = (raw: string[] | undefined): Record<string, string> => {
 		out[f.slice(0, eq)] = f.slice(eq + 1);
 	}
 	return out;
+};
+
+// Merge `--field-stdin <n>` values into `fields`: read n `KEY=VALUE` lines from
+// the stdin protocol (after the account passphrase, before any item password), so
+// a wrapper can set field values that may be secret without exposing them on argv
+// (visible via `ps`/proc). No-op when the flag is absent.
+const readStdinFields = async (
+	values: Record<string, unknown>,
+	fields: Record<string, string>,
+): Promise<void> => {
+	const raw = values["field-stdin"];
+	if (raw === undefined) return;
+	const n = Number(raw);
+	if (!Number.isInteger(n) || n < 0) throw new Error("--field-stdin expects a non-negative count");
+	for (let i = 0; i < n; i++) {
+		const line = await readStdinLine();
+		const eq = line.indexOf("=");
+		if (eq <= 0) throw new Error("bad --field-stdin line (expected KEY=VALUE)");
+		fields[line.slice(0, eq)] = line.slice(eq + 1);
+	}
 };
 
 // Build relay credentials from flags, falling back to env. The app-layer token
@@ -280,6 +338,7 @@ const main = async (): Promise<number> => {
 			field: { type: "string", multiple: true },
 			type: { type: "string" }, // add/edit: item type (login|note|card|identity)
 			password: { type: "boolean" },
+			"field-stdin": { type: "string" }, // add/edit: read N `KEY=VALUE` field lines from stdin
 			name: { type: "string" },
 			relay: { type: "string" },
 			tailnet: { type: "boolean" }, // sync: also reconcile with direct tailnet peers
@@ -287,17 +346,22 @@ const main = async (): Promise<number> => {
 			host: { type: "string" }, // serve: bind address (default: this device's tailnet IP)
 			port: { type: "string" }, // serve/sync: peer-server port
 			"peer-token": { type: "string" }, // serve/sync: shared token gating the peer server
+			"peer-token-file": { type: "string" }, // ...from a file instead of argv
+			peer: { type: "string", multiple: true }, // sync: tailnet peer allowlist (name/ip)
 			token: { type: "string" },
 			"token-file": { type: "string" },
 			"relay-token": { type: "string" },
+			"relay-token-file": { type: "string" }, // ...from a file instead of argv
 			role: { type: "string" },
 			user: { type: "string" },
 			device: { type: "string" },
 			"org-key": { type: "string" },
+			"org-key-file": { type: "string" }, // recover: org escrow key from a file, not argv
 			keychain: { type: "boolean" },
 			"with-key": { type: "string" }, // keystore/init: systemd-creds binding (host|tpm2|auto)
 			"access-id": { type: "string" },
 			"access-secret": { type: "string" },
+			"access-secret-file": { type: "string" }, // ...from a file instead of argv
 			env: { type: "string" }, // run
 			"allow-missing": { type: "boolean" }, // run
 			mask: { type: "boolean" }, // run: scrub the child's stdout/stderr
@@ -308,6 +372,17 @@ const main = async (): Promise<number> => {
 
 	if (values.json) setJsonOutput(true);
 	if (values["passphrase-stdin"]) setPassphraseSource("stdin");
+
+	// Pre-resolve the `--<flag>-file` secret alternatives into `values` so the rest
+	// of the CLI reads them like an inline flag — but the secret comes off disk, not
+	// argv (which is world-readable via `ps` and lands in shell history). An inline
+	// flag, if also given, wins for backward compatibility.
+	const vbag = values as Record<string, unknown>;
+	for (const flag of ["relay-token", "access-secret", "peer-token"]) {
+		const file = vbag[`${flag}-file`];
+		if (typeof file === "string" && vbag[flag] === undefined)
+			vbag[flag] = (await readFile(file, "utf8")).trim();
+	}
 	// `--with-key <mode>` is sugar over $VAULT_SYSTEMD_CREDS_KEY: it selects the
 	// systemd-creds binding used when a DUK is minted (`init --keychain`,
 	// `keystore enable`). The systemd provider reads the env at seal time, and
@@ -326,9 +401,7 @@ const main = async (): Promise<number> => {
 			try {
 				if (isInitialized(store)) throw new Error("vault already initialized");
 				const pass = await readPassphrase("New passphrase: ");
-				const ks = values.keychain ? await defaultKeyStore() : undefined;
-				if (values.keychain && !ks)
-					process.stderr.write("warning: no OS keystore available here; created passphrase-only\n");
+				const ks = await requestedKeyStore(values);
 				const r = await init(store, pass, ks);
 				emit(`Initialized vault ${r.vaultId}\n  user:   ${r.userId}\n  device: ${r.deviceId}\n`, {
 					vaultId: r.vaultId,
@@ -351,7 +424,11 @@ const main = async (): Promise<number> => {
 				const fields = collectFields(values.field as string[] | undefined);
 				const itemType = parseItemType(values.type);
 				return (async () => {
-					if (values.password) fields.password = await readPassphrase("Item password: ");
+					// Field-stdin values come first (matching the wrapper's stdin order:
+					// passphrase, fields, then item password).
+					await readStdinFields(values, fields);
+					if (values.password)
+						fields.password = await readPassphrase("Item password: ", { useEnv: false });
 					const id = addItem(s, title, fields, itemType);
 					emit(`Added ${itemType ?? DEFAULT_ITEM_TYPE} "${title}" (${id})\n`, {
 						title,
@@ -426,10 +503,13 @@ const main = async (): Promise<number> => {
 				if (!title) throw new Error("usage: vault edit <title> [--type <t>] [--field k=v ...]");
 				const itemType = parseItemType(values.type);
 				const fields = collectFields(values.field as string[] | undefined);
-				if (Object.keys(fields).length === 0 && !itemType)
-					throw new Error("nothing to update: pass --field k=v ... and/or --type <t>");
-				editItem(s, title, fields, itemType);
-				emit(`Updated "${title}"\n`, { title, ...(itemType ? { itemType } : {}) });
+				return (async () => {
+					await readStdinFields(values, fields);
+					if (Object.keys(fields).length === 0 && !itemType)
+						throw new Error("nothing to update: pass --field k=v ... and/or --type <t>");
+					editItem(s, title, fields, itemType);
+					emit(`Updated "${title}"\n`, { title, ...(itemType ? { itemType } : {}) });
+				})();
 			});
 			return 0;
 
@@ -497,15 +577,24 @@ const main = async (): Promise<number> => {
 				let pulled = 0;
 				let pushed = 0;
 				const notes: string[] = [];
+				// Track leg outcomes so a sync where EVERY attempted transport failed
+				// exits non-zero. Without this, a downgraded hub failure + a downgraded
+				// tailnet failure both become notes and the command reports
+				// "Synced: pulled 0, pushed 0" with exit 0 — a cron'd sync could be
+				// broken indefinitely with no failing status.
+				let legsAttempted = 0;
+				let legsSucceeded = 0;
 
 				// Hub leg (unless tailnet-only). A hub failure is fatal only when the
 				// tailnet fallback isn't also running — otherwise it's the very outage
 				// §8.6 exists to ride out, so we note it and continue to the peers.
 				if (!tailnetOnly && relay) {
+					legsAttempted++;
 					try {
 						const stats = await syncWithRelay(s, relay, auth);
 						pulled += stats.pulled;
 						pushed += stats.pushed;
+						legsSucceeded++;
 						notes.push(`relay: pulled ${stats.pulled}, pushed ${stats.pushed}`);
 					} catch (err) {
 						if (!useTailnet) throw err;
@@ -516,13 +605,27 @@ const main = async (): Promise<number> => {
 				// Tailnet leg. Discovery (shelling to `tailscale`) failing is fatal only
 				// for a tailnet-only sync; otherwise the hub already carried the round.
 				if (useTailnet) {
+					legsAttempted++;
 					const port = Number(values.port ?? process.env.VAULT_PEER_PORT ?? DEFAULT_PEER_PORT);
 					const peerToken =
 						(values["peer-token"] as string | undefined) ?? process.env.VAULT_PEER_TOKEN;
+					// Optional allowlist (--peer name/ip, repeatable, or VAULT_PEER_ALLOW
+					// comma-separated): restrict which tailnet nodes receive the peer token.
+					const allow = [
+						...((values.peer as string[] | undefined) ?? []),
+						...(process.env.VAULT_PEER_ALLOW?.split(",").map((x) => x.trim()) ?? []),
+					].filter(Boolean);
+					if (peerToken && allow.length === 0)
+						process.stderr.write(
+							"warning: presenting --peer-token to ALL online tailnet nodes; set --peer/VAULT_PEER_ALLOW to restrict\n",
+						);
 					try {
-						const r = await syncTailnet(s, { port, auth: { token: peerToken } });
+						const r = await syncTailnet(s, { port, auth: { token: peerToken }, allow });
 						pulled += r.pulled;
 						pushed += r.pushed;
+						// Per-peer failures are returned rather than thrown. The transport
+						// succeeded only if at least one peer actually completed a round.
+						if (r.reached.length > 0) legsSucceeded++;
 						let note = `tailnet: reached ${r.reached.length} peer(s)`;
 						if (r.failed.length) note += `, ${r.failed.length} unreachable`;
 						notes.push(note);
@@ -531,6 +634,11 @@ const main = async (): Promise<number> => {
 						notes.push(`tailnet: failed (${err instanceof Error ? err.message : String(err)})`);
 					}
 				}
+
+				// Every transport we tried failed: surface a failure instead of a
+				// misleading success.
+				if (legsAttempted > 0 && legsSucceeded === 0)
+					throw new Error(`sync failed on all transports — ${notes.join("; ")}`);
 
 				const epoch = maybeCatchUp(s);
 				let text = `Synced: pulled ${pulled}, pushed ${pushed}\n`;
@@ -577,9 +685,15 @@ const main = async (): Promise<number> => {
 					(token ? "" : "warning: no --peer-token set; open to the whole tailnet\n"),
 				{ host, port, vaultId, gated: !!token },
 			);
-			// Block until signalled, then close the server and store cleanly.
+			// Block until signalled, then close the server and store cleanly. Guard
+			// against a second signal (Ctrl-C twice while connections drain): rerunning
+			// teardown would call store.close() again, which throws on an
+			// already-closed DatabaseSync and turns a clean shutdown into a crash.
 			await new Promise<void>((resolve) => {
+				let shuttingDown = false;
 				const shut = (): void => {
+					if (shuttingDown) return;
+					shuttingDown = true;
 					server.close(() => {
 						store.close();
 						resolve();
@@ -651,12 +765,7 @@ const main = async (): Promise<number> => {
 			try {
 				const tokenB = await readToken<TokenB>(values);
 				const pass = await readPassphrase();
-				const { sas } = await deviceConfirm(
-					store,
-					pass,
-					tokenB,
-					values.keychain ? await defaultKeyStore() : undefined,
-				);
+				const { sas } = await deviceConfirm(store, pass, tokenB, await requestedKeyStore(values));
 				emit(
 					`Enrolled. Verify SAS matches the other device: ${sas}\nRun 'vault sync --relay <url>' to pull history.\n`,
 					{ sas },
@@ -705,7 +814,7 @@ const main = async (): Promise<number> => {
 					store,
 					pass,
 					join,
-					values.keychain ? await defaultKeyStore() : undefined,
+					await requestedKeyStore(values),
 				);
 				emit(
 					`Joined vault as user ${userId}. Verify SAS matches the admin: ${sas}\nRun 'vault sync --relay <url>' to publish your device and pull history.\n`,
@@ -736,11 +845,15 @@ const main = async (): Promise<number> => {
 			return 0;
 
 		case "recover":
-			await withSession(values, (s) => {
+			await withSession(values, async (s) => {
 				const user = values.user as string | undefined;
-				const orgKey = values["org-key"] as string | undefined;
+				// The org escrow private key decrypts every member's identity keys —
+				// never require it on argv. Prefer --org-key-file / VAULT_ORG_KEY.
+				const orgKey = await readSecretFlag(values, "org-key", "VAULT_ORG_KEY");
 				if (!user || !orgKey)
-					throw new Error("usage: vault recover --user <id> --org-key <base64>");
+					throw new Error(
+						"usage: vault recover --user <id> (--org-key-file <path> | VAULT_ORG_KEY=… | --org-key <base64>)",
+					);
 				const recovered = recoverUser(s, user, orgKey);
 				emit(
 					`Recovered identity keys for user ${user}:\n\n${recovered}\n\n` +
@@ -828,7 +941,7 @@ const main = async (): Promise<number> => {
 					session,
 					{
 						envFile: (values.env as string | undefined) ?? "./.env",
-						defaultVault: (values.vault as string | undefined) ?? session.vaultId,
+						openVault: (values.vault as string | undefined) ?? DEFAULT_VAULT,
 						allowMissing: !!values["allow-missing"],
 						mask: !!values.mask,
 					},
@@ -865,7 +978,13 @@ const main = async (): Promise<number> => {
 				const session = await unlock(store, pass, await unlockKeyStore(store));
 				const port = Number(values.port ?? DEFAULT_PROXY_PORT);
 				const connect = Boolean(values.connect);
-				return await proxyCmd(session, { configFiles, port, connect }, rest[0], rest.slice(1));
+				const openVault = (values.vault as string | undefined) ?? DEFAULT_VAULT;
+				return await proxyCmd(
+					session,
+					{ configFiles, port, connect, openVault },
+					rest[0],
+					rest.slice(1),
+				);
 			} finally {
 				store.close();
 			}

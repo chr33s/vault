@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Clock, encodeHLC, decodeHLC, compareHLC } from "../core/hlc.ts";
+import { Clock, encodeHLC, decodeHLC, compareHLC, isWithinForwardDrift } from "../core/hlc.ts";
 
 test("HLC tick is strictly monotonic within a device", () => {
 	let t = 1000;
@@ -13,19 +13,34 @@ test("HLC tick is strictly monotonic within a device", () => {
 	assert.ok(compareHLC(b, d) < 0);
 });
 
-test("HLC observe advances past a future-dated remote stamp (causality)", () => {
+test("HLC observe advances past a remote stamp beyond one day (causality)", () => {
 	// Local physical clock is BEHIND the remote one.
 	let localPhys = 1000;
 	const c = new Clock("devLocal", () => localPhys);
 
-	// A remote edit carries a far-future timestamp.
-	const remote = decodeHLC(encodeHLC({ millis: 9_000_000, counter: 3, deviceId: "devRemote" }));
+	// Exercise a distance larger than the former forward-drift clamp.
+	const remote = decodeHLC(
+		encodeHLC({ millis: localPhys + 2 * 24 * 60 * 60 * 1000, counter: 3, deviceId: "devRemote" }),
+	);
 
 	// After observing it, the next local tick must out-rank the remote stamp —
 	// otherwise a fresh local edit would silently lose the LWW race.
-	c.observe(remote);
+	const observed = c.observe(remote);
+	assert.ok(compareHLC(observed, remote) > 0, "receive event must beat the observed remote");
 	const next = c.tick();
 	assert.ok(compareHLC(next, remote) > 0, "local edit after observe must beat the observed remote");
+});
+
+test("future-drift policy rejects a remote stamp before CRDT application", () => {
+	const now = 1000;
+	assert.equal(
+		isWithinForwardDrift({ millis: now + 24 * 60 * 60 * 1000, counter: 0, deviceId: "a" }, now),
+		true,
+	);
+	assert.equal(
+		isWithinForwardDrift({ millis: now + 24 * 60 * 60 * 1000 + 1, counter: 0, deviceId: "a" }, now),
+		false,
+	);
 });
 
 test("encodeHLC is fixed-width so lexicographic order == logical order", () => {

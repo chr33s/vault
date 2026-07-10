@@ -48,23 +48,68 @@ resolve_sea_node() {
   fi
 
   if [ ! -x "$sea_node" ]; then
+    local archive sums expected actual gpg_required
     mkdir -p "$cache"
     url="https://nodejs.org/dist/v${ver}/${dir}.${ext}"
+    archive="${cache}/${dir}.${ext}"
+    sums="${cache}/SHASUMS256.txt"
     echo "local node lacks the SEA fuse; fetching official $dir" >&2
-    if [ "$ext" = tar.gz ]; then
-      if command -v curl >/dev/null; then
-        curl -fsSL "$url" | tar -xz -C "$cache"
-      elif command -v wget >/dev/null; then
-        wget -qO- "$url" | tar -xz -C "$cache"
-      else
-        echo "error: need curl or wget to fetch $url" >&2; return 1
-      fi
-    else
-      tmp="${cache}/${dir}.zip"
-      if command -v curl >/dev/null; then curl -fsSL "$url" -o "$tmp"; else wget -qO "$tmp" "$url"; fi
-      unzip -oq "$tmp" -d "$cache"
-      rm -f "$tmp"
+    # Download to a FILE first, then verify its checksum BEFORE extracting — the
+    # extracted binary is injected into and shipped as the release, so a trojaned
+    # mirror/CDN or a TLS-intercepting proxy must not be able to slip in a
+    # backdoored Node. (Previously the tarball was piped straight into tar with no
+    # integrity check at all.)
+    dl() { # dl <url> <out>
+      if command -v curl >/dev/null; then curl -fsSL "$1" -o "$2"
+      elif command -v wget >/dev/null; then wget -qO "$2" "$1"
+      else echo "error: need curl or wget to fetch $1" >&2; return 1; fi
+    }
+    dl "$url" "$archive"
+    dl "https://nodejs.org/dist/v${ver}/SHASUMS256.txt" "$sums"
+
+    # Expected hash: an out-of-band pin (VAULT_SEA_NODE_SHA256) wins — that is the
+    # only form that also defends against a MITM who rewrites SHASUMS256.txt.
+    # Otherwise use the published checksum file (catches corruption / a bad mirror
+    # that didn't also forge the sums file).
+    expected="${VAULT_SEA_NODE_SHA256:-$(grep "  ${dir}.${ext}\$" "$sums" | awk '{print $1}')}"
+    if [ -z "$expected" ]; then
+      echo "error: no SHA-256 for ${dir}.${ext} (not in SHASUMS256.txt, no VAULT_SEA_NODE_SHA256)" >&2
+      return 1
     fi
+    if command -v sha256sum >/dev/null; then actual="$(sha256sum "$archive" | awk '{print $1}')"
+    else actual="$(shasum -a 256 "$archive" | awk '{print $1}')"; fi
+    if [ "$expected" != "$actual" ]; then
+      echo "error: checksum mismatch for $archive (expected $expected, got $actual) — refusing to build" >&2
+      rm -f "$archive"; return 1
+    fi
+
+    # Best-effort GPG verification of the checksum file against the Node release
+    # keyring. Required mode must fail closed at every prerequisite, not only when
+    # `gpg --verify` itself runs and rejects the signature.
+    gpg_required="${VAULT_SEA_REQUIRE_GPG:-0}"
+    if ! command -v gpg >/dev/null; then
+      if [ "$gpg_required" = 1 ]; then
+        echo "error: VAULT_SEA_REQUIRE_GPG=1 but gpg is not available" >&2
+        return 1
+      fi
+      echo "warning: gpg is not available; relied on SHA-256 only" >&2
+    elif ! dl "https://nodejs.org/dist/v${ver}/SHASUMS256.txt.asc" "${sums}.asc"; then
+      if [ "$gpg_required" = 1 ]; then
+        echo "error: VAULT_SEA_REQUIRE_GPG=1 but SHASUMS256.txt.asc could not be downloaded" >&2
+        return 1
+      fi
+      echo "warning: could not download SHASUMS256.txt.asc; relied on SHA-256 only" >&2
+    elif gpg --verify "${sums}.asc" "$sums" >/dev/null 2>&1; then
+      echo "gpg-verified SHASUMS256.txt" >&2
+    elif [ "$gpg_required" = 1 ]; then
+      echo "error: GPG verification of SHASUMS256.txt failed (import the Node release keys)" >&2
+      return 1
+    else
+      echo "warning: could not GPG-verify SHASUMS256.txt (Node release keys not imported); relied on SHA-256 only" >&2
+    fi
+
+    if [ "$ext" = tar.gz ]; then tar -xzf "$archive" -C "$cache"; else unzip -oq "$archive" -d "$cache"; fi
+    rm -f "$archive"
   fi
 
   if [ ! -x "$sea_node" ]; then

@@ -12,14 +12,21 @@
 // Build/deploy with Wrangler (see relay/worker/wrangler.toml and the deployment
 // guide). This file is NEVER bundled into the SEA binary or run under Node.
 
-import { entryHash, type LogEntry } from "../../core/authlog.ts";
+import {
+	entryHash,
+	replay,
+	deviceSignKey,
+	validRootGenesis,
+	type LogEntry,
+	type Membership,
+} from "../../core/authlog.ts";
 import {
 	verifyEnvelope,
 	type OpEnvelope,
 	type VersionVector,
 	type GrantRow,
 } from "../../core/protocol.ts";
-import type { RotationRecord } from "../../core/rotation.ts";
+import { verifyRotation, wellFormedRotation, type RotationRecord } from "../../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "../access.ts";
 import { handle, type RelayStorage } from "../handler.ts";
 
@@ -79,6 +86,8 @@ class DoRelayStorage implements RelayStorage {
 		this.sql.exec(`CREATE TABLE IF NOT EXISTS relay_authlog (
       team_id TEXT NOT NULL, hash TEXT NOT NULL, entry TEXT NOT NULL,
       PRIMARY KEY (team_id, hash));`);
+		this.sql.exec(`CREATE TABLE IF NOT EXISTS relay_roots (
+      team_id TEXT PRIMARY KEY, hash TEXT NOT NULL);`);
 		this.sql.exec(`CREATE TABLE IF NOT EXISTS relay_rotations (
       team_id TEXT NOT NULL, epoch INTEGER NOT NULL, device_id TEXT NOT NULL, record TEXT NOT NULL,
       PRIMARY KEY (team_id, epoch, device_id));`);
@@ -138,10 +147,62 @@ class DoRelayStorage implements RelayStorage {
 			JSON.stringify(entry),
 		);
 	}
+	private rootHashFor(teamId: string, candidate?: string): string | undefined {
+		let pinned = this.rows(`SELECT hash FROM relay_roots WHERE team_id=?`, teamId)[0] as
+			| { hash: string }
+			| undefined;
+		if (!pinned) {
+			// Preserve the first matching root already stored by a pre-pin Worker.
+			const rows = this.rows(
+				`SELECT entry FROM relay_authlog WHERE team_id=? ORDER BY rowid`,
+				teamId,
+			);
+			let legacyHash: string | undefined;
+			for (const row of rows) {
+				try {
+					const entry = JSON.parse(row.entry as string) as LogEntry;
+					if (validRootGenesis(entry, teamId)) {
+						legacyHash = entryHash(entry);
+						break;
+					}
+				} catch {
+					/* skip malformed legacy rows */
+				}
+			}
+			const initial = legacyHash ?? candidate;
+			if (!initial) return undefined;
+			this.sql.exec(
+				`INSERT OR IGNORE INTO relay_roots (team_id,hash) VALUES (?,?)`,
+				teamId,
+				initial,
+			);
+			pinned = this.rows(`SELECT hash FROM relay_roots WHERE team_id=?`, teamId)[0] as {
+				hash: string;
+			};
+		}
+		return pinned.hash;
+	}
+	pinGenesis(teamId: string, entry: LogEntry): boolean {
+		if (!validRootGenesis(entry, teamId)) return false;
+		const hash = entryHash(entry);
+		return this.rootHashFor(teamId, hash) === hash;
+	}
 	authExcept(teamId: string, have: Set<string>): LogEntry[] {
-		return this.rows(`SELECT hash,entry FROM relay_authlog WHERE team_id=?`, teamId)
-			.filter((r) => !have.has(r.hash as string))
-			.map((r) => JSON.parse(r.entry as string) as LogEntry);
+		const pinned = this.rootHashFor(teamId);
+		const seen = new Set(have);
+		return this.rows(`SELECT entry FROM relay_authlog WHERE team_id=?`, teamId).flatMap((row) => {
+			try {
+				const entry = JSON.parse(row.entry as string) as LogEntry;
+				const hash = entryHash(entry);
+				if (entry.body.type === "genesis" && (hash !== pinned || !validRootGenesis(entry, teamId)))
+					return [];
+				if (seen.has(hash)) return [];
+				seen.add(hash);
+				return [entry];
+			} catch {
+				return [];
+			}
+		});
 	}
 	putRotation(teamId: string, rec: RotationRecord): void {
 		this.sql.exec(
@@ -179,6 +240,25 @@ class DoRelayStorage implements RelayStorage {
 			wrapped: r.wrapped as string,
 		}));
 	}
+
+	// Membership for authenticating op/rotation signatures (see verifyOp note).
+	// Memoized by auth-entry count since the log is append-only.
+	private memberCache: { count: number; membership: Membership } | undefined;
+	membershipFor(teamId: string): Membership | undefined {
+		const count = (this.rows(`SELECT COUNT(*) AS c FROM relay_authlog WHERE team_id=?`, teamId)[0]!
+			.c as number)!;
+		if (!this.memberCache || this.memberCache.count !== count) {
+			try {
+				this.memberCache = {
+					count,
+					membership: replay(this.authExcept(teamId, new Set()), teamId),
+				};
+			} catch {
+				return undefined;
+			}
+		}
+		return this.memberCache.membership;
+	}
 }
 
 // Build a RelayRequest from a Fetch API Request.
@@ -202,6 +282,43 @@ const jsonError = (status: number, error: string): Response =>
 		headers: { "content-type": "application/json" },
 	});
 
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+// Return undefined as soon as the byte limit is crossed. Reading through the
+// stream prevents chunked requests from being fully buffered by Request.text().
+const readLimitedBody = async (req: Request): Promise<string | undefined> => {
+	if (!req.body) return "";
+	const reader = req.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > MAX_BODY_BYTES) {
+				try {
+					await reader.cancel();
+				} catch {
+					/* the response is still 413 if the producer's cancellation fails */
+				}
+				return undefined;
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const bytes = new Uint8Array(size);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(bytes);
+};
+
 // The Durable Object: one instance per teamId, owning that team's SQLite.
 export class RelayDO {
 	private store: DoRelayStorage;
@@ -214,10 +331,22 @@ export class RelayDO {
 		try {
 			const access = accessFromEnv(this.env);
 			const rr = toRelayRequest(req, access);
-			const { status, body } = await handle(rr, this.store, {
+			const store = this.store;
+			const { status, body } = await handle(rr, store, {
 				authorize: (header) => authorizeHeaders(header, access),
-				// Cheap integrity check; clients re-verify signatures against the auth log.
-				verifyOp: (op) => verifyEnvelope(op),
+				// Authenticate authorship against the auth log so a member can't
+				// pre-claim/censor another device's (deviceId, seq) slot.
+				verifyOp: (op, teamId) => {
+					const m = store.membershipFor(teamId);
+					const key = m && deviceSignKey(m, op.deviceId);
+					return !!key && verifyEnvelope(op, key);
+				},
+				// Bound synthetic-rotation floods: only well-formed, device-signed
+				// rotations are stored.
+				verifyRotation: (rec, teamId) => {
+					const key = store.membershipFor(teamId)?.deviceKeys.get(rec.signerId);
+					return !!key && wellFormedRotation(rec) && verifyRotation(rec, key);
+				},
 			});
 			return new Response(JSON.stringify(body), {
 				status,
@@ -244,8 +373,21 @@ export default {
 				});
 			if (req.method !== "POST") return jsonError(405, "method not allowed");
 
-			// Peek the teamId to pick the DO, then replay the body to the DO via a clone.
-			const raw = await req.text();
+			// Enforce the access gate at the EDGE, before reading the body or routing
+			// to a Durable Object. Otherwise an unauthenticated flood of random
+			// teamIds would each spin up a fresh DO (running its CREATE TABLE) and
+			// buffer an uncapped body — a storage/billing amplification the token or
+			// Access check exists to prevent. The DO re-checks auth defensively.
+			const access = accessFromEnv(env);
+			if (!(await authorizeHeaders((n) => req.headers.get(n) ?? undefined, access)))
+				return jsonError(403, "forbidden");
+
+			// Cap the body before buffering it (Content-Length fast path + hard cap on
+			// the read) so a single request can't exhaust memory.
+			if (Number(req.headers.get("content-length") ?? "0") > MAX_BODY_BYTES)
+				return jsonError(413, "payload too large");
+			const raw = await readLimitedBody(req);
+			if (raw === undefined) return jsonError(413, "payload too large");
 			let teamId = "";
 			try {
 				teamId = (JSON.parse(raw || "{}") as { teamId?: string }).teamId ?? "";

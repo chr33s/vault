@@ -1,6 +1,6 @@
 {
 	"name": "vault",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"private": true,
 	"description": "End-to-end encrypted, local-first credential vault (Architecture C: local-first core + Cloudflare relay). Zero runtime dependencies.",
 	"bin": {
@@ -9,6 +9,7 @@
 	"type": "module",
 	"scripts": {
 		"check": "oxlint --type-aware --type-check . && oxfmt --check .",
+		"check:deps": "node build/check-deps.ts",
 		"fix": "oxfmt --write . && oxlint --type-aware --type-check --fix",
 		"cli": "node cli/main.ts",
 		"relay": "node relay/main.ts",
@@ -17,19 +18,18 @@
 		"test:sea": "node --test test/sea.test.ts",
 		"typecheck": "tsc --noEmit",
 		"bundle": "node build/bundle.ts",
-		"build:sea": "bash build/make-sea.sh",
-		"check:deps": "node build/check-deps.ts"
+		"build:sea": "bash build/make-sea.sh"
 	},
 	"devDependencies": {
-		"@types/node": "25.9.3",
+		"@types/node": "26.1.1",
 		"esbuild": "0.28.1",
-		"oxfmt": "0.54.0",
-		"oxlint": "1.69.0",
-		"oxlint-tsgolint": "0.23.0",
-		"typescript": "6.0.3"
+		"oxfmt": "0.58.0",
+		"oxlint": "1.73.0",
+		"oxlint-tsgolint": "0.24.0",
+		"typescript": "7.0.2"
 	},
 	"engines": {
-		"node": "26.3.0"
+		"node": "26.5.0"
 	},
 	"allowScripts": {
 		"esbuild@0.28.1": true

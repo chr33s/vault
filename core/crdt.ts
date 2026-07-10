@@ -75,7 +75,14 @@ export class VaultState {
 		if (op.hlc > a.lastHlc) a.lastHlc = op.hlc;
 
 		if (op.field === PASSWORD_FIELD) {
-			a.pwValues.set(op.hlc, op.value);
+			// Keyed by encoded HLC. Honest per-device clocks never repeat an HLC, but
+			// a misbehaving author could equivocate two values at the same HLC; resolve
+			// such a collision deterministically (keep the larger value) so the merge
+			// stays order-independent instead of depending on apply() sequence.
+			const prev = a.pwValues.get(op.hlc);
+			if (prev === undefined || op.value === null || (prev !== null && op.value! > prev)) {
+				a.pwValues.set(op.hlc, op.value);
+			}
 			for (const r of op.replaces ?? []) a.pwSuperseded.add(r);
 			return;
 		}

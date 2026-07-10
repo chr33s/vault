@@ -91,10 +91,19 @@ export type TailnetSyncResult = {
 // a sync that reaches some peers still succeeds.
 export const syncTailnet = async (
 	s: Session,
-	opts: { port?: number; auth?: RelayAuth; timeoutMs?: number } = {},
+	opts: { port?: number; auth?: RelayAuth; timeoutMs?: number; allow?: string[] } = {},
 ): Promise<TailnetSyncResult> => {
 	const port = opts.port ?? DEFAULT_PEER_PORT;
-	const { peers } = await tailscaleStatus();
+	const { peers: allPeers } = await tailscaleStatus();
+	// When an allowlist is configured, present the peer token ONLY to those nodes.
+	// Otherwise `tailscale status` enumerates every online node (a shared node, a
+	// colleague's machine, a compromised host) and each would receive the shared
+	// peer token on the first round and could replay it against real peer servers.
+	const allow = opts.allow?.map((a) => a.toLowerCase());
+	const peers =
+		allow && allow.length > 0
+			? allPeers.filter((p) => allow.includes(p.name.toLowerCase()) || allow.includes(p.ip))
+			: allPeers;
 	let pulled = 0;
 	let pushed = 0;
 	const reached: string[] = [];

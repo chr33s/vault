@@ -43,7 +43,16 @@ final class VaultCLI {
 			}
 			return nil
 		}
-		let bin = resolve("VAULT_BIN", "vault") ?? URL(fileURLWithPath: "/usr/local/bin/vault")
+		// Prefer an explicit $VAULT_BIN (dev) or the signed binary bundled in
+		// Contents/Resources. Do NOT fall back to a fixed path like
+		// /usr/local/bin/vault: on a Homebrew Mac that directory is admin-writable
+		// without root, so a planted binary there would receive the account
+		// passphrase on stdin. A missing bundled binary instead yields a clear spawn
+		// error against the in-bundle path.
+		let bin =
+			resolve("VAULT_BIN", "vault")
+			?? resources?.appendingPathComponent("vault")
+			?? URL(fileURLWithPath: "vault")
 		return VaultCLI(binaryURL: bin, seHelperURL: resolve("VAULT_HELPER", "vault-helper"))
 	}
 
@@ -73,35 +82,71 @@ final class VaultCLI {
 			process.standardOutput = stdout
 			process.standardError = stderr
 
+			// Drain stdout/stderr on background queues that start BEFORE the process
+			// exits. Reading only inside terminationHandler deadlocks: a child whose
+			// output exceeds the ~64KB pipe buffer blocks in write(2) and never
+			// terminates, so the handler never fires and this continuation hangs
+			// forever. Concurrent reads keep both pipes flowing regardless of size.
+			var outData = Data()
+			var errData = Data()
+			let ioGroup = DispatchGroup()
+			ioGroup.enter()
+			DispatchQueue.global().async {
+				outData = stdout.fileHandleForReading.readDataToEndOfFile()
+				ioGroup.leave()
+			}
+			ioGroup.enter()
+			DispatchQueue.global().async {
+				errData = stderr.fileHandleForReading.readDataToEndOfFile()
+				ioGroup.leave()
+			}
+
 			process.terminationHandler = { _ in
-				let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-				let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-				guard
-					let firstLine = String(data: outData, encoding: .utf8)?
-						.split(separator: "\n", omittingEmptySubsequences: true).first
-				else {
-					let msg = String(data: errData, encoding: .utf8) ?? ""
-					cont.resume(
-						throwing: CLIError(message: msg.isEmpty ? "vault produced no output" : msg.trimmed))
-					return
-				}
-				let lineData = Data(firstLine.utf8)
-				do {
-					let env = try JSONDecoder().decode(Envelope.self, from: lineData)
-					if env.ok { cont.resume(returning: lineData) } else {
-						cont.resume(throwing: CLIError(message: env.error ?? "unknown error"))
+				// Both reads have completed (EOF at child exit); safe to read the vars.
+				ioGroup.notify(queue: DispatchQueue.global()) {
+					guard
+						let firstLine = String(data: outData, encoding: .utf8)?
+							.split(separator: "\n", omittingEmptySubsequences: true).first
+					else {
+						let msg = String(data: errData, encoding: .utf8) ?? ""
+						cont.resume(
+							throwing: CLIError(message: msg.isEmpty ? "vault produced no output" : msg.trimmed))
+						return
 					}
-				} catch {
-					cont.resume(throwing: CLIError(message: "could not parse vault output"))
+					let lineData = Data(firstLine.utf8)
+					do {
+						let env = try JSONDecoder().decode(Envelope.self, from: lineData)
+						if env.ok { cont.resume(returning: lineData) } else {
+							cont.resume(throwing: CLIError(message: env.error ?? "unknown error"))
+						}
+					} catch {
+						cont.resume(throwing: CLIError(message: "could not parse vault output"))
+					}
 				}
 			}
 
 			do { try process.run() } catch {
+				// No child inherited these descriptors, so Process will not close the
+				// parent-side writers for us. Closing them releases both background EOF
+				// readers instead of retaining a blocked task after every failed launch.
+				try? stdin.fileHandleForWriting.close()
+				try? stdout.fileHandleForWriting.close()
+				try? stderr.fileHandleForWriting.close()
 				cont.resume(throwing: error)
 				return
 			}
+			// Write secrets to stdin with the throwing API inside do/catch: the legacy
+			// FileHandle.write(_:) raises an UNCATCHABLE ObjC exception on a broken
+			// pipe (child exited early — bad --vault, wrong binary), crashing the whole
+			// app. write(contentsOf:) throws a Swift error we can swallow; the child's
+			// exit code/output is authoritative.
 			let h = stdin.fileHandleForWriting
-			for p in passphrases { h.write(Data((p + "\n").utf8)) }
+			do {
+				for p in passphrases { try h.write(contentsOf: Data((p + "\n").utf8)) }
+			} catch {
+				// Child closed stdin before we finished writing; ignore and let its
+				// output/exit drive the result.
+			}
 			try? h.close()
 		}
 	}

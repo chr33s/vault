@@ -3,9 +3,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { init, unlock, addItem, getItem, rebuildSession } from "../cli/engine.ts";
+import {
+	init,
+	unlock,
+	addItem,
+	getItem,
+	rebuildSession,
+	authNewDevice,
+	deviceAdd,
+	deviceConfirm,
+} from "../cli/engine.ts";
 import * as cr from "../core/crypto.ts";
 import { encodeHLC } from "../core/hlc.ts";
+import { makeEnvelope } from "../core/protocol.ts";
 import { keyCommit, encodeGrant, rotationBytes, type RotationRecord } from "../core/rotation.ts";
 import { seal } from "../core/sealedbox.ts";
 import { Store } from "../core/store.ts";
@@ -89,6 +99,53 @@ test("rotation naming an unknown device as signer is rejected", async () => {
 		rebuildSession(s);
 		assert.equal(s.currentEpoch, 1);
 		assert.equal(s.currentKeyCommit, legitCommit);
+		store.close();
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("future-dated remote field ops are rejected before CRDT application", async () => {
+	const dir = await tmp();
+	try {
+		const store = new Store(join(dir, "v.db"));
+		await init(store, PASS);
+		const s = await unlock(store, PASS);
+		const itemId = addItem(s, "clock", {});
+
+		const remoteStore = new Store(join(dir, "remote.db"));
+		const tokenA = await authNewDevice(remoteStore, PASS);
+		const tokenB = deviceAdd(s, tokenA);
+		await deviceConfirm(remoteStore, PASS, tokenB);
+		const remote = await unlock(remoteStore, PASS);
+		const key = remote.keys.get(remote.currentKeyCommit)!;
+		const field = {
+			itemId,
+			field: "username",
+			value: "future-wins",
+			hlc: encodeHLC({
+				millis: Date.now() + 2 * 24 * 60 * 60 * 1000,
+				counter: 0,
+				deviceId: remote.deviceId,
+			}),
+		};
+		const box = cr.aeadEncrypt(key, Buffer.from(JSON.stringify(field), "utf8"));
+		const payload = Buffer.from(
+			JSON.stringify({ keyCommit: remote.currentKeyCommit, ...cr.encodeBox(box) }),
+			"utf8",
+		);
+		store.putOp(
+			makeEnvelope(
+				remote.deviceId,
+				store.maxSeqFor(remote.deviceId) + 1,
+				payload,
+				remote.priv.deviceSign,
+			),
+		);
+
+		rebuildSession(s);
+		assert.equal(getItem(s, "clock")!.fields.username, undefined);
+		remoteStore.close();
 		store.close();
 	} finally {
 		await rm(dir, { recursive: true, force: true });

@@ -27,8 +27,13 @@ struct TokenQRView: View {
 			}
 			.frame(height: 60)
 			Button("Copy token") {
-				NSPasteboard.general.clearContents()
-				NSPasteboard.general.setString(token, forType: .string)
+				let pb = NSPasteboard.general
+				pb.clearContents()
+				pb.setString(token, forType: .string)
+				// Mark the entry concealed (org.nspasteboard.ConcealedType convention) so
+				// clipboard-history managers skip archiving it — an enrollment token is
+				// key-carrying material the SAS ceremony assumes is ephemeral.
+				pb.setString(token, forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
 			}
 			.font(.caption)
 		}
