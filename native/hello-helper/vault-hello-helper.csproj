@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Windows Hello KeyCredential signer (plan §12b). A separately-built,
+       separately-signed artifact like the macOS vault-helper: NOT an npm
+       dependency, so the runtime stays zero-dependency and check:deps stays
+       green. The windows10 TFM pulls in the built-in CsWinRT projections for
+       Windows.Security.Credentials; 10.0.19041 is the earliest SDK carrying a
+       stable KeyCredentialManager projection, and the min version keeps the
+       binary runnable on any supported Windows 10/11. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>vault-hello-helper</AssemblyName>
+    <RootNamespace>VaultHelloHelper</RootNamespace>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+</Project>

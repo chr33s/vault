@@ -71,7 +71,12 @@ resolve_sea_node() {
     # only form that also defends against a MITM who rewrites SHASUMS256.txt.
     # Otherwise use the published checksum file (catches corruption / a bad mirror
     # that didn't also forge the sums file).
-    expected="${VAULT_SEA_NODE_SHA256:-$(grep "  ${dir}.${ext}\$" "$sums" | awk '{print $1}')}"
+    # Trailing `|| true`: a no-match grep exits 1, and under this script's
+    # `set -o pipefail` the whole pipeline (and the assignment) would then abort
+    # BEFORE the empty-$expected diagnostic below can run — silently killing the
+    # build on a truncated/renamed SHASUMS256.txt. `|| true` neutralizes that so
+    # the empty result flows to the guard on the next lines.
+    expected="${VAULT_SEA_NODE_SHA256:-$(grep "  ${dir}.${ext}\$" "$sums" | awk '{print $1}' || true)}"
     if [ -z "$expected" ]; then
       echo "error: no SHA-256 for ${dir}.${ext} (not in SHASUMS256.txt, no VAULT_SEA_NODE_SHA256)" >&2
       return 1
@@ -122,7 +127,10 @@ resolve_sea_node() {
 node build/bundle.ts
 
 # 2 & 3. Generate the SEA binary directly (no postject) and sign it.
-if node --help 2>/dev/null | grep -q -- '--build-sea'; then
+# Probe via command substitution, NOT `node --help | grep -q`: under pipefail,
+# grep -q exiting at first match can SIGPIPE the still-writing node (exit 141),
+# turning a passing probe into a random "lacks --build-sea" failure.
+if [[ "$(node --help 2>/dev/null || true)" == *--build-sea* ]]; then
   SEA_NODE="$(resolve_sea_node)"
   "$SEA_NODE" --build-sea build/sea-config.json
 

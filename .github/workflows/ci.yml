@@ -69,6 +69,35 @@ jobs:
           path: |
             dist/vault*
 
+  native-windows:
+    name: native hello helper (win-x64)
+    needs: test
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: "package.json"
+      - run: npm ci
+      # Compile the WinRT helper — validates the CsWinRT projections and the
+      # WinVerifyTrust interop actually build against the Windows SDK. Self-contained
+      # single-file so the ONE published .exe is a drop-in sibling of vault.exe with
+      # no .NET runtime install on the user's box (matching the standalone macOS
+      # vault-helper); a framework-dependent apphost stub can't run on its own.
+      - run: dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true native/hello-helper
+      # Run the hello-tier tests on real Windows: the PowerShell WinRT projection
+      # script and the compiled helper must answer `available` cleanly. Runners
+      # have no Hello enrolled, so the tier legitimately reports unavailable;
+      # the gesture paths need a real Hello-enrolled host (see native/hello-helper).
+      - shell: bash
+        run: |
+          VAULT_HELLO_HELPER="$PWD/native/hello-helper/bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/vault-hello-helper.exe" \
+            node --test test/hello.test.ts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vault-hello-helper-win-x64
+          path: native/hello-helper/bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/vault-hello-helper.exe
+
   native:
     name: native helper + app (darwin-arm64)
     needs: sea

@@ -23,8 +23,15 @@
 //     user (via PowerShell's System.Security.Cryptography.ProtectedData) and
 //     stores the resulting blob on disk. At-rest protection bound to the user
 //     account — a disk copied to another machine/user can't unprotect it. It is
-//     NOT Windows Hello / TPM per-access UV (that needs a WinRT KeyCredential
-//     shim, the strong tier).
+//     NOT per-access UV — for that, prefer windows-hello above it.
+//   - windows-hello (implemented; Windows, strong tier): wraps the DUK under a
+//     key derived from a Windows Hello-gated KeyCredential signature
+//     (HKDF(RequestSignAsync(challenge), salt=challenge) -> AES-256-GCM, see
+//     cli/hello.ts). True per-access user verification — `get` forces a Hello
+//     gesture (PIN/face/fingerprint) releasing a non-exportable TPM-backed key.
+//     Discovered via the signed native/hello-helper (VAULT_HELLO_HELPER or a
+//     sibling vault-hello-helper.exe); $VAULT_HELLO_PS=1 opts into an unsigned
+//     PowerShell WinRT fallback for dev.
 //   - systemd-creds (implemented; Linux): seals the DUK with `systemd-creds
 //     encrypt --with-key=host` and stores the blob on disk — the Linux analog of
 //     windows-dpapi. Machine-scoped (the host secret is root-only), NOT per-user
@@ -44,45 +51,24 @@
 // the keychain/DPAPI master key too); its value is offline disk theft, backups,
 // and weak-passphrase resistance. See the README threat model.
 
-import { execFile as execFileCb, spawn } from "node:child_process";
+import { execFile as execFileCb } from "node:child_process";
 import { access, mkdir, readFile, writeFile, unlink, chmod } from "node:fs/promises";
 import { platform } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { promisify } from "node:util";
+import { type BlobCipher } from "./blobcipher.ts";
+import { defaultHelloSigner, makeHelloCipher, type HelloSigner } from "./hello.ts";
 import { configDir } from "./paths.ts";
+import { powerShellArgs, siblingOfExecutable, spawnCollect, type SpawnResult } from "./spawn.ts";
 import { makeTpm2Cipher } from "./tpm2/provider.ts";
 
+// Every keystore transport (DPAPI/systemd-creds/SE helper — and hello.ts's
+// helper) drives its child process through the one shared spawnCollect
+// (cli/spawn.ts); every tier implements the one shared BlobCipher shape
+// (cli/blobcipher.ts, re-exported here for existing importers).
+export type { BlobCipher } from "./blobcipher.ts";
+
 const execFile = promisify(execFileCb);
-
-// Shared child-process driver for every keystore transport (DPAPI/systemd-creds/
-// SE helper). Spawns `bin args`, writes `input` to stdin, collects stdout/stderr,
-// and resolves {code, stdout, stderr} on close. It NEVER rejects on a non-zero
-// exit (the code is returned for the caller to interpret) — only a spawn error
-// rejects. Swallows stdin EPIPE, since a child may exit before draining stdin and
-// the exit code is authoritative.
-type SpawnResult = { code: number; stdout: Buffer; stderr: Buffer };
-
-const spawnCollect = (
-	bin: string,
-	args: string[],
-	opts: { input?: Buffer; env?: NodeJS.ProcessEnv } = {},
-): Promise<SpawnResult> =>
-	new Promise<SpawnResult>((resolve, reject) => {
-		const child = spawn(bin, args, {
-			stdio: ["pipe", "pipe", "pipe"],
-			...(opts.env ? { env: opts.env } : {}),
-		});
-		const out: Buffer[] = [];
-		const err: Buffer[] = [];
-		child.stdout.on("data", (c: Buffer) => out.push(c));
-		child.stderr.on("data", (c: Buffer) => err.push(c));
-		child.on("error", reject);
-		child.on("close", (code) =>
-			resolve({ code: code ?? 0, stdout: Buffer.concat(out), stderr: Buffer.concat(err) }),
-		);
-		child.stdin.on("error", () => {}); // EPIPE if the child exited first; code is authoritative
-		child.stdin.end(opts.input ?? Buffer.alloc(0));
-	});
 
 export type KeyStore = {
 	readonly name: string;
@@ -161,22 +147,26 @@ export const macKeychain: KeyStore = {
 // `ProtectedData` API reached through PowerShell; it's injectable so the store
 // logic is testable off-Windows.
 
-export type Dpapi = {
-	available(): Promise<boolean>;
-	protect(plaintext: Buffer): Promise<Buffer>; // -> DPAPI blob
-	unprotect(blob: Buffer): Promise<Buffer>; // -> plaintext
-};
+// DPAPI is exactly a BlobCipher (aliased, not hand-mirrored, so future BlobCipher
+// evolution surfaces here too rather than silently skipping this tier). Its
+// CurrentUser binding takes no per-id parameter: unlike systemd-creds (--name) or
+// hello (AEAD AAD), windows-dpapi does NOT bind the blob to the keystore id. That
+// gap is deliberate — the blobs live in the owner-only 0700 config tree and DPAPI
+// already scopes to the current Windows user (a same-user attacker can call
+// ProtectedData directly regardless), and threading the id into ProtectedData's
+// optionalEntropy would change the sealed format and break every existing
+// windows-dpapi vault without a migration read-path. powerShellDpapi's one-arg
+// protect/unprotect ignore the extra `name` makeBlobKeyStore passes.
+export type Dpapi = BlobCipher;
 
 // Run a PowerShell script that reads base64 on stdin and writes base64 on
 // stdout. Avoids putting secrets on the command line / in the process table.
 const runPowerShell = async (script: string, input: Buffer): Promise<Buffer> => {
 	const ps = platform() === "win32" ? "powershell.exe" : (process.env.VAULT_POWERSHELL ?? "pwsh"); // allow pwsh for testing
 	// PowerShell reads/writes base64 text (keeps secrets off argv and binary-clean).
-	const { code, stdout, stderr } = await spawnCollect(
-		ps,
-		["-NoProfile", "-NonInteractive", "-Command", script],
-		{ input: Buffer.from(input.toString("base64")) },
-	);
+	const { code, stdout, stderr } = await spawnCollect(ps, powerShellArgs(script), {
+		input: Buffer.from(input.toString("base64")),
+	});
 	if (code !== 0) throw new Error(`powershell exited ${code}: ${stderr.toString().trim()}`);
 	return Buffer.from(stdout.toString("utf8").trim(), "base64");
 };
@@ -227,17 +217,9 @@ export const powerShellDpapi: Dpapi = {
 // DPAPI (Windows) and systemd-creds (Linux) are the same SHAPE of tier: an OS
 // facility that seals bytes bound to this machine/user and hands back a blob we
 // persist on disk — at-rest protection, no per-access prompt, no extra hardware.
-// `BlobCipher` captures that shape; the old `Dpapi` type is a structural subset
-// (its one-arg protect/unprotect is assignable), so existing callers keep working.
-//
-// `name` lets a backend bind the blob to the keystore id (systemd-creds --name);
-// backends that don't need it (DPAPI) ignore the extra argument.
-export type BlobCipher = {
-	available(): Promise<boolean>;
-	protect(plaintext: Buffer, name?: string): Promise<Buffer>;
-	unprotect(blob: Buffer, name?: string): Promise<Buffer>;
-	bindingMode?(): string | undefined; // persisted so unlock can pin the seal mode
-};
+// `BlobCipher` (cli/blobcipher.ts) captures that shape; the old `Dpapi` type is a
+// structural subset (its one-arg protect/unprotect is assignable), so existing
+// callers keep working.
 
 const blobDir = async (subdir: string): Promise<string> => {
 	const dir = join(configDir(), subdir);
@@ -294,6 +276,24 @@ export const makeDpapiKeyStore = (dpapi: Dpapi = powerShellDpapi): KeyStore =>
 	makeBlobKeyStore({ name: "windows-dpapi", subdir: "dpapi", ext: "dpapi", cipher: dpapi });
 
 export const windowsDpapi: KeyStore = makeDpapiKeyStore();
+
+// ---- Windows Hello tier (strong tier over windows-dpapi) ----
+//
+// The cipher (cli/hello.ts) wraps the DUK under a key derived from a
+// Hello-gated, deterministic KeyCredential signature; the wrapped blob lands on
+// disk through the same shared plumbing. `get` re-signs the blob's challenge —
+// that private-key operation is what forces the Hello gesture. The signer is
+// injectable so the blob format + HKDF/AES-GCM wrap are testable off Windows
+// with a fake-sign oracle (test/hello.test.ts).
+export const makeHelloKeyStore = (signer: HelloSigner = defaultHelloSigner()): KeyStore =>
+	makeBlobKeyStore({
+		name: "windows-hello",
+		subdir: "hello",
+		ext: "hello",
+		cipher: makeHelloCipher(signer),
+	});
+
+export const windowsHello: KeyStore = makeHelloKeyStore();
 
 // ---- Linux systemd-creds provider (the DPAPI-equivalent at-rest tier) ----
 //
@@ -424,9 +424,7 @@ const runSeHelper = (
 
 export const makeSecureEnclaveKeyStore = (opts: SecureEnclaveOptions = {}): KeyStore => {
 	const helper = (): string =>
-		opts.helperPath ??
-		process.env[SE_HELPER_ENV] ??
-		join(dirname(process.execPath), "vault-helper");
+		opts.helperPath ?? process.env[SE_HELPER_ENV] ?? siblingOfExecutable("vault-helper");
 	const dir = (): string => opts.storeDir ?? join(configDir(), "se");
 	return {
 		name: "secure-enclave",
@@ -469,12 +467,17 @@ export const makeSecureEnclaveKeyStore = (opts: SecureEnclaveOptions = {}): KeyS
 
 export const secureEnclave: KeyStore = makeSecureEnclaveKeyStore();
 
-// All known providers, in preference order (strongest first). tpm2Store precedes
-// linuxSystemdCreds so an opted-in TPM (per-access) wins over the at-rest tier, but
-// it is inert ($VAULT_TPM2 unset -> available() false), so the default is unchanged.
+// All known providers, in preference order (strongest first). windowsHello
+// precedes windowsDpapi (per-access UV over at-rest, like secureEnclave over
+// macKeychain) but only reports available when its helper is installed (or the
+// PowerShell fallback is opted in), so a stock Windows box still gets DPAPI.
+// tpm2Store precedes linuxSystemdCreds so an opted-in TPM (per-access) wins over
+// the at-rest tier, but it is inert ($VAULT_TPM2 unset -> available() false), so
+// the default is unchanged.
 const PROVIDERS: readonly KeyStore[] = [
 	secureEnclave,
 	macKeychain,
+	windowsHello,
 	windowsDpapi,
 	tpm2Store,
 	linuxSystemdCreds,

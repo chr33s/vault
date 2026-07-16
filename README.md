@@ -27,20 +27,20 @@ test/    node:test specs
 
 ## What's implemented
 
-| Milestone                      | Status | Notes                                                                                                                                                                                                                                                     |
-| ------------------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| M1 core + tests                | ✅     | crypto, sealed-box, Argon2id KDF (legacy scrypt read path), HLC, field-level CRDT with password MV-register, signed Merkle-DAG auth log with deterministic fork reconciliation, conflict-free epochs, anti-entropy protocol, sqlite store                 |
-| M2 local CLI                   | ✅     | `init/add/get/list/edit/rm` + `run` against the local replica, no network                                                                                                                                                                                 |
-| M3 relay + sync                | ✅     | `node:http` relay (`/sync`, `/push`); the op log **and** the signed auth log, rotation records, and recovery grants all propagate; two CLIs converge through a relay                                                                                      |
-| M4 enrollment                  | ✅     | `auth` / `device-add` / `device-confirm` token handshake, auth-log validation, user-with-device-subkeys                                                                                                                                                   |
-| M5 rotation/revocation         | ✅     | conflict-free epochs + security catch-up; `device-remove` (rotation propagates over the relay; removed members are locked out of new data)                                                                                                                |
-| Cross-user sharing             | ✅     | `invite` / `share` / `join`: a different person joins a vault (`add-user` + sealed grants); multi-user removal verified end-to-end                                                                                                                        |
-| Recovery escrow                | ✅     | `recovery-enable` / `recover` (spec §5/§13): per-vault org key; members seal their identity to it; owner reconstructs a locked-out member                                                                                                                 |
-| Multi-vault                    | ✅     | `--vault <name>` selects independent named replicas; `vaults` lists them                                                                                                                                                                                  |
-| M6 SEA packaging               | ✅     | `build/` bundle + `node --build-sea` + signing + CI matrix; produces a working single-file `dist/vault` on Node 26                                                                                                                                        |
-| M7 Cloudflare deploy           | ✅     | **both** §8.2 placements: self-hosted Node behind `cloudflared` (systemd + Tunnel) **and** serverless Worker + Durable Object (`relay/worker/` + `wrangler.toml`); shared `relay/handler.ts`, Access JWT verification, runbook for both (`relay/deploy/`) |
-| M8 direct fallback / native UI | ✅     | **direct tailnet fallback (§8.6) shipped** — `vault serve` replica peer + `vault sync --tailnet` over Tailscale; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`)  |
-| Agent secret-use proxy (§13)   | ✅     | `vault proxy` — a loopback egress proxy injects a vault secret into an AI agent's API calls so the agent **uses** a credential without **seeing** it; host-bound, egress-allowlisted, no redirect-follow, per-injection audit                             |
+| Milestone                      | Status | Notes                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| M1 core + tests                | ✅     | crypto, sealed-box, Argon2id KDF (legacy scrypt read path), HLC, field-level CRDT with password MV-register, signed Merkle-DAG auth log with deterministic fork reconciliation, conflict-free epochs, anti-entropy protocol, sqlite store                                                                                                                                         |
+| M2 local CLI                   | ✅     | `init/add/get/list/edit/rm` + `run` against the local replica, no network                                                                                                                                                                                                                                                                                                         |
+| M3 relay + sync                | ✅     | `node:http` relay (`/sync`, `/push`); the op log **and** the signed auth log, rotation records, and recovery grants all propagate; two CLIs converge through a relay                                                                                                                                                                                                              |
+| M4 enrollment                  | ✅     | `auth` / `device-add` / `device-confirm` token handshake, auth-log validation, user-with-device-subkeys                                                                                                                                                                                                                                                                           |
+| M5 rotation/revocation         | ✅     | conflict-free epochs + security catch-up; `device-remove` (rotation propagates over the relay; removed members are locked out of new data)                                                                                                                                                                                                                                        |
+| Cross-user sharing             | ✅     | `invite` / `share` / `join`: a different person joins a vault (`add-user` + sealed grants); multi-user removal verified end-to-end                                                                                                                                                                                                                                                |
+| Recovery escrow                | ✅     | `recovery-enable` / `recover` (spec §5/§13): per-vault org key; members seal their identity to it; owner reconstructs a locked-out member                                                                                                                                                                                                                                         |
+| Multi-vault                    | ✅     | `--vault <name>` selects independent named replicas; `vaults` lists them                                                                                                                                                                                                                                                                                                          |
+| M6 SEA packaging               | ✅     | `build/` bundle + `node --build-sea` + signing + CI matrix; produces a working single-file `dist/vault` on Node 26                                                                                                                                                                                                                                                                |
+| M7 Cloudflare deploy           | ✅     | **both** §8.2 placements: self-hosted Node behind `cloudflared` (systemd + Tunnel) **and** serverless Worker + Durable Object (`relay/worker/` + `wrangler.toml`); shared `relay/handler.ts`, Access JWT verification, runbook for both (`relay/deploy/`)                                                                                                                         |
+| M8 direct fallback / native UI | ✅     | **direct tailnet fallback (§8.6) shipped** — `vault serve` replica peer + `vault sync --tailnet` over Tailscale; **native macOS UI shipped** — `secure-enclave` Touch-ID keystore tier + `Vault.app` SwiftUI wrapper over `vault --json` (see `native/`); **Windows Hello strong tier shipped** — `windows-hello` KeyCredential keystore (`cli/hello.ts` + `native/hello-helper`) |
+| Agent secret-use proxy (§13)   | ✅     | `vault proxy` — a loopback egress proxy injects a vault secret into an AI agent's API calls so the agent **uses** a credential without **seeing** it; host-bound, egress-allowlisted, no redirect-follow, per-injection audit                                                                                                                                                     |
 
 ## Crypto (all `node:crypto`, plan §8)
 
@@ -394,9 +394,9 @@ What the cryptography **protects**, regardless of who runs it:
   is meaningless without the passphrase; with `--keychain` it also requires the
   device's OS keystore secret (macOS keychain, Windows DPAPI, or Linux
   `systemd-creds`), or — on the **strong tier** — a Touch-ID-gated,
-  non-exportable **Secure Enclave** key
-  (`native/Vault.app`). Covers a stolen/copied disk, Time Machine, and a vault
-  file synced to iCloud/Dropbox.
+  non-exportable **Secure Enclave** key (`native/Vault.app`) or a
+  **Windows Hello**-gated `KeyCredential` (`native/hello-helper`). Covers a
+  stolen/copied disk, Time Machine, and a vault file synced to iCloud/Dropbox.
 - **Plaintext sprawl** — secrets aren't in `.env`/dotfiles; `vault run` decrypts
   them only transiently into a child's environment, and `vault proxy` keeps them
   out of the consumer entirely (injected on egress, so an AI agent never even
@@ -443,8 +443,10 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   Better still, skip typing: `vault keystore enable` uses `systemd-creds`
   (machine-bound; `VAULT_SYSTEMD_CREDS_KEY=tpm2` binds the unlock key to the TPM).
 - **Windows** — **no app-usable equivalent**; low-level keyboard hooks aren't
-  blockable per-process. Lean on the keystore path (DPAPI today, Windows Hello +
-  TPM as the strong tier) instead of typing.
+  blockable per-process. Lean on the keystore path instead of typing: DPAPI at
+  rest, or the `windows-hello` strong tier (a Hello gesture instead of a
+  passphrase — nothing to keylog; see `native/hello-helper`), with TPM-via-TBS
+  as the non-biometric alternative.
 
 ## Security notes (plan §11)
 
@@ -474,8 +476,19 @@ terminal-level "secure input" exists but is narrow and platform-specific:
   also drives **Windows TPMs over TBS** (`tbs.dll` via a persistent PowerShell
   helper) — the transport framing + codec are validated against swtpm on Linux,
   but the literal `tbs.dll` call is untested off-Windows and should be verified on
-  a real Windows host. A biometric **Windows Hello** (WinRT `KeyCredentialManager`)
-  front-end is still not built.
+  a real Windows host. On **Windows**, the biometric **Windows Hello** tier
+  (`windows-hello`, spec §3.5): `KeyCredential` keys sign but don't decrypt, so
+  the DUK is wrapped under `HKDF(RequestSignAsync(challenge), salt=challenge)` →
+  AES-256-GCM (`cli/hello.ts`), and every unlock is a Hello gesture
+  (PIN/face/fingerprint) releasing a non-exportable TPM-backed key. Enrollment
+  self-tests that signatures are deterministic and refuses the tier otherwise.
+  The signer is the signed `vault-hello-helper` (C#/CsWinRT, `native/hello-helper`
+  — discovered via `$VAULT_HELLO_HELPER` or as a sibling of `vault.exe`, with
+  Authenticode caller-auth via `WinVerifyTrust`); `$VAULT_HELLO_PS=1` opts into
+  an unsigned PowerShell WinRT fallback for dev. The wrap crypto + protocol are
+  unit-tested off-Windows with a fake-sign oracle, and CI builds the helper and
+  probes availability on a Windows runner; the gesture paths should be verified
+  on a real Hello-enrolled host before relying on them.
 - **Untrusted relay** (spec §8.4): signatures + version vectors +
   order-independent CRDT mean the relay can delay but never forge, read, or
   corrupt. It sees metadata (identity, op sizes, timing), never plaintext.

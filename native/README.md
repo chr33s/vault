@@ -10,6 +10,8 @@ stays green. Both are arm64-only, matching the SEA target (plan §1/§7).
     vault/            its sources (auto-included; PBXFileSystemSynchronizedRootGroup)
   Package.swift     Step 2 — vault-helper: the Secure-Enclave KeyStore shim
     vault-helper/     its sources
+  hello-helper/  (not macOS) the Windows analog — the `windows-hello`
+                 KeyCredential signer, plan §12b; see its own README
 ```
 
 `Vault.app` is built by `vault.xcodeproj` (via `build.sh`), which embeds the

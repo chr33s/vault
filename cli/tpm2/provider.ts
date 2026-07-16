@@ -10,6 +10,7 @@
 // keystore selection on a box that merely has a TPM.
 
 import { platform } from "node:os";
+import type { BlobCipher } from "../blobcipher.ts";
 import { open as tpmOpen, seal } from "./codec.ts";
 import { decodeBlob, encodeBlob } from "./codec.ts";
 import { devTpmrm0Transport, socketTransport, tbsTransport, type Transport } from "./transport.ts";
@@ -23,21 +24,13 @@ const defaultTransport = (): Transport => {
 	return platform() === "win32" ? tbsTransport() : devTpmrm0Transport;
 };
 
-// Mirror the BlobCipher shape from cli/keystore.ts without importing it (the
-// keystore module imports US; keep the dependency one-way).
-export type Tpm2Cipher = {
-	available(): Promise<boolean>;
-	protect(plaintext: Buffer, name?: string): Promise<Buffer>;
-	unprotect(blob: Buffer, name?: string): Promise<Buffer>;
-};
-
 export type Tpm2Options = {
 	transport?: Transport;
 	pin?: () => Buffer; // injectable; default reads $VAULT_TPM2_PIN at call time
 	optIn?: () => boolean; // injectable; default requires $VAULT_TPM2=1
 };
 
-export const makeTpm2Cipher = (opts: Tpm2Options = {}): Tpm2Cipher => {
+export const makeTpm2Cipher = (opts: Tpm2Options = {}): BlobCipher => {
 	const transport = opts.transport ?? defaultTransport();
 	const pin = opts.pin ?? ((): Buffer => Buffer.from(process.env.VAULT_TPM2_PIN ?? "", "utf8"));
 	const optIn = opts.optIn ?? ((): boolean => process.env.VAULT_TPM2 === "1");
