@@ -59,7 +59,7 @@ test("genesis + add-device + add-user replays into membership", () => {
 		"user",
 		owner.sign.privateKey,
 	);
-	chain = add(chain, userBody("bob", bob), "owner", "user", owner.sign.privateKey);
+	chain = add(chain, userBody("bob", bob), "dev1", "device", dev.sign.privateKey);
 
 	const m = replay(chain);
 	assert.equal(m.vaultId, "v1");

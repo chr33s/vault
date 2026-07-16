@@ -6,7 +6,9 @@
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { replay } from "../core/authlog.ts";
 import {
+	grantAuthentic,
 	opsSince,
 	rotationId,
 	type OpEnvelope,
@@ -153,8 +155,12 @@ export const syncWithRelay = async (
 		resp.authLog,
 		resp.rotations,
 	);
-	for (const g of resp.grants ?? [])
-		s.store.putGrant(s.vaultId, g.principal, g.keyVersion, g.wrapped);
+	// The relay is only a transport.  Verify both the device signature and the
+	// publisher's current role before an org key can influence recovery escrow.
+	const membership = replay(s.store.authLog(), s.vaultId);
+	for (const g of resp.grants ?? []) {
+		if (grantAuthentic(s.vaultId, g, membership)) s.store.putGrant(s.vaultId, g);
+	}
 
 	// Push: everything the relay is missing (it dedups; volumes are tiny).
 	const toPush: OpEnvelope[] = opsSince(s.store.allOps(), resp.vector);

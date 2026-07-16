@@ -91,7 +91,7 @@ export class PeerStore implements RelayStorage {
 	}
 
 	putGrant(teamId: string, g: GrantRow): void {
-		if (this.mine(teamId)) this.store.putGrant(teamId, g.principal, g.keyVersion, g.wrapped);
+		if (this.mine(teamId)) this.store.putGrant(teamId, g);
 	}
 
 	allGrants(teamId: string): GrantRow[] {

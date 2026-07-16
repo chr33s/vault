@@ -2,6 +2,7 @@
 // CRDT/auth log; key material is a single-valued epoch chosen by a deterministic
 // total order, so concurrent admin rotations converge with no coordinator.
 
+import { activeDeviceMember, type Membership } from "./authlog.ts";
 import { sha256, verify, encodeBox, decodeBox } from "./crypto.ts";
 import { compareEncoded } from "./hlc.ts";
 import type { SealedBox } from "./sealedbox.ts";
@@ -69,6 +70,21 @@ export const wellFormedRotation = (r: RotationRecord): boolean =>
 	Number.isInteger(r.baseEpoch) &&
 	r.epoch >= 1 &&
 	r.baseEpoch === r.epoch - 1;
+
+// Whether a rotation may advance the *current* epoch: it must name itself as its
+// own signer (signerId === deviceId) and be signed by an active owner/admin
+// device. Historical device keys are deliberately insufficient here — a removed
+// device must not win a later epoch — though they remain usable for decrypting
+// old data (see the engine's signature-verified recovery path). This is the
+// single source of truth shared by the client, peer server, relay, and worker so
+// they cannot drift on which rotations are accepted.
+export const rotationAuthentic = (rec: RotationRecord, membership: Membership): boolean => {
+	if (rec.signerId !== rec.deviceId) return false;
+	if (!wellFormedRotation(rec)) return false;
+	const signer = activeDeviceMember(membership, rec.signerId);
+	if (!signer || (signer.role !== "owner" && signer.role !== "admin")) return false;
+	return verifyRotation(rec, Buffer.from(signer.devices.get(rec.signerId)!.signPub, "base64"));
+};
 
 // Deterministic winner among records: higher epoch always supersedes; within an
 // epoch, argmax over (hlc, deviceId). Every honest node computes the same winner

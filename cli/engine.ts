@@ -6,6 +6,7 @@ import {
 	replay,
 	makeEntry,
 	heads,
+	activeDeviceMember,
 	deviceSignKey,
 	entryHash,
 	type LogEntry,
@@ -26,13 +27,22 @@ import {
 import * as cr from "../core/crypto.ts";
 import { Clock, encodeHLC, decodeHLC, isWithinForwardDrift } from "../core/hlc.ts";
 import { deriveKeys, DEFAULT_KDF_PARAMS, type KdfParams } from "../core/kdf.ts";
-import { makeEnvelope, rotationId, verifyEnvelope, type OpEnvelope } from "../core/protocol.ts";
+import {
+	grantVerifiable,
+	grantBytes,
+	makeEnvelope,
+	rotationId,
+	verifyEnvelope,
+	type GrantRow,
+	type OpEnvelope,
+} from "../core/protocol.ts";
 import {
 	winner,
 	keyCommit,
 	encodeGrant,
 	decodeGrant,
 	rotationBytes,
+	rotationAuthentic,
 	verifyRotation,
 	wellFormedRotation,
 	needsCatchUp,
@@ -249,11 +259,10 @@ const signedEntry = (
 const loadRotations = (store: Store): RotationRecord[] =>
 	store.rotations().map((r) => JSON.parse(r) as RotationRecord);
 
-// Only rotation records whose signature verifies against the signing key of an
-// authorized device (ever added — see Membership.deviceKeys) are trusted. This
-// rejects forged rotations injected by a non-key-holder such as the relay
-// (spec §8.4, §10.2); winner selection and key recovery use only these.
-const validRotations = (
+// Signatures from historical devices remain useful to recover keys for old
+// ciphertext, but they do not authorize a current epoch.  Keep these two
+// questions separate so a removed device cannot win a later rotation.
+const signatureVerifiedRotations = (
 	store: Store,
 	membership: Membership = replay(store.authLog()),
 ): RotationRecord[] =>
@@ -262,6 +271,19 @@ const validRotations = (
 		const pub = membership.deviceKeys.get(r.signerId);
 		return pub !== undefined && verifyRotation(r, pub);
 	});
+
+const activeAdminRotations = (
+	store: Store,
+	membership: Membership = replay(store.authLog()),
+): RotationRecord[] => loadRotations(store).filter((r) => rotationAuthentic(r, membership));
+
+const activeAdminDevice = (membership: Membership, deviceId: string): boolean => {
+	const signer = activeDeviceMember(membership, deviceId);
+	return !!signer && (signer.role === "owner" || signer.role === "admin");
+};
+
+const activeOwnerDevice = (membership: Membership, deviceId: string): boolean =>
+	activeDeviceMember(membership, deviceId)?.role === "owner";
 
 // Recover vault keys from rotation grants sealed to this device, keyed by their
 // commitment. Both the winner's and any loser's key at an epoch are recovered.
@@ -464,15 +486,16 @@ export const unlock = async (
 	const vaultId = requireMeta(store, "vaultId");
 	const userId = requireMeta(store, "userId");
 	const deviceId = requireMeta(store, "deviceId");
-	const role = (store.getMeta("role") as Role) ?? "member";
 
 	// Validate the membership chain.
-	const membership = replay(store.authLog());
+	const membership = replay(store.authLog(), vaultId);
+	const role = activeDeviceMember(membership, deviceId)?.role ?? "member";
 
 	// Recover vault keys (by commitment): from signature-verified rotation grants
 	// sealed to this device, plus any self-grants captured at enrollment.
-	const rotations = validRotations(store, membership);
-	const keys = recoverEpochKeys(rotations, pub.deviceEnc, priv.deviceEnc);
+	const verifiedRotations = signatureVerifiedRotations(store, membership);
+	const rotations = activeAdminRotations(store, membership);
+	const keys = recoverEpochKeys(verifiedRotations, pub.deviceEnc, priv.deviceEnc);
 	recoverSelfGrants(store, pub.deviceEnc, priv.deviceEnc, keys);
 	const win = winner(rotations); // top epoch, deterministic (hlc,deviceId) winner
 
@@ -502,16 +525,20 @@ export const unlock = async (
 // log (used after a sync round pulls in new ops). Also refreshes the current
 // epoch and winning key.
 export const rebuildSession = (s: Session): void => {
-	const membership = replay(s.store.authLog());
-	const rotations = validRotations(s.store, membership);
+	const membership = replay(s.store.authLog(), s.vaultId);
+	const verifiedRotations = signatureVerifiedRotations(s.store, membership);
+	const rotations = activeAdminRotations(s.store, membership);
 	// Recompute the key set from scratch (like unlock) rather than accumulating
 	// into the existing map, so a key whose rotation is no longer valid is dropped.
-	s.keys = recoverEpochKeys(rotations, s.pub.deviceEnc, s.priv.deviceEnc);
+	s.keys = recoverEpochKeys(verifiedRotations, s.pub.deviceEnc, s.priv.deviceEnc);
 	recoverSelfGrants(s.store, s.pub.deviceEnc, s.priv.deviceEnc, s.keys);
 	const win = winner(rotations);
 	if (win) {
 		s.currentEpoch = win.epoch;
 		s.currentKeyCommit = win.keyCommit;
+	} else {
+		s.currentEpoch = 0;
+		s.currentKeyCommit = "";
 	}
 	rebuildState(s, membership);
 };
@@ -600,6 +627,32 @@ const emitOps = (s: Session, ops: FieldOp[]): void => {
 	s.store.putOps(envelopes);
 };
 
+// Re-encrypt FieldOps verbatim rather than reconstructing them from the
+// materialized item view.  Their HLCs and password `replaces` sets are CRDT
+// causality, not encryption metadata: minting fresh timestamps here would make
+// a stale offline value win an LWW merge and would collapse password conflicts.
+const reencryptableOps = (s: Session, membership: Membership): FieldOp[] => {
+	const seen = new Set<string>();
+	const fields: FieldOp[] = [];
+	for (const envelope of s.store.allOps()) {
+		const signPub = deviceSignKey(membership, envelope.deviceId);
+		if (!signPub || !verifyEnvelope(envelope, signPub)) continue;
+		try {
+			const field = decryptOp(envelope.payload, s.keys);
+			if (!field) continue;
+			if (envelope.deviceId !== s.deviceId && !isWithinForwardDrift(decodeHLC(field.hlc))) continue;
+			const identity = JSON.stringify(field);
+			if (!seen.has(identity)) {
+				seen.add(identity);
+				fields.push(field);
+			}
+		} catch {
+			/* malformed/corrupt ciphertext is not carried into the fresh epoch */
+		}
+	}
+	return fields;
+};
+
 // ============================================================================
 // item CRUD (spec §4, §7.1)
 // ============================================================================
@@ -652,10 +705,18 @@ export const listItems = (s: Session): ItemView[] => s.state.list();
 // ============================================================================
 
 // Issue a new epoch, sealing the fresh key to every active device of the
-// remaining members. Re-encrypt local items lazily under the new epoch by
-// re-emitting their fields (small credential volumes).
-export const rotate = (s: Session, membership = replay(s.store.authLog())): number => {
-	const rotations = validRotations(s.store, membership);
+// remaining members. Re-encrypt known operations under the new epoch while
+// retaining their original CRDT causal metadata. `carry` overrides which ops are
+// re-encrypted; a revocation passes the pre-removal snapshot so the data a
+// removed device authored is not lost (see rotateOrDeferToAdmin).
+export const rotate = (
+	s: Session,
+	membership = replay(s.store.authLog(), s.vaultId),
+	carry?: FieldOp[],
+): number => {
+	if (!activeAdminDevice(membership, s.deviceId))
+		throw new Error("only an active admin device may rotate keys");
+	const rotations = activeAdminRotations(s.store, membership);
 	const win = winner(rotations);
 	const baseEpoch = win?.epoch ?? 0;
 	const epoch = baseEpoch + 1;
@@ -688,17 +749,9 @@ export const rotate = (s: Session, membership = replay(s.store.authLog())): numb
 	s.currentEpoch = epoch;
 	s.currentKeyCommit = rec.keyCommit;
 
-	// Re-encrypt existing items under the new epoch. If a concurrent rotation
-	// later wins this epoch, the next sync adopts its key and re-emits again.
-	for (const item of s.state.list()) {
-		const fields: ItemFields = { ...item.fields, [ITEM_TYPE_FIELD]: item.itemType };
-		if (item.passwords.length > 0) fields.password = item.passwords[item.passwords.length - 1]!;
-		const livePw = s.state.livePasswordHlcs(item.itemId);
-		emitOps(
-			s,
-			buildItemOps(item.itemId, fields, () => encodeHLC(s.clock.tick()), livePw),
-		);
-	}
+	// Snapshot before writing the copies so an operation is copied at most once
+	// per rotation, including after a prior rotation already re-encrypted it.
+	emitOps(s, carry ?? reencryptableOps(s, membership));
 	return epoch;
 };
 
@@ -706,56 +759,80 @@ export const rotate = (s: Session, membership = replay(s.store.authLog())): numb
 // read new data (spec §9, §10.2).
 export const removeUser = (s: Session, userId: string): number => {
 	const chain = s.store.authLog();
-	const membership = replay(chain);
-	if (s.role !== "owner" && s.role !== "admin") throw new Error("only admins may remove users");
+	const membership = replay(chain, s.vaultId);
+	if (!activeAdminDevice(membership, s.deviceId)) throw new Error("only admins may remove users");
 	if (!membership.members.has(userId)) throw new Error(`no such member ${userId}`);
 
 	const entry = signedEntry(
 		chain,
 		{ type: "remove-user", userId },
-		s.userId,
-		"user",
-		s.priv.userSign,
+		s.deviceId,
+		"device",
+		s.priv.deviceSign,
 	);
 	s.store.appendAuthEntry(entry);
-	return rotate(s, replay(s.store.authLog()));
+	return rotateOrDeferToAdmin(s, membership);
 };
 
 // Remove a single device subkey (e.g. a lost laptop) and rotate, leaving the
-// owning user and their other devices intact (spec §9). Signed by the owning
-// user or an admin (authority enforced in authlog.replay).
+// owning user and their other devices intact (spec §9). Signed by the active
+// owning device or an active admin device, so the removed device loses this
+// authority immediately.
 export const removeDevice = (s: Session, deviceId: string): number => {
 	const chain = s.store.authLog();
-	const membership = replay(chain);
+	const membership = replay(chain, s.vaultId);
 	let ownerId: string | undefined;
 	for (const m of membership.members.values()) {
 		if (m.active && m.devices.has(deviceId)) ownerId = m.userId;
 	}
 	if (!ownerId) throw new Error(`no such active device ${deviceId}`);
-	if (s.userId !== ownerId && s.role !== "owner" && s.role !== "admin")
+	const signer = activeDeviceMember(membership, s.deviceId);
+	if (!signer || (signer.userId !== ownerId && signer.role !== "owner" && signer.role !== "admin"))
 		throw new Error("only the owning user or an admin may remove a device");
 
 	const entry = signedEntry(
 		chain,
 		{ type: "remove-device", userId: ownerId, deviceId },
-		s.userId,
-		"user",
-		s.priv.userSign,
+		s.deviceId,
+		"device",
+		s.priv.deviceSign,
 	);
 	s.store.appendAuthEntry(entry);
-	return rotate(s, replay(s.store.authLog()));
+	return rotateOrDeferToAdmin(s, membership);
+};
+
+// After a revocation, rotate immediately if this device may (an active admin),
+// otherwise leave the removal recorded and let the next active admin issue the
+// catch-up rotation via maybeCatchUp. A member removing their own lost device,
+// or an owner removing their own account, is no longer an active admin once the
+// entry is applied, so calling rotate() here would throw after the log was
+// already mutated — leaving the revocation half-committed with no epoch change.
+//
+// `beforeRemoval` is the membership as of just before the revocation entry was
+// appended. Re-encrypting against it (rather than the post-removal state) keeps
+// the items the removed device authored: their ops still verify under the
+// pre-removal membership and are re-signed here under our active identity, so
+// they survive the next rebuild instead of vanishing with the revoked device. A
+// forged post-removal op cannot sneak in this way: the removal is applied
+// synchronously, before the removed device can learn of it and propagate one.
+const rotateOrDeferToAdmin = (s: Session, beforeRemoval: Membership): number => {
+	const after = replay(s.store.authLog(), s.vaultId);
+	if (!activeAdminDevice(after, s.deviceId)) return s.currentEpoch;
+	return rotate(s, after, reencryptableOps(s, beforeRemoval));
 };
 
 // After sync, check whether a security catch-up rotation is required and, if so,
 // issue one (spec §10.2). Returns the new epoch, or undefined if none needed.
 export const maybeCatchUp = (s: Session): number | undefined => {
 	const chain = s.store.authLog();
-	const win = winner(validRotations(s.store, replay(chain)));
+	const membership = replay(chain, s.vaultId);
+	if (!activeAdminDevice(membership, s.deviceId)) return undefined;
+	const win = winner(activeAdminRotations(s.store, membership));
 	const removalHashes = chain
 		.filter((e) => e.body.type === "remove-user" || e.body.type === "remove-device")
-		.map((e) => e.hash);
+		.map((e) => entryHash(e));
 	if (needsCatchUp(win, removalHashes)) {
-		return rotate(s, replay(chain));
+		return rotate(s, membership);
 	}
 	return undefined;
 };
@@ -846,6 +923,13 @@ export const deviceAdd = (
 ): TokenB => {
 	const newEncPub = Buffer.from(tokenA.encPub, "base64");
 	const newSignPub = Buffer.from(tokenA.signPub, "base64");
+	const membership = replay(s.store.authLog(), s.vaultId);
+	const me = activeDeviceMember(membership, s.deviceId);
+	if (!me || me.userId !== s.userId)
+		throw new Error("this device is not authorized to enroll another");
+	// This unauthenticated transport field is retained solely so older tokens can
+	// still be decoded.  The recipient always derives its role from the signed log.
+	void opts.role;
 
 	// Append the signed add-device entry under this user's identity.
 	const chain = s.store.authLog();
@@ -858,9 +942,9 @@ export const deviceAdd = (
 			deviceSignPub: tokenA.signPub,
 			deviceEncPub: tokenA.encPub,
 		},
-		s.userId,
-		"user",
-		s.priv.userSign,
+		s.deviceId,
+		"device",
+		s.priv.deviceSign,
 	);
 	s.store.appendAuthEntry(entry);
 
@@ -880,7 +964,7 @@ export const deviceAdd = (
 	return {
 		vaultId: s.vaultId,
 		userId: s.userId,
-		role: opts.role ?? s.role,
+		role: me.role,
 		currentEpoch: s.currentEpoch,
 		authLog: s.store.authLog(),
 		rotations: loadRotations(s.store),
@@ -919,11 +1003,17 @@ export const deviceConfirm = async (
 	}
 
 	// Validate the membership chain and confirm this device is authorized in it.
-	const membership = replay(tokenB.authLog);
-	if (!deviceSignKey(membership, deviceId))
-		throw new Error("auth log does not authorize this device");
+	const membership = replay(tokenB.authLog, tokenB.vaultId);
+	if (membership.vaultId !== tokenB.vaultId)
+		throw new Error("auth log vault does not match the enrollment token");
 	const ownerMember = membership.members.get(tokenB.userId);
-	if (!ownerMember) throw new Error("auth log missing the enrolling user");
+	const enrolledDevice = ownerMember?.devices.get(deviceId);
+	if (
+		!ownerMember?.active ||
+		!enrolledDevice ||
+		enrolledDevice.signPub !== requireMeta(store, "deviceSignPub")
+	)
+		throw new Error("auth log does not authorize this device");
 
 	// Unseal the user private identity keys (sealed to this device in Token B).
 	const up = JSON.parse(
@@ -942,7 +1032,7 @@ export const deviceConfirm = async (
 	store.transaction(() => {
 		store.setMeta("vaultId", tokenB.vaultId);
 		store.setMeta("userId", tokenB.userId);
-		store.setMeta("role", tokenB.role);
+		store.setMeta("role", ownerMember.role);
 		store.setMeta("userSignPub", ownerMember.signPub);
 		store.setMeta("userEncPub", ownerMember.encPub);
 		persistWrapMeta(store, wrapMeta);
@@ -1043,7 +1133,8 @@ export const shareVault = (
 	invite: InviteToken,
 	opts: { role?: Role; relay?: RelayInfo } = {},
 ): JoinToken => {
-	if (s.role !== "owner" && s.role !== "admin") throw new Error("only admins may share a vault");
+	const membership = replay(s.store.authLog(), s.vaultId);
+	if (!activeAdminDevice(membership, s.deviceId)) throw new Error("only admins may share a vault");
 	const role: Role = opts.role ?? "member";
 	// A shared user is member|admin only; `owner` is minted solely by the genesis
 	// and would be rejected at replay anyway (validate here for a clean error).
@@ -1060,9 +1151,9 @@ export const shareVault = (
 			userEncPub: invite.userEncPub,
 			role,
 		},
-		s.userId,
-		"user",
-		s.priv.userSign,
+		s.deviceId,
+		"device",
+		s.priv.deviceSign,
 	);
 	s.store.appendAuthEntry(entry);
 
@@ -1111,9 +1202,13 @@ export const joinConfirm = async (
 	}
 
 	// Validate the chain and confirm an admin actually added us.
-	const membership = replay(join.authLog);
+	const membership = replay(join.authLog, join.vaultId);
+	if (membership.vaultId !== join.vaultId)
+		throw new Error("auth log vault does not match the join token");
 	const me = membership.members.get(userId);
 	if (!me || !me.active) throw new Error("join token does not grant this user membership");
+	// `join.role` is transport metadata, not part of the signed enrollment
+	// ceremony.  The signed add-user record is the sole source of this role.
 
 	// Build our own device subkey entry against the imported chain (signed by our
 	// user identity key — authorized because we are now a member), and verify the
@@ -1143,7 +1238,7 @@ export const joinConfirm = async (
 		store.appendAuthEntry(addDevice);
 		for (const r of join.rotations) store.putRotation(r.epoch, r.deviceId, JSON.stringify(r));
 		store.setMeta("vaultId", join.vaultId);
-		store.setMeta("role", join.role);
+		store.setMeta("role", me.role);
 		persistWrapMeta(store, wrapMeta);
 		store.setMeta("encPrivKeys", encPrivKeys);
 		store.setMeta("selfEpochGrants", JSON.stringify(join.epochGrants));
@@ -1166,15 +1261,39 @@ export const joinConfirm = async (
 const ORG_PRINCIPAL = "orgPublicKey";
 const recoveryPrincipal = (userId: string): string => `recovery:${userId}`;
 
+const signedGrant = (
+	s: Session,
+	principal: string,
+	keyVersion: number,
+	wrapped: string,
+): GrantRow => {
+	const unsigned = { principal, keyVersion, wrapped, signerId: s.deviceId };
+	return {
+		...unsigned,
+		sig: cr.sign(grantBytes(s.vaultId, unsigned), s.priv.deviceSign).toString("base64"),
+	};
+};
+
+const verifiedLocalGrant = (s: Session, principal: string): GrantRow | undefined => {
+	const grant = s.store.getGrant(s.vaultId, principal, 0);
+	if (!grant) return undefined;
+	const membership = replay(s.store.authLog(), s.vaultId);
+	// Read-back, not acceptance: a grant published by a since-removed device is
+	// still valid here (that is the whole point of escrow), so verify against the
+	// retained historical key rather than requiring an active signer.
+	return grantVerifiable(s.vaultId, grant, membership) ? grant : undefined;
+};
+
 // Enable escrow: mint the org keypair, announce the org public key, contribute
 // the caller's own RecoveryGrant. Returns the org PRIVATE key (base64) for the
 // owner to store offline — it is never persisted in the vault.
 export const recoveryEnable = (s: Session): string => {
-	if (s.role !== "owner") throw new Error("only the owner may enable recovery escrow");
-	if (s.store.getGrant(s.vaultId, ORG_PRINCIPAL, 0))
-		throw new Error("recovery escrow already enabled");
+	const membership = replay(s.store.authLog(), s.vaultId);
+	if (!activeOwnerDevice(membership, s.deviceId))
+		throw new Error("only the owner may enable recovery escrow");
+	if (verifiedLocalGrant(s, ORG_PRINCIPAL)) throw new Error("recovery escrow already enabled");
 	const org = cr.generateX25519();
-	s.store.putGrant(s.vaultId, ORG_PRINCIPAL, 0, org.publicKey.toString("base64"));
+	s.store.putGrant(s.vaultId, signedGrant(s, ORG_PRINCIPAL, 0, org.publicKey.toString("base64")));
 	contributeRecovery(s);
 	return org.privateKey.toString("base64");
 };
@@ -1182,9 +1301,13 @@ export const recoveryEnable = (s: Session): string => {
 // If escrow is enabled and we haven't yet sealed our identity to the org key,
 // do so now. Idempotent; safe to call on every unlock/sync.
 export const contributeRecovery = (s: Session): void => {
-	const orgPubB64 = s.store.getGrant(s.vaultId, ORG_PRINCIPAL, 0);
-	if (!orgPubB64) return;
-	if (s.store.getGrant(s.vaultId, recoveryPrincipal(s.userId), 0)) return;
+	const membership = replay(s.store.authLog(), s.vaultId);
+	const me = activeDeviceMember(membership, s.deviceId);
+	if (!me || me.userId !== s.userId) return;
+	const org = verifiedLocalGrant(s, ORG_PRINCIPAL);
+	if (!org) return;
+	if (verifiedLocalGrant(s, recoveryPrincipal(s.userId))) return;
+	const orgPubB64 = org.wrapped;
 	const orgPub = Buffer.from(orgPubB64, "base64");
 	const material = Buffer.from(
 		JSON.stringify({
@@ -1194,19 +1317,25 @@ export const contributeRecovery = (s: Session): void => {
 		"utf8",
 	);
 	const sealed = encodeGrant(seal(material, orgPub));
-	s.store.putGrant(s.vaultId, recoveryPrincipal(s.userId), 0, JSON.stringify(sealed));
+	s.store.putGrant(
+		s.vaultId,
+		signedGrant(s, recoveryPrincipal(s.userId), 0, JSON.stringify(sealed)),
+	);
 };
 
 // Reconstruct a member's identity keys using the org private key (held offline).
 // Returns the recovered keys as a JSON string for secure out-of-band delivery.
 export const recoverUser = (s: Session, userId: string, orgPrivB64: string): string => {
-	if (s.role !== "owner") throw new Error("only the owner may run recovery");
-	const orgPubB64 = s.store.getGrant(s.vaultId, ORG_PRINCIPAL, 0);
-	if (!orgPubB64) throw new Error("recovery escrow is not enabled");
-	const g = s.store.getGrant(s.vaultId, recoveryPrincipal(userId), 0);
+	const membership = replay(s.store.authLog(), s.vaultId);
+	if (!activeOwnerDevice(membership, s.deviceId))
+		throw new Error("only the owner may run recovery");
+	const org = verifiedLocalGrant(s, ORG_PRINCIPAL);
+	if (!org) throw new Error("recovery escrow is not enabled");
+	const orgPubB64 = org.wrapped;
+	const g = verifiedLocalGrant(s, recoveryPrincipal(userId));
 	if (!g)
 		throw new Error(`no recovery grant for ${userId} (have they synced since escrow was enabled?)`);
-	const sealed = decodeGrant(JSON.parse(g) as SealedGrant);
+	const sealed = decodeGrant(JSON.parse(g.wrapped) as SealedGrant);
 	try {
 		const pt = unseal(sealed, Buffer.from(orgPrivB64, "base64"), Buffer.from(orgPubB64, "base64"));
 		return pt.toString("utf8");

@@ -53,6 +53,11 @@ export type RelayDeps = {
 	// writer pushes unbounded synthetic rotations (unique epoch/deviceId) that
 	// would otherwise persist to the store. Default accepts everything.
 	verifyRotation?: (rec: RotationRecord, teamId: string) => boolean | Promise<boolean>;
+	// Recovery-grant publishers are authenticated against the current membership:
+	// only owners announce the org key and users publish their own grants.  Unlike
+	// opaque ops, accepting an unauthenticated grant can make a client seal its
+	// identity to an attacker's key, so the secure default is reject.
+	verifyGrant?: (g: GrantRow, teamId: string) => boolean | Promise<boolean>;
 };
 
 // Pure helpers (inlined from core/protocol so this module pulls no crypto).
@@ -115,7 +120,10 @@ export const handle = async (
 				/* skip malformed */
 			}
 		}
-		for (const g of body.grants ?? []) await store.putGrant(body.teamId, g);
+		const verifyGrant = deps.verifyGrant ?? (() => false);
+		for (const g of body.grants ?? []) {
+			if (await verifyGrant(g, body.teamId)) await store.putGrant(body.teamId, g);
+		}
 
 		const verifyOp = deps.verifyOp ?? (() => true);
 		let accepted = 0;

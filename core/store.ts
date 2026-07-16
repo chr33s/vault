@@ -6,7 +6,7 @@
 import { chmodSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { entryHash, type LogEntry } from "./authlog.ts";
-import type { OpEnvelope, VersionVector } from "./protocol.ts";
+import type { GrantRow, OpEnvelope, VersionVector } from "./protocol.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS ops (
@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS grants (
   principal   TEXT,
   key_version INTEGER,
   wrapped     TEXT,
+  signer_id   TEXT NOT NULL DEFAULT '',
+  sig         TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (team_id, principal, key_version)
 );
 CREATE TABLE IF NOT EXISTS rotations (
@@ -69,6 +71,19 @@ export class Store {
 		}
 		this.db.exec("PRAGMA journal_mode = WAL;");
 		this.db.exec(SCHEMA);
+		// Existing replicas predate signed grants.  Keep their rows readable (they
+		// will fail client verification) while adding the authenticated fields for
+		// all new grant records.
+		try {
+			this.db.exec("ALTER TABLE grants ADD COLUMN signer_id TEXT NOT NULL DEFAULT '';");
+		} catch {
+			/* column already exists */
+		}
+		try {
+			this.db.exec("ALTER TABLE grants ADD COLUMN sig TEXT NOT NULL DEFAULT '';");
+		} catch {
+			/* column already exists */
+		}
 	}
 
 	close(): void {
@@ -156,16 +171,20 @@ export class Store {
 	// masquerade as already-held (the relay/worker path recomputes for the same
 	// reason).
 	appendAuthEntry(e: LogEntry): void {
+		const hash = entryHash(e);
 		this.db
 			.prepare(`INSERT OR IGNORE INTO authlog (hash, entry) VALUES (?, ?)`)
-			.run(entryHash(e), JSON.stringify(e));
+			.run(hash, JSON.stringify({ ...e, hash }));
 	}
 
 	authLog(): LogEntry[] {
 		const rows = this.db.prepare(`SELECT entry FROM authlog`).all() as Array<
 			Record<string, unknown>
 		>;
-		return rows.map((r) => JSON.parse(r.entry as string) as LogEntry);
+		return rows.map((r) => {
+			const entry = JSON.parse(r.entry as string) as LogEntry;
+			return { ...entry, hash: entryHash(entry) };
+		});
 	}
 
 	authHashes(): string[] {
@@ -192,32 +211,46 @@ export class Store {
 
 	// ---- grants ----
 
-	putGrant(teamId: string, principal: string, keyVersion: number, wrapped: string): void {
+	putGrant(teamId: string, g: GrantRow): void {
 		this.db
 			.prepare(
-				`INSERT OR REPLACE INTO grants (team_id, principal, key_version, wrapped)
-         VALUES (?, ?, ?, ?)`,
+				`INSERT OR REPLACE INTO grants (team_id, principal, key_version, wrapped, signer_id, sig)
+         VALUES (?, ?, ?, ?, ?, ?)`,
 			)
-			.run(teamId, principal, keyVersion, wrapped);
+			.run(teamId, g.principal, g.keyVersion, g.wrapped, g.signerId, g.sig);
 	}
 
-	getGrant(teamId: string, principal: string, keyVersion: number): string | undefined {
+	getGrant(teamId: string, principal: string, keyVersion: number): GrantRow | undefined {
 		const row = this.db
-			.prepare(`SELECT wrapped FROM grants WHERE team_id = ? AND principal = ? AND key_version = ?`)
+			.prepare(
+				`SELECT principal, key_version, wrapped, signer_id, sig
+         FROM grants WHERE team_id = ? AND principal = ? AND key_version = ?`,
+			)
 			.get(teamId, principal, keyVersion) as Record<string, unknown> | undefined;
-		return row?.wrapped as string | undefined;
+		return row
+			? {
+					principal: row.principal as string,
+					keyVersion: row.key_version as number,
+					wrapped: row.wrapped as string,
+					signerId: row.signer_id as string,
+					sig: row.sig as string,
+				}
+			: undefined;
 	}
 
-	allGrants(teamId: string): Array<{ principal: string; keyVersion: number; wrapped: string }> {
+	allGrants(teamId: string): GrantRow[] {
 		const rows = this.db
 			.prepare(
-				`SELECT principal, key_version, wrapped FROM grants WHERE team_id = ? ORDER BY principal`,
+				`SELECT principal, key_version, wrapped, signer_id, sig
+         FROM grants WHERE team_id = ? ORDER BY principal`,
 			)
 			.all(teamId) as Array<Record<string, unknown>>;
 		return rows.map((r) => ({
 			principal: r.principal as string,
 			keyVersion: r.key_version as number,
 			wrapped: r.wrapped as string,
+			signerId: r.signer_id as string,
+			sig: r.sig as string,
 		}));
 	}
 

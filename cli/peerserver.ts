@@ -12,8 +12,8 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { replay, deviceSignKey, type Membership } from "../core/authlog.ts";
-import { verifyEnvelope } from "../core/protocol.ts";
-import { verifyRotation, wellFormedRotation } from "../core/rotation.ts";
+import { grantAuthentic, verifyEnvelope } from "../core/protocol.ts";
+import { rotationAuthentic } from "../core/rotation.ts";
 import type { Store } from "../core/store.ts";
 import { authorizeHeaders, type AccessConfig } from "../relay/access.ts";
 import { handle } from "../relay/handler.ts";
@@ -91,8 +91,12 @@ export const createPeerServer = (
 						return !!key && verifyEnvelope(op, key);
 					},
 					verifyRotation: (rec) => {
-						const key = membership()?.deviceKeys.get(rec.signerId);
-						return !!key && wellFormedRotation(rec) && verifyRotation(rec, key);
+						const m = membership();
+						return !!m && rotationAuthentic(rec, m);
+					},
+					verifyGrant: (g, teamId) => {
+						const m = membership();
+						return !!m && teamId === vaultId && grantAuthentic(teamId, g, m);
 					},
 				},
 			);

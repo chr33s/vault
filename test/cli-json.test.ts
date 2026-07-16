@@ -157,7 +157,7 @@ test("--json device-add returns the SAS + Token B (enrollment contract for the U
 			const tokenA = auth.tokenA as string;
 			const added = lastJson(
 				(
-					await execFile(["--json", "device-add", "--token", tokenA, "--role", "admin"], {
+					await execFile(["--json", "device-add", "--token", tokenA], {
 						home,
 						env,
 					})

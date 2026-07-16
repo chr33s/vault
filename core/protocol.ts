@@ -3,7 +3,7 @@
 // the metadata needed to dedupe, order, and verify authorship. The relay only
 // ever sees these envelopes — never plaintext.
 
-import type { LogEntry } from "./authlog.ts";
+import { activeDeviceMember, type LogEntry, type Membership, type Role } from "./authlog.ts";
 import { sha256, sign, verify } from "./crypto.ts";
 
 // Base64 of the AEAD-sealed CRDT op (see store/vault for payload contents).
@@ -51,6 +51,73 @@ export type GrantRow = {
 	principal: string; // "orgPublicKey" | "recovery:<userId>"
 	keyVersion: number;
 	wrapped: string;
+	// The signer is an active device subkey.  The signature binds the team so a
+	// grant copied from another vault cannot be replayed here.
+	signerId: string;
+	sig: string; // base64 Ed25519 over grantBytes(teamId, grant without sig)
+};
+
+export const grantBytes = (teamId: string, g: Omit<GrantRow, "sig">): Buffer =>
+	Buffer.from(
+		JSON.stringify({
+			teamId,
+			principal: g.principal,
+			keyVersion: g.keyVersion,
+			wrapped: g.wrapped,
+			signerId: g.signerId,
+		}),
+		"utf8",
+	);
+
+export const verifyGrant = (teamId: string, g: GrantRow, signerPub: Buffer): boolean => {
+	const { sig, ...unsigned } = g;
+	return verify(grantBytes(teamId, unsigned), signerPub, Buffer.from(sig, "base64"));
+};
+
+const wellFormedGrant = (g: GrantRow): boolean =>
+	Number.isInteger(g.keyVersion) &&
+	g.keyVersion >= 0 &&
+	typeof g.principal === "string" &&
+	typeof g.wrapped === "string" &&
+	typeof g.signerId === "string" &&
+	typeof g.sig === "string";
+
+// Recovery escrow has two authorities: only an owner may announce the org key,
+// and a member may publish only that member's own sealed recovery material.
+const grantPrincipalOk = (g: GrantRow, signerRole: Role, signerUserId: string): boolean => {
+	if (g.principal === "orgPublicKey") return g.keyVersion === 0 && signerRole === "owner";
+	if (!g.principal.startsWith("recovery:")) return false;
+	const userId = g.principal.slice("recovery:".length);
+	return g.keyVersion === 0 && userId.length > 0 && signerUserId === userId;
+};
+
+// Acceptance check, enforced on both sides of the relay boundary: a grant is
+// stored only if signed by a currently *active* device with the right authority.
+// Requiring active-ness at ingest is what stops a removed device from injecting
+// (or racing in) a malicious org key or recovery blob.
+export const grantAuthentic = (teamId: string, g: GrantRow, membership: Membership): boolean => {
+	if (!wellFormedGrant(g)) return false;
+	const signer = activeDeviceMember(membership, g.signerId);
+	if (!signer) return false;
+	const pub = signer.devices.get(g.signerId)!.signPub;
+	if (!verifyGrant(teamId, g, Buffer.from(pub, "base64"))) return false;
+	return grantPrincipalOk(g, signer.role, signer.userId);
+};
+
+// Retention check, for reading back a grant we already accepted (recoverUser,
+// contributeRecovery, the "already enabled" guard). Unlike grantAuthentic the
+// signing device need NOT still be active: escrow must keep working precisely
+// when the device that published a grant has since been removed. The signature
+// is checked against the retained historical key, and the principal against the
+// signer's retained identity/role.
+export const grantVerifiable = (teamId: string, g: GrantRow, membership: Membership): boolean => {
+	if (!wellFormedGrant(g)) return false;
+	const signPub = membership.deviceKeys.get(g.signerId);
+	const ownerUserId = membership.deviceOwners.get(g.signerId);
+	if (!signPub || ownerUserId === undefined) return false;
+	if (!verifyGrant(teamId, g, signPub)) return false;
+	const signer = membership.members.get(ownerUserId);
+	return !!signer && grantPrincipalOk(g, signer.role, ownerUserId);
 };
 
 export const rotationId = (epoch: number, deviceId: string): string => `${epoch}:${deviceId}`;

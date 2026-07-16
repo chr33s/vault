@@ -21,12 +21,13 @@ import {
 	type Membership,
 } from "../../core/authlog.ts";
 import {
+	grantAuthentic,
 	verifyEnvelope,
 	type OpEnvelope,
 	type VersionVector,
 	type GrantRow,
 } from "../../core/protocol.ts";
-import { verifyRotation, wellFormedRotation, type RotationRecord } from "../../core/rotation.ts";
+import { rotationAuthentic, type RotationRecord } from "../../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "../access.ts";
 import { handle, type RelayStorage } from "../handler.ts";
 
@@ -93,7 +94,18 @@ class DoRelayStorage implements RelayStorage {
       PRIMARY KEY (team_id, epoch, device_id));`);
 		this.sql.exec(`CREATE TABLE IF NOT EXISTS relay_grants (
       team_id TEXT NOT NULL, principal TEXT NOT NULL, key_version INTEGER NOT NULL, wrapped TEXT NOT NULL,
+      signer_id TEXT NOT NULL DEFAULT '', sig TEXT NOT NULL DEFAULT '',
       PRIMARY KEY (team_id, principal, key_version));`);
+		try {
+			this.sql.exec("ALTER TABLE relay_grants ADD COLUMN signer_id TEXT NOT NULL DEFAULT '';");
+		} catch {
+			/* column already exists */
+		}
+		try {
+			this.sql.exec("ALTER TABLE relay_grants ADD COLUMN sig TEXT NOT NULL DEFAULT '';");
+		} catch {
+			/* column already exists */
+		}
 	}
 	private rows(q: string, ...b: unknown[]): Array<Record<string, unknown>> {
 		return this.sql.exec(q, ...b).toArray();
@@ -140,11 +152,12 @@ class DoRelayStorage implements RelayStorage {
 	putAuth(teamId: string, entry: LogEntry): void {
 		// Key by the recomputed hash (don't trust the client's cached field) — same
 		// as the Node relay, now that entryHash (node:crypto) runs under nodejs_compat.
+		const hash = entryHash(entry);
 		this.sql.exec(
 			`INSERT OR IGNORE INTO relay_authlog (team_id,hash,entry) VALUES (?,?,?)`,
 			teamId,
-			entryHash(entry),
-			JSON.stringify(entry),
+			hash,
+			JSON.stringify({ ...entry, hash }),
 		);
 	}
 	private rootHashFor(teamId: string, candidate?: string): string | undefined {
@@ -198,7 +211,7 @@ class DoRelayStorage implements RelayStorage {
 					return [];
 				if (seen.has(hash)) return [];
 				seen.add(hash);
-				return [entry];
+				return [{ ...entry, hash }];
 			} catch {
 				return [];
 			}
@@ -222,22 +235,30 @@ class DoRelayStorage implements RelayStorage {
 			.map((r) => r.record as string);
 	}
 	putGrant(teamId: string, g: GrantRow): void {
+		// First-write-wins: a grant slot is immutable once set, so a captured/stale
+		// authentic grant re-pushed later cannot overwrite the current one.
 		this.sql.exec(
-			`INSERT OR IGNORE INTO relay_grants (team_id,principal,key_version,wrapped) VALUES (?,?,?,?)`,
+			`INSERT OR IGNORE INTO relay_grants
+       (team_id,principal,key_version,wrapped,signer_id,sig) VALUES (?,?,?,?,?,?)`,
 			teamId,
 			g.principal,
 			g.keyVersion,
 			g.wrapped,
+			g.signerId,
+			g.sig,
 		);
 	}
 	allGrants(teamId: string): GrantRow[] {
 		return this.rows(
-			`SELECT principal,key_version,wrapped FROM relay_grants WHERE team_id=? ORDER BY principal`,
+			`SELECT principal,key_version,wrapped,signer_id,sig
+       FROM relay_grants WHERE team_id=? ORDER BY principal`,
 			teamId,
 		).map((r) => ({
 			principal: r.principal as string,
 			keyVersion: r.key_version as number,
 			wrapped: r.wrapped as string,
+			signerId: r.signer_id as string,
+			sig: r.sig as string,
 		}));
 	}
 
@@ -341,11 +362,15 @@ export class RelayDO {
 					const key = m && deviceSignKey(m, op.deviceId);
 					return !!key && verifyEnvelope(op, key);
 				},
-				// Bound synthetic-rotation floods: only well-formed, device-signed
-				// rotations are stored.
+				// Bound synthetic-rotation floods: only well-formed rotations signed by
+				// an active owner/admin device are stored (shared core rule).
 				verifyRotation: (rec, teamId) => {
-					const key = store.membershipFor(teamId)?.deviceKeys.get(rec.signerId);
-					return !!key && wellFormedRotation(rec) && verifyRotation(rec, key);
+					const membership = store.membershipFor(teamId);
+					return !!membership && rotationAuthentic(rec, membership);
+				},
+				verifyGrant: (g, teamId) => {
+					const membership = store.membershipFor(teamId);
+					return !!membership && grantAuthentic(teamId, g, membership);
 				},
 			});
 			return new Response(JSON.stringify(body), {

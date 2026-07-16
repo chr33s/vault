@@ -236,7 +236,7 @@ Tokens are base64 today (a QR is an encoding detail, deferred):
 # New device:
 vault auth                                   # prints Token A
 # Authorized device:
-vault device-add --token <A> --role member   # prints Token B + a SAS to compare
+vault device-add --token <A>                 # prints Token B + a SAS to compare
 # New device:
 vault device-confirm --token <B>             # unseals the vault key, builds the replica
 vault sync --relay https://vault.example.com --token <service-token>

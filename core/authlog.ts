@@ -145,7 +145,20 @@ export const linearize = (entries: LogEntry[]): LogEntry[] => {
 };
 
 // Derived membership.
-export type Device = { deviceId: string; signPub: string; encPub: string };
+export type Device = {
+	deviceId: string;
+	signPub: string;
+	encPub: string;
+	// A device key delegates enrollment authority only to descendants it signed.
+	// Removing it revokes a *concurrent* delegation too (see remove-device), so a
+	// racing/replayed enrollment cannot turn a removed device into a fresh
+	// replacement identity.
+	enrolledByDeviceId?: string;
+	// Hash of the add-device entry that created this device. Used by remove-device
+	// to tell a legitimate prior enrollment (causally before the removal) from a
+	// concurrent one the removed device raced in.
+	enrolledAtHash: string;
+};
 export type Member = {
 	userId: string;
 	signPub: string;
@@ -153,6 +166,11 @@ export type Member = {
 	role: Role;
 	active: boolean;
 	devices: Map<string, Device>;
+	// A user identity is shared with every enrolled device, so it cannot be the
+	// continuing authority to add devices: a removed device retains it.  It may
+	// bootstrap exactly the user's first device; every later enrollment must be
+	// signed by an already-active device subkey, which is individually revocable.
+	hasEverHadDevice: boolean;
 };
 export type Membership = {
 	vaultId: string;
@@ -163,10 +181,25 @@ export type Membership = {
 	// forgery by a non-key-holder (e.g. the relay) is still rejected, while a
 	// historically-valid rotation remains decryptable.
 	deviceKeys: Map<string, Buffer>;
+	// deviceId -> owning userId for every device ever added, retained after
+	// removal. Lets a recovery-escrow grant signed by a since-removed device still
+	// be attributed to its author (protocol.grantVerifiable) — escrow must survive
+	// the removal of the very device that lost access.
+	deviceOwners: Map<string, string>;
 };
 
 const isAdmin = (m: Member | undefined): boolean =>
 	!!m && m.active && (m.role === "owner" || m.role === "admin");
+
+// Resolve an *active* device to its owning member.  In contrast to deviceKeys,
+// this deliberately excludes removed devices; use deviceKeys only where a
+// historical signature still needs to be checked.
+export const activeDeviceMember = (state: Membership, deviceId: string): Member | undefined => {
+	for (const m of state.members.values()) {
+		if (m.active && m.devices.has(deviceId)) return m;
+	}
+	return undefined;
+};
 
 // Resolve the public key that must have signed an entry, enforcing authority
 // against the membership state accumulated so far. Throws if unauthorized; the
@@ -179,9 +212,21 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 				throw new Error("genesis must be self-signed by creator");
 			return b.userSignPub;
 		case "add-user": {
-			const signer = state.members.get(e.signerId);
-			if (e.signerKind !== "user" || !isAdmin(signer))
-				throw new Error("add-user requires an admin signer");
+			let signer: Member | undefined;
+			let signerPub: string;
+			if (e.signerKind === "device") {
+				signer = activeDeviceMember(state, e.signerId);
+				if (!isAdmin(signer)) throw new Error("add-user requires an active admin device");
+				signerPub = signer!.devices.get(e.signerId)!.signPub;
+			} else {
+				signer = state.members.get(e.signerId);
+				// Compatibility/bootstrap only: before an identity has ever enrolled a
+				// device, no revocable device key exists yet.  Once it does, user keys
+				// distributed in Token B are never sufficient for administration.
+				if (e.signerKind !== "user" || !isAdmin(signer) || signer?.hasEverHadDevice)
+					throw new Error("add-user requires an active admin device");
+				signerPub = signer!.signPub;
+			}
 			// An add-user must not overwrite a live member: without this, an
 			// admin-signed entry reusing an existing userId (e.g. the owner's, which
 			// is public in every enrollment token) replaces that member's keys and
@@ -191,43 +236,71 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 			if (existing?.active) throw new Error("add-user cannot overwrite an existing member");
 			// Only the genesis mints an owner; add-user is member|admin (spec §9).
 			if (b.role === "owner") throw new Error("add-user cannot grant the owner role");
-			return signer!.signPub;
+			return signerPub;
 		}
 		case "remove-user": {
-			const signer = state.members.get(e.signerId);
-			if (e.signerKind !== "user" || !isAdmin(signer))
-				throw new Error("remove-user requires an admin signer");
+			let signer: Member | undefined;
+			let signerPub: string;
+			if (e.signerKind === "device") {
+				signer = activeDeviceMember(state, e.signerId);
+				if (!isAdmin(signer)) throw new Error("remove-user requires an active admin device");
+				signerPub = signer!.devices.get(e.signerId)!.signPub;
+			} else {
+				signer = state.members.get(e.signerId);
+				if (e.signerKind !== "user" || !isAdmin(signer) || signer?.hasEverHadDevice)
+					throw new Error("remove-user requires an active admin device");
+				signerPub = signer!.signPub;
+			}
 			// The owner is the root of authority and cannot be removed by an admin
 			// (ownership transfer is not a supported operation); otherwise an admin
 			// could deactivate the owner and seize sole control.
 			const target = state.members.get(b.userId);
-			if (target?.role === "owner" && e.signerId !== b.userId)
+			if (target?.role === "owner" && signer!.userId !== b.userId)
 				throw new Error("the owner cannot be removed");
-			return signer!.signPub;
+			return signerPub;
 		}
 		case "add-device": {
-			const signer = state.members.get(b.userId);
-			if (e.signerKind !== "user" || e.signerId !== b.userId || !signer || !signer.active)
-				throw new Error("add-device must be signed by the owning user");
-			return signer.signPub;
+			const target = state.members.get(b.userId);
+			if (!target?.active) throw new Error("add-device requires an active member");
+			// A newly-created identity has no device key yet, so its first device is
+			// signed by the user identity.  Once a device has ever existed, the user
+			// identity is no longer sufficient: Token B copies it to every device and
+			// a removed device would otherwise be able to enroll itself again.
+			if (e.signerKind === "user") {
+				if (e.signerId !== b.userId || target.hasEverHadDevice)
+					throw new Error("add-device bootstrap must be the user's first device");
+				return target.signPub;
+			}
+			if (e.signerKind !== "device") throw new Error("add-device requires a device signer");
+			const signer = activeDeviceMember(state, e.signerId);
+			if (!signer || signer.userId !== b.userId)
+				throw new Error("add-device requires an active device of the owning user");
+			return signer.devices.get(e.signerId)!.signPub;
 		}
 		case "remove-device": {
-			if (e.signerKind !== "user") throw new Error("remove-device requires a user signer");
-			const signer = state.members.get(e.signerId);
-			if (!signer || !signer.active) throw new Error("unknown signer");
-			if (e.signerId !== b.userId && !isAdmin(signer))
+			if (e.signerKind !== "device") throw new Error("remove-device requires a device signer");
+			const signer = activeDeviceMember(state, e.signerId);
+			if (!signer) throw new Error("unknown signer");
+			if (signer.userId !== b.userId && !isAdmin(signer))
 				throw new Error("remove-device requires owner-of-device or admin");
 			// An admin cannot strip the owner's devices (would let an admin lock the
-			// owner out of their own vault); only the owner may remove their own.
+			// owner out of their own vault); only the owner's device may remove one.
 			const target = state.members.get(b.userId);
-			if (target?.role === "owner" && e.signerId !== b.userId)
+			if (target?.role === "owner" && signer.userId !== b.userId)
 				throw new Error("only the owner may remove the owner's device");
-			return signer.signPub;
+			return signer.devices.get(e.signerId)!.signPub;
 		}
 	}
 };
 
-const applyEntry = (state: Membership, e: LogEntry): void => {
+// `hash` is this entry's own hash; `ancestorHashes` is the set of entries
+// causally before it (transitive parents). Only remove-device consults them.
+const applyEntry = (
+	state: Membership,
+	e: LogEntry,
+	hash: string,
+	ancestorHashes: Set<string>,
+): void => {
 	const b = e.body;
 	switch (b.type) {
 		case "genesis":
@@ -238,6 +311,7 @@ const applyEntry = (state: Membership, e: LogEntry): void => {
 				role: "owner",
 				active: true,
 				devices: new Map(),
+				hasEverHadDevice: false,
 			});
 			break;
 		case "add-user":
@@ -248,6 +322,7 @@ const applyEntry = (state: Membership, e: LogEntry): void => {
 				role: b.role,
 				active: true,
 				devices: new Map(),
+				hasEverHadDevice: false,
 			});
 			break;
 		case "remove-user": {
@@ -265,13 +340,34 @@ const applyEntry = (state: Membership, e: LogEntry): void => {
 				deviceId: b.deviceId,
 				signPub: b.deviceSignPub,
 				encPub: b.deviceEncPub,
+				enrolledByDeviceId: e.signerKind === "device" ? e.signerId : undefined,
+				enrolledAtHash: hash,
 			});
-			// Retain the key for historical rotation-signature checks (not cleared on removal).
+			m.hasEverHadDevice = true;
+			// Retain the key and owner for historical rotation-signature / grant checks
+			// (not cleared on removal).
 			state.deviceKeys.set(b.deviceId, Buffer.from(b.deviceSignPub, "base64"));
+			state.deviceOwners.set(b.deviceId, b.userId);
 			break;
 		}
 		case "remove-device": {
-			state.members.get(b.userId)?.devices.delete(b.deviceId);
+			const devices = state.members.get(b.userId)?.devices;
+			if (!devices) break;
+			// Revocation is transitive over the enrollment delegation tree, but only
+			// for enrollments that are NOT causally before this removal. A device the
+			// removed device enrolled earlier (e.g. the owner's phone, enrolled from a
+			// laptop later decommissioned) is legitimate prior delegation and must
+			// survive. A concurrent/later enrollment — a removed device racing in a
+			// replacement — is discarded even if canonical DAG ordering happened to
+			// fold that add before this removal.
+			const revoked = [b.deviceId];
+			for (const deviceId of revoked) {
+				devices.delete(deviceId);
+				for (const d of devices.values()) {
+					if (d.enrolledByDeviceId === deviceId && !ancestorHashes.has(d.enrolledAtHash))
+						revoked.push(d.deviceId);
+				}
+			}
 			break;
 		}
 	}
@@ -293,6 +389,19 @@ const applyEntry = (state: Membership, e: LogEntry): void => {
 // enter a replica in the first place.
 export const replay = (entries: LogEntry[], expectedVaultId?: string): Membership => {
 	const order = linearize(entries);
+	// Causal ancestry per entry, computed in topological order (parents precede
+	// their children in `order`), so remove-device can distinguish a prior
+	// enrollment from a concurrent one.
+	const hashes = order.map(entryHash);
+	const ancestors = new Map<string, Set<string>>();
+	order.forEach((e, i) => {
+		const set = new Set<string>();
+		for (const p of e.parents) {
+			set.add(p);
+			for (const a of ancestors.get(p) ?? []) set.add(a);
+		}
+		ancestors.set(hashes[i]!, set);
+	});
 	const isRootGenesis = (e: LogEntry): boolean =>
 		e.body.type === "genesis" &&
 		e.parents.length === 0 &&
@@ -304,10 +413,11 @@ export const replay = (entries: LogEntry[], expectedVaultId?: string): Membershi
 		vaultId: genesis.body.vaultId,
 		members: new Map(),
 		deviceKeys: new Map(),
+		deviceOwners: new Map(),
 	};
-	for (const e of order) {
+	order.forEach((e, i) => {
 		// Exactly one genesis roots the DAG; ignore any others (different vault).
-		if (e.body.type === "genesis" && e !== genesis) continue;
+		if (e.body.type === "genesis" && e !== genesis) return;
 		try {
 			const signerPub = resolveSigner(state, e);
 			const ok = verify(
@@ -315,12 +425,12 @@ export const replay = (entries: LogEntry[], expectedVaultId?: string): Membershi
 				Buffer.from(signerPub, "base64"),
 				Buffer.from(e.sig, "base64"),
 			);
-			if (!ok) continue; // bad signature — skip
-			applyEntry(state, e);
+			if (!ok) return; // bad signature — skip
+			applyEntry(state, e, hashes[i]!, ancestors.get(hashes[i]!) ?? new Set());
 		} catch {
 			// unauthorized signer / inapplicable entry — skip, keep folding the rest
 		}
-	}
+	});
 	return state;
 };
 
@@ -350,10 +460,7 @@ export const validRootGenesis = (entry: LogEntry, expectedVaultId: string): bool
 
 // Resolve a device's signing public key (for op verification), if authorized.
 export const deviceSignKey = (state: Membership, deviceId: string): Buffer | undefined => {
-	for (const m of state.members.values()) {
-		if (!m.active) continue;
-		const d = m.devices.get(deviceId);
-		if (d) return Buffer.from(d.signPub, "base64");
-	}
-	return undefined;
+	const m = activeDeviceMember(state, deviceId);
+	const d = m?.devices.get(deviceId);
+	return d ? Buffer.from(d.signPub, "base64") : undefined;
 };

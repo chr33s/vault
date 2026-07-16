@@ -56,10 +56,7 @@ test("SEA binary: version + init/add/list/get + relay sync round-trip", { skip }
 		const run2 = runIn(home2);
 		try {
 			const tokenA = (await run2("auth")).trim().split("\n").pop()!;
-			const tokenB = (await run("device-add", "--token", tokenA, "--role", "admin"))
-				.trim()
-				.split("\n")
-				.pop()!;
+			const tokenB = (await run("device-add", "--token", tokenA)).trim().split("\n").pop()!;
 			await run2("device-confirm", "--token", tokenB);
 			await run2("sync", "--relay", relay);
 			assert.equal(

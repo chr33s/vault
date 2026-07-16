@@ -15,13 +15,14 @@ import {
 	type Membership,
 } from "../core/authlog.ts";
 import {
+	grantAuthentic,
 	verifyEnvelope,
 	rotationId,
 	type OpEnvelope,
 	type VersionVector,
 } from "../core/protocol.ts";
 import type { GrantRow } from "../core/protocol.ts";
-import { verifyRotation, wellFormedRotation, type RotationRecord } from "../core/rotation.ts";
+import { rotationAuthentic, type RotationRecord } from "../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "./access.ts";
 import { handle, type RelayStorage } from "./handler.ts";
 import { GENERIC_500, installSafeFatalHandlers } from "./log.ts";
@@ -70,35 +71,55 @@ class RelayStore implements RelayStorage {
       principal   TEXT NOT NULL,
       key_version INTEGER NOT NULL,
       wrapped     TEXT NOT NULL,
+		  signer_id   TEXT NOT NULL DEFAULT '',
+		  sig         TEXT NOT NULL DEFAULT '',
       PRIMARY KEY (team_id, principal, key_version)
     );`);
+		try {
+			this.db.exec("ALTER TABLE relay_grants ADD COLUMN signer_id TEXT NOT NULL DEFAULT '';");
+		} catch {
+			/* column already exists */
+		}
+		try {
+			this.db.exec("ALTER TABLE relay_grants ADD COLUMN sig TEXT NOT NULL DEFAULT '';");
+		} catch {
+			/* column already exists */
+		}
 	}
 
 	putGrant(teamId: string, g: GrantRow): void {
+		// First-write-wins: a grant slot (team, principal, keyVersion) is immutable
+		// once set, so a captured/stale authentic grant re-pushed later cannot
+		// overwrite the current one (recovery material and the org key never change).
 		this.db
 			.prepare(
-				`INSERT OR IGNORE INTO relay_grants (team_id, principal, key_version, wrapped) VALUES (?, ?, ?, ?)`,
+				`INSERT OR IGNORE INTO relay_grants
+         (team_id, principal, key_version, wrapped, signer_id, sig) VALUES (?, ?, ?, ?, ?, ?)`,
 			)
-			.run(teamId, g.principal, g.keyVersion, g.wrapped);
+			.run(teamId, g.principal, g.keyVersion, g.wrapped, g.signerId, g.sig);
 	}
 	allGrants(teamId: string): GrantRow[] {
 		const rows = this.db
 			.prepare(
-				`SELECT principal, key_version, wrapped FROM relay_grants WHERE team_id = ? ORDER BY principal`,
+				`SELECT principal, key_version, wrapped, signer_id, sig
+         FROM relay_grants WHERE team_id = ? ORDER BY principal`,
 			)
 			.all(teamId) as Array<Record<string, unknown>>;
 		return rows.map((r) => ({
 			principal: r.principal as string,
 			keyVersion: r.key_version as number,
 			wrapped: r.wrapped as string,
+			signerId: r.signer_id as string,
+			sig: r.sig as string,
 		}));
 	}
 
 	putAuth(teamId: string, entry: LogEntry): void {
 		// Key by the recomputed hash (don't trust the client's cached field).
+		const hash = entryHash(entry);
 		this.db
 			.prepare(`INSERT OR IGNORE INTO relay_authlog (team_id, hash, entry) VALUES (?, ?, ?)`)
-			.run(teamId, entryHash(entry), JSON.stringify(entry));
+			.run(teamId, hash, JSON.stringify({ ...entry, hash }));
 	}
 	private rootHashFor(teamId: string, candidate?: string): string | undefined {
 		let pinned = this.db.prepare(`SELECT hash FROM relay_roots WHERE team_id = ?`).get(teamId) as
@@ -152,7 +173,7 @@ class RelayStore implements RelayStorage {
 					return [];
 				if (seen.has(hash)) return [];
 				seen.add(hash);
-				return [entry];
+				return [{ ...entry, hash }];
 			} catch {
 				return [];
 			}
@@ -246,12 +267,18 @@ const opAuthentic = (store: RelayStore, op: OpEnvelope, teamId: string): boolean
 	return !!key && verifyEnvelope(op, key);
 };
 
-// A rotation is accepted iff well-formed and signed by a device the auth log has
-// ever validly held (deviceKeys is retained across removal so a historically
-// valid rotation still verifies — matching the client's rule).
-const rotationAuthentic = (store: RelayStore, rec: RotationRecord, teamId: string): boolean => {
-	const key = store.membershipFor(teamId)?.deviceKeys.get(rec.signerId);
-	return !!key && wellFormedRotation(rec) && verifyRotation(rec, key);
+// A rotation can advance the current epoch only when it is signed by an active
+// owner/admin device (shared core rule; historical device keys are intentionally
+// not enough, so a removed device cannot lock active members out with a later
+// epoch even though its old records still decrypt old data).
+const rotationAcceptable = (store: RelayStore, rec: RotationRecord, teamId: string): boolean => {
+	const membership = store.membershipFor(teamId);
+	return !!membership && rotationAuthentic(rec, membership);
+};
+
+const recoveryGrantAuthentic = (store: RelayStore, g: GrantRow, teamId: string): boolean => {
+	const membership = store.membershipFor(teamId);
+	return !!membership && grantAuthentic(teamId, g, membership);
 };
 
 const readBody = async (req: IncomingMessage): Promise<unknown> => {
@@ -300,7 +327,8 @@ export const createRelay = (opts: RelayOptions = {}): { server: Server; store: R
 					// author device's key in the auth log, so a member can't pre-claim
 					// (and thereby censor) another device's (deviceId, seq) slot.
 					verifyOp: (op, teamId) => opAuthentic(store, op, teamId),
-					verifyRotation: (rec, teamId) => rotationAuthentic(store, rec, teamId),
+					verifyRotation: (rec, teamId) => rotationAcceptable(store, rec, teamId),
+					verifyGrant: (g, teamId) => recoveryGrantAuthentic(store, g, teamId),
 				},
 			);
 			send(res, status, body);

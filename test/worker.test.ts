@@ -21,7 +21,7 @@ import {
 	type LogEntry,
 } from "../core/authlog.ts";
 import * as cr from "../core/crypto.ts";
-import { makeEnvelope } from "../core/protocol.ts";
+import { grantAuthentic, grantBytes, makeEnvelope } from "../core/protocol.ts";
 import { verifyEnvelope } from "../core/protocol.ts";
 import { authorizeHeaders } from "../relay/access.ts";
 import { handle, type RelayStorage } from "../relay/handler.ts";
@@ -272,6 +272,96 @@ test("relay authenticates op authorship: a forged (deviceId,seq) claim is reject
 		verifyOp,
 	});
 	assert.deepEqual(r2.body, { accepted: 1 }, "the real device's op is not censored");
+});
+
+test("relay accepts only signed, role-authorized recovery-grant publishers", async () => {
+	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const ownerDevice = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const member = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const memberDevice = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const genesis: EntryBody = {
+		type: "genesis",
+		vaultId: "grant-team",
+		userId: "owner",
+		userSignPub: owner.sign.publicKey.toString("base64"),
+		userEncPub: owner.enc.publicKey.toString("base64"),
+		role: "owner",
+	};
+	let chain: LogEntry[] = [makeEntry([], genesis, "owner", "user", owner.sign.privateKey)];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "owner",
+				deviceId: "owner-device",
+				deviceSignPub: ownerDevice.sign.publicKey.toString("base64"),
+				deviceEncPub: ownerDevice.enc.publicKey.toString("base64"),
+			},
+			"owner",
+			"user",
+			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-user",
+				userId: "member",
+				userSignPub: member.sign.publicKey.toString("base64"),
+				userEncPub: member.enc.publicKey.toString("base64"),
+				role: "member",
+			},
+			"owner-device",
+			"device",
+			ownerDevice.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "member",
+				deviceId: "member-device",
+				deviceSignPub: memberDevice.sign.publicKey.toString("base64"),
+				deviceEncPub: memberDevice.enc.publicKey.toString("base64"),
+			},
+			"member",
+			"user",
+			member.sign.privateKey,
+		),
+	];
+	const makeGrant = (principal: string, signerId: string, priv: Buffer) => {
+		const unsigned = { principal, keyVersion: 0, wrapped: "public-material", signerId };
+		return {
+			...unsigned,
+			sig: cr.sign(grantBytes("grant-team", unsigned), priv).toString("base64"),
+		};
+	};
+	const memberOrgKey = makeGrant("orgPublicKey", "member-device", memberDevice.sign.privateKey);
+	const ownerOrgKey = makeGrant("orgPublicKey", "owner-device", ownerDevice.sign.privateKey);
+	const store = memStore();
+	const verifyGrant = (g: import("../core/protocol.ts").GrantRow, teamId: string) =>
+		grantAuthentic(teamId, g, replay(store.authExcept(teamId, new Set()) as LogEntry[], teamId));
+
+	await handle(
+		req("POST", "/push", {
+			teamId: "grant-team",
+			ops: [],
+			authLog: chain,
+			grants: [memberOrgKey, ownerOrgKey],
+		}),
+		store,
+		{ authorize: async () => true, verifyGrant },
+	);
+	const grants = await store.allGrants("grant-team");
+	assert.equal(grants.length, 1);
+	assert.equal(grants[0]!.signerId, "owner-device", "a member cannot preseed the org key");
 });
 
 test("worker handler: health + auth gate (shared authorizeHeaders)", async () => {

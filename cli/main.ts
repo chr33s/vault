@@ -104,7 +104,7 @@ Sync
 
 Devices (token handshake)
   auth                         New device: generate keys, print Token A
-  device-add --token <A> [--role member|admin] [--relay <url>] [--relay-token <t>]
+  device-add --token <A> [--relay <url>] [--relay-token <t>]
                                Authorized device: seal grants, print Token B
   device-confirm --token <B>   New device: unseal vault key, build replica
   device-remove (--device <id> | --user <id>)   Revoke a device or a person, then rotate
@@ -748,9 +748,12 @@ const main = async (): Promise<number> => {
 
 		case "device-add":
 			await withSession(values, async (s) => {
+				if (values.role !== undefined)
+					throw new Error(
+						"device roles come from signed membership; --role is only valid for share",
+					);
 				const tokenA = await readToken<TokenA>(values);
 				const tokenB: TokenB = deviceAdd(s, tokenA, {
-					role: (values.role as TokenB["role"]) ?? undefined,
 					relay: relayInfo(values),
 				});
 				emit(
