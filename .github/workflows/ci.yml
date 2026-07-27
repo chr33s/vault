@@ -98,6 +98,44 @@ jobs:
           name: vault-hello-helper-win-x64
           path: native/hello-helper/bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/vault-hello-helper.exe
 
+  cleanup-artifacts:
+    name: cleanup old artifacts
+    needs: [sea, native-windows]
+    # Runs even when an upload job fails, but only on push: pull_request runs
+    # from forks get a read-only token and could never delete anything.
+    if: always() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            // Keep only the newest 3 artifacts per name (one per SEA target
+            // plus the Hello helper) so old runs don't eat the storage quota.
+            const keep = 3;
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
+            );
+            const byName = new Map();
+            for (const artifact of artifacts) {
+              if (artifact.expired) continue;
+              if (!byName.has(artifact.name)) byName.set(artifact.name, []);
+              byName.get(artifact.name).push(artifact);
+            }
+            for (const [name, group] of byName) {
+              group.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              for (const artifact of group.slice(keep)) {
+                core.info(`Deleting ${name} #${artifact.id} (${artifact.created_at})`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
+
   native:
     name: native helper + app (darwin-arm64)
     needs: sea
