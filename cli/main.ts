@@ -445,7 +445,9 @@ const main = async (): Promise<number> => {
 				if (!title) throw new Error("usage: vault get <title> [--field name]");
 				const item = getItem(s, title);
 				if (!item) throw new Error(`no item titled "${title}"`);
-				const field = values.name as string | undefined;
+				// `--field` is what HELP documents; `--name` is kept as an alias.
+				const field =
+					(values.field as string[] | undefined)?.at(-1) ?? (values.name as string | undefined);
 				if (field) {
 					const v = field === "password" ? item.passwords.join("\n") : item.fields[field];
 					if (v === undefined) throw new Error(`no field "${field}"`);

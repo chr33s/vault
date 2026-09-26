@@ -8,6 +8,7 @@ import {
 	deviceSignKey,
 	type LogEntry,
 	type EntryBody,
+	deviceIdOf,
 } from "../core/authlog.ts";
 import * as crypto from "../core/crypto.ts";
 
@@ -22,6 +23,39 @@ const add = (
 	signerKind: "user" | "device",
 	signerPriv: Buffer,
 ): LogEntry[] => [...chain, makeEntry(heads(chain), body, signerId, signerKind, signerPriv)];
+
+// add-device + the device's own prove-device (device ids derive from the key).
+const enroll = (
+	chain: LogEntry[],
+	userId: string,
+	dev: Identity,
+	signerId: string,
+	signerKind: "user" | "device",
+	signerPriv: Buffer,
+): { chain: LogEntry[]; deviceId: string } => {
+	const deviceId = deviceIdOf(dev.sign.publicKey.toString("base64"));
+	chain = add(
+		chain,
+		{
+			type: "add-device",
+			userId,
+			deviceId,
+			deviceSignPub: dev.sign.publicKey.toString("base64"),
+			deviceEncPub: dev.enc.publicKey.toString("base64"),
+		},
+		signerId,
+		signerKind,
+		signerPriv,
+	);
+	chain = add(
+		chain,
+		{ type: "prove-device", userId, deviceId },
+		deviceId,
+		"device",
+		dev.sign.privateKey,
+	);
+	return { chain, deviceId };
+};
 
 const genesis = (owner: Identity, userId = "owner", vaultId = "v1"): EntryBody => ({
 	type: "genesis",
@@ -46,27 +80,17 @@ test("genesis + add-device + add-user replays into membership", () => {
 	const bob = id();
 	let chain: LogEntry[] = [];
 	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	chain = add(
-		chain,
-		{
-			type: "add-device",
-			userId: "owner",
-			deviceId: "dev1",
-			deviceSignPub: dev.sign.publicKey.toString("base64"),
-			deviceEncPub: dev.enc.publicKey.toString("base64"),
-		},
-		"owner",
-		"user",
-		owner.sign.privateKey,
-	);
-	chain = add(chain, userBody("bob", bob), "dev1", "device", dev.sign.privateKey);
+	const e1 = enroll(chain, "owner", dev, "owner", "user", owner.sign.privateKey);
+	chain = e1.chain;
+	const dev1 = e1.deviceId;
+	chain = add(chain, userBody("bob", bob), dev1, "device", dev.sign.privateKey);
 
 	const m = replay(chain);
 	assert.equal(m.vaultId, "v1");
 	assert.equal(m.members.size, 2);
 	assert.equal(m.members.get("owner")!.role, "owner");
 	assert.equal(m.members.get("bob")!.role, "member");
-	assert.ok(deviceSignKey(m, "dev1")!.equals(dev.sign.publicKey));
+	assert.ok(deviceSignKey(m, dev1)!.equals(dev.sign.publicKey));
 });
 
 test("forged signature is skipped, not fatal", () => {
@@ -109,19 +133,10 @@ test("remove-user deactivates the member and clears devices", () => {
 	let chain: LogEntry[] = [];
 	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
 	chain = add(chain, userBody("bob", bob), "owner", "user", owner.sign.privateKey);
-	chain = add(
-		chain,
-		{
-			type: "add-device",
-			userId: "bob",
-			deviceId: "bdev",
-			deviceSignPub: bobDev.sign.publicKey.toString("base64"),
-			deviceEncPub: bobDev.enc.publicKey.toString("base64"),
-		},
-		"bob",
-		"user",
-		bob.sign.privateKey,
-	);
+	const e = enroll(chain, "bob", bobDev, "bob", "user", bob.sign.privateKey);
+	chain = e.chain;
+	const bdev = e.deviceId;
+	assert.ok(deviceSignKey(replay(chain), bdev), "active before removal");
 	chain = add(
 		chain,
 		{ type: "remove-user", userId: "bob" },
@@ -131,7 +146,8 @@ test("remove-user deactivates the member and clears devices", () => {
 	);
 	const m = replay(chain);
 	assert.equal(m.members.get("bob")!.active, false);
-	assert.equal(deviceSignKey(m, "bdev"), undefined);
+	assert.equal(deviceSignKey(m, bdev), undefined);
+	assert.equal(m.members.get("bob")!.devices.size, 0);
 });
 
 test("FORK: concurrent entries on the same parent reconcile deterministically", () => {
@@ -195,19 +211,9 @@ test("tamper-evidence: mutating an ancestor orphans its descendants", () => {
 	const dev = id();
 	let chain: LogEntry[] = [];
 	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	chain = add(
-		chain,
-		{
-			type: "add-device",
-			userId: "owner",
-			deviceId: "dev1",
-			deviceSignPub: dev.sign.publicKey.toString("base64"),
-			deviceEncPub: dev.enc.publicKey.toString("base64"),
-		},
-		"owner",
-		"user",
-		owner.sign.privateKey,
-	);
+	const e = enroll(chain, "owner", dev, "owner", "user", owner.sign.privateKey);
+	chain = e.chain;
+	assert.ok(deviceSignKey(replay(chain), e.deviceId), "active before tampering");
 	// Tamper the genesis body without re-signing. Its hash changes, so the
 	// add-device's parent reference dangles and its signature no longer matches.
 	const tampered = structuredClone(chain);
@@ -215,7 +221,7 @@ test("tamper-evidence: mutating an ancestor orphans its descendants", () => {
 	assert.notEqual(entryHash(tampered[0]!), chain[0]!.hash);
 	const m = replay(tampered);
 	assert.equal(m.members.size, 0, "tampering destroys the derived membership");
-	assert.equal(deviceSignKey(m, "dev1"), undefined);
+	assert.equal(deviceSignKey(m, e.deviceId), undefined);
 });
 
 test("an admin cannot overwrite an existing member (owner-lockout guard)", () => {
@@ -291,4 +297,45 @@ test("replay pins the genesis to the expected vaultId (forged-root rejected)", (
 	const m = replay(mixed, "v-real");
 	assert.equal(m.vaultId, "v-real");
 	assert.equal(m.members.has("attacker"), false);
+});
+
+test("add-device alone does not activate a device: the key holder must prove it", () => {
+	const owner = id();
+	const ownerDev = id();
+	const member = id();
+	const memberDev = id();
+	const laptop = id(); // the owner's second device, whose public key is visible
+	let chain: LogEntry[] = [];
+	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
+	const o = enroll(chain, "owner", ownerDev, "owner", "user", owner.sign.privateKey);
+	chain = add(o.chain, userBody("m", member), o.deviceId, "device", ownerDev.sign.privateKey);
+	const mm = enroll(chain, "m", memberDev, "m", "user", member.sign.privateKey);
+	chain = mm.chain;
+	const laptopId = deviceIdOf(laptop.sign.publicKey.toString("base64"));
+	const addBody = (userId: string): EntryBody => ({
+		type: "add-device",
+		userId,
+		deviceId: laptopId,
+		deviceSignPub: laptop.sign.publicKey.toString("base64"),
+		deviceEncPub: member.enc.publicKey.toString("base64"),
+	});
+	// The member claims the laptop's key for themselves, and even signs a
+	// "proof" with their own device key; neither activates it.
+	chain = add(chain, addBody("m"), mm.deviceId, "device", memberDev.sign.privateKey);
+	chain = add(
+		chain,
+		{ type: "prove-device", userId: "m", deviceId: laptopId },
+		laptopId,
+		"device",
+		memberDev.sign.privateKey,
+	);
+	let m = replay(chain);
+	assert.equal(deviceSignKey(m, laptopId), undefined);
+	assert.equal(m.deviceOwners.get(laptopId), undefined);
+	// The owner's genuine enrollment, proven by the laptop, wins regardless of order.
+	const genuine = enroll(chain, "owner", laptop, o.deviceId, "device", ownerDev.sign.privateKey);
+	m = replay(genuine.chain);
+	assert.ok(deviceSignKey(m, laptopId)!.equals(laptop.sign.publicKey));
+	assert.equal(m.deviceOwners.get(laptopId), "owner");
+	assert.equal(m.members.get("m")!.devices.has(laptopId), false);
 });

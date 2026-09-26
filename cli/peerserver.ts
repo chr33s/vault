@@ -11,7 +11,7 @@
 // rests on either gate: ops stay end-to-end encrypted and signed.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { replay, deviceSignKey, type Membership } from "../core/authlog.ts";
+import { deviceSignKey, type Membership } from "../core/authlog.ts";
 import { grantAuthentic, verifyEnvelope } from "../core/protocol.ts";
 import { rotationAuthentic } from "../core/rotation.ts";
 import type { Store } from "../core/store.ts";
@@ -51,22 +51,11 @@ export const createPeerServer = (
 		? { serviceTokens: new Set([opts.token]), requireAccess: true }
 		: {};
 
-	// Membership from this device's own auth log, used to authenticate incoming op
-	// and rotation signatures so a tailnet peer can't censor a device's (deviceId,
-	// seq) slot or flood the local store with synthetic rotation records. Memoized
-	// by auth-entry count (the log only grows).
-	let memberCache: { count: number; membership: Membership } | undefined;
-	const membership = (): Membership | undefined => {
-		const count = store.authHashes().length;
-		if (!memberCache || memberCache.count !== count) {
-			try {
-				memberCache = { count, membership: replay(store.authLog(), vaultId) };
-			} catch {
-				return undefined;
-			}
-		}
-		return memberCache.membership;
-	};
+	// Membership from this device's own auth log (memoized in the PeerStore), used
+	// to authenticate incoming op and rotation signatures so a tailnet peer can't
+	// censor a device's (deviceId, seq) slot or flood the local store with
+	// synthetic rotation records.
+	const membership = (): Membership | undefined => peer.membership();
 
 	return createServer((req, res) => {
 		(async () => {

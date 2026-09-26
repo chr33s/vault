@@ -19,6 +19,7 @@ import {
 	deviceSignKey,
 	type EntryBody,
 	type LogEntry,
+	deviceIdOf,
 } from "../core/authlog.ts";
 import * as cr from "../core/crypto.ts";
 import { grantAuthentic, grantBytes, makeEnvelope } from "../core/protocol.ts";
@@ -40,6 +41,7 @@ const memStore = (): RelayStorage => {
 		if (!x) map.set(t, (x = new Map()));
 		return x;
 	};
+	const m_ops = (t: string) => m(ops, t);
 	return {
 		putOp(t, op) {
 			const o = m(ops, t);
@@ -51,6 +53,14 @@ const memStore = (): RelayStorage => {
 			return [...m(ops, t).values()].sort((a, b) =>
 				a.deviceId + a.seq < b.deviceId + b.seq ? -1 : 1,
 			);
+		},
+		opsSince(t, v) {
+			return [...m_ops(t).values()].filter((op) => op.seq > (v[op.deviceId] ?? 0));
+		},
+		maxSeq(t, d) {
+			let m = 0;
+			for (const op of m_ops(t).values()) if (op.deviceId === d) m = Math.max(m, op.seq);
+			return m;
 		},
 		vector(t) {
 			const v: Record<string, number> = {};
@@ -153,6 +163,7 @@ test("relay authenticates op authorship: a forged (deviceId,seq) claim is reject
 	// Build a minimal auth log: owner user 'u1' with device 'devA'.
 	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
 	const devA = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const devAId = deviceIdOf(devA.sign.publicKey.toString("base64"));
 	const gen: EntryBody = {
 		type: "genesis",
 		vaultId: "t1",
@@ -169,13 +180,23 @@ test("relay authenticates op authorship: a forged (deviceId,seq) claim is reject
 			{
 				type: "add-device",
 				userId: "u1",
-				deviceId: "devA",
+				deviceId: devAId,
 				deviceSignPub: devA.sign.publicKey.toString("base64"),
 				deviceEncPub: devA.enc.publicKey.toString("base64"),
 			},
 			"u1",
 			"user",
 			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "u1", deviceId: devAId },
+			devAId,
+			"device",
+			devA.sign.privateKey,
 		),
 	];
 
@@ -189,8 +210,8 @@ test("relay authenticates op authorship: a forged (deviceId,seq) claim is reject
 
 	// An attacker (not devA) forges an op claiming devA's slot (devA, seq 1).
 	const attacker = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
-	const forged = makeEnvelope("devA", 1, Buffer.from("garbage"), attacker.sign.privateKey);
-	const genuine = makeEnvelope("devA", 1, Buffer.from("real"), devA.sign.privateKey);
+	const forged = makeEnvelope(devAId, 1, Buffer.from("garbage"), attacker.sign.privateKey);
+	const genuine = makeEnvelope(devAId, 1, Buffer.from("real"), devA.sign.privateKey);
 
 	// An invalid first root must not claim an otherwise-empty team. Its body hash
 	// differs from the real root, while its stale signature no longer authenticates it.
@@ -246,7 +267,7 @@ test("relay authenticates op authorship: a forged (deviceId,seq) claim is reject
 			{
 				type: "add-device",
 				userId: rivalUserId,
-				deviceId: "devA",
+				deviceId: devAId,
 				deviceSignPub: attacker.sign.publicKey.toString("base64"),
 				deviceEncPub: attacker.enc.publicKey.toString("base64"),
 			},
@@ -279,6 +300,8 @@ test("relay accepts only signed, role-authorized recovery-grant publishers", asy
 	const ownerDevice = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
 	const member = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
 	const memberDevice = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const ownerDeviceId = deviceIdOf(ownerDevice.sign.publicKey.toString("base64"));
+	const memberDeviceId = deviceIdOf(memberDevice.sign.publicKey.toString("base64"));
 	const genesis: EntryBody = {
 		type: "genesis",
 		vaultId: "grant-team",
@@ -295,13 +318,23 @@ test("relay accepts only signed, role-authorized recovery-grant publishers", asy
 			{
 				type: "add-device",
 				userId: "owner",
-				deviceId: "owner-device",
+				deviceId: ownerDeviceId,
 				deviceSignPub: ownerDevice.sign.publicKey.toString("base64"),
 				deviceEncPub: ownerDevice.enc.publicKey.toString("base64"),
 			},
 			"owner",
 			"user",
 			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "owner", deviceId: ownerDeviceId },
+			ownerDeviceId,
+			"device",
+			ownerDevice.sign.privateKey,
 		),
 	];
 	chain = [
@@ -315,7 +348,7 @@ test("relay accepts only signed, role-authorized recovery-grant publishers", asy
 				userEncPub: member.enc.publicKey.toString("base64"),
 				role: "member",
 			},
-			"owner-device",
+			ownerDeviceId,
 			"device",
 			ownerDevice.sign.privateKey,
 		),
@@ -327,13 +360,23 @@ test("relay accepts only signed, role-authorized recovery-grant publishers", asy
 			{
 				type: "add-device",
 				userId: "member",
-				deviceId: "member-device",
+				deviceId: memberDeviceId,
 				deviceSignPub: memberDevice.sign.publicKey.toString("base64"),
 				deviceEncPub: memberDevice.enc.publicKey.toString("base64"),
 			},
 			"member",
 			"user",
 			member.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "member", deviceId: memberDeviceId },
+			memberDeviceId,
+			"device",
+			memberDevice.sign.privateKey,
 		),
 	];
 	const makeGrant = (principal: string, signerId: string, priv: Buffer) => {
@@ -343,8 +386,8 @@ test("relay accepts only signed, role-authorized recovery-grant publishers", asy
 			sig: cr.sign(grantBytes("grant-team", unsigned), priv).toString("base64"),
 		};
 	};
-	const memberOrgKey = makeGrant("orgPublicKey", "member-device", memberDevice.sign.privateKey);
-	const ownerOrgKey = makeGrant("orgPublicKey", "owner-device", ownerDevice.sign.privateKey);
+	const memberOrgKey = makeGrant("orgPublicKey", memberDeviceId, memberDevice.sign.privateKey);
+	const ownerOrgKey = makeGrant("orgPublicKey", ownerDeviceId, ownerDevice.sign.privateKey);
 	const store = memStore();
 	const verifyGrant = (g: import("../core/protocol.ts").GrantRow, teamId: string) =>
 		grantAuthentic(teamId, g, replay(store.authExcept(teamId, new Set()) as LogEntry[], teamId));
@@ -361,7 +404,7 @@ test("relay accepts only signed, role-authorized recovery-grant publishers", asy
 	);
 	const grants = await store.allGrants("grant-team");
 	assert.equal(grants.length, 1);
-	assert.equal(grants[0]!.signerId, "owner-device", "a member cannot preseed the org key");
+	assert.equal(grants[0]!.signerId, ownerDeviceId, "a member cannot preseed the org key");
 });
 
 test("worker handler: health + auth gate (shared authorizeHeaders)", async () => {

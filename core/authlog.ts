@@ -23,6 +23,9 @@
 // independently authorized against their causal past), matching spec §10.2.
 
 import { sha256, verify, sign } from "./crypto.ts";
+import { wellFormedEntry } from "./wire.ts";
+
+export { wellFormedEntry };
 
 export type Role = "owner" | "admin" | "member";
 
@@ -52,6 +55,13 @@ export type AddDeviceEntry = {
 	deviceEncPub: string; // base64 X25519 device public key
 };
 
+// Proof of possession: signed by the device's OWN key (signerId === deviceId),
+// naming the user it belongs to. add-device only proposes a key (anyone can copy
+// a public key); the device becomes active once it proves it holds the private
+// half for that user. Without this, a member could register another user's
+// device key under themselves first in DAG order and hijack it.
+export type ProveDeviceEntry = { type: "prove-device"; userId: string; deviceId: string };
+
 export type RemoveDeviceEntry = { type: "remove-device"; userId: string; deviceId: string };
 export type RemoveUserEntry = { type: "remove-user"; userId: string };
 
@@ -59,6 +69,7 @@ export type EntryBody =
 	| GenesisEntry
 	| AddUserEntry
 	| AddDeviceEntry
+	| ProveDeviceEntry
 	| RemoveDeviceEntry
 	| RemoveUserEntry;
 
@@ -109,7 +120,8 @@ export const makeEntry = (
 
 // The current heads: entries not referenced as a parent by any other entry.
 // New entries reference all heads, which heals a fork at the next write.
-export const heads = (entries: LogEntry[]): string[] => {
+export const heads = (all: LogEntry[]): string[] => {
+	const entries = all.filter(wellFormedEntry);
 	const referenced = new Set<string>();
 	for (const e of entries) for (const p of e.parents) referenced.add(p);
 	return entries
@@ -124,7 +136,7 @@ export const heads = (entries: LogEntry[]): string[] => {
 // result; it linearizes on a later call once its ancestors have arrived.
 export const linearize = (entries: LogEntry[]): LogEntry[] => {
 	const byHash = new Map<string, LogEntry>();
-	for (const e of entries) byHash.set(entryHash(e), e);
+	for (const e of entries) if (wellFormedEntry(e)) byHash.set(entryHash(e), e);
 
 	const placed = new Set<string>();
 	const order: LogEntry[] = [];
@@ -143,6 +155,10 @@ export const linearize = (entries: LogEntry[]): LogEntry[] => {
 	}
 	return order;
 };
+
+// A device's id: the first 16 hex chars of sha256(signing public key).
+export const deviceIdOf = (signPubB64: string): string =>
+	sha256(Buffer.from(signPubB64, "base64")).toString("hex").slice(0, 16);
 
 // Derived membership.
 export type Device = {
@@ -165,12 +181,21 @@ export type Member = {
 	encPub: string;
 	role: Role;
 	active: boolean;
+	// Active (proven) devices.
 	devices: Map<string, Device>;
+	// Added but not yet proven (see ProveDeviceEntry). Not active: they can't
+	// sign or authorize anything. Rotations still seal to them, since only the
+	// member's own device (or first-device bootstrap) can add one.
+	pendingDevices: Map<string, Device>;
 	// A user identity is shared with every enrolled device, so it cannot be the
 	// continuing authority to add devices: a removed device retains it.  It may
 	// bootstrap exactly the user's first device; every later enrollment must be
 	// signed by an already-active device subkey, which is individually revocable.
 	hasEverHadDevice: boolean;
+	// Device that signed the add-user entry that (last) admitted this member, if
+	// it was device-signed. Lets a joiner derive the SAS from the admin that
+	// actually added them.
+	addedByDeviceId?: string;
 };
 export type Membership = {
 	vaultId: string;
@@ -186,6 +211,10 @@ export type Membership = {
 	// be attributed to its author (protocol.grantVerifiable) — escrow must survive
 	// the removal of the very device that lost access.
 	deviceOwners: Map<string, string>;
+	// Hashes of the entries replay actually applied (validly signed and
+	// authorized). Anything else in the stored log has no effect, so callers
+	// reasoning about "what happened" (e.g. the catch-up rule) must use this.
+	appliedHashes: Set<string>;
 };
 
 const isAdmin = (m: Member | undefined): boolean =>
@@ -262,6 +291,11 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 		case "add-device": {
 			const target = state.members.get(b.userId);
 			if (!target?.active) throw new Error("add-device requires an active member");
+			// A deviceId is the hash of its signing key, so an entry can't bind another
+			// device's (public) id to a different key. The device stays pending until
+			// the key holder proves possession (prove-device).
+			if (b.deviceId !== deviceIdOf(b.deviceSignPub))
+				throw new Error("add-device deviceId must be derived from its signing key");
 			// A newly-created identity has no device key yet, so its first device is
 			// signed by the user identity.  Once a device has ever existed, the user
 			// identity is no longer sufficient: Token B copies it to every device and
@@ -277,6 +311,18 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 				throw new Error("add-device requires an active device of the owning user");
 			return signer.devices.get(e.signerId)!.signPub;
 		}
+		case "prove-device": {
+			if (e.signerKind !== "device" || e.signerId !== b.deviceId)
+				throw new Error("prove-device must be signed by the device itself");
+			const target = state.members.get(b.userId);
+			const pending = target?.active ? target.pendingDevices.get(b.deviceId) : undefined;
+			if (!pending) throw new Error("prove-device requires a pending device of that user");
+			// A key belongs to one user for the life of the vault.
+			const owner = state.deviceOwners.get(b.deviceId);
+			if (owner !== undefined && owner !== b.userId)
+				throw new Error("prove-device cannot claim another user's device key");
+			return pending.signPub;
+		}
 		case "remove-device": {
 			if (e.signerKind !== "device") throw new Error("remove-device requires a device signer");
 			const signer = activeDeviceMember(state, e.signerId);
@@ -290,6 +336,9 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 				throw new Error("only the owner may remove the owner's device");
 			return signer.devices.get(e.signerId)!.signPub;
 		}
+		default:
+			// A type this version doesn't understand (see wire.wellFormedEntry).
+			throw new Error("unknown entry type");
 	}
 };
 
@@ -311,6 +360,7 @@ const applyEntry = (
 				role: "owner",
 				active: true,
 				devices: new Map(),
+				pendingDevices: new Map(),
 				hasEverHadDevice: false,
 			});
 			break;
@@ -322,7 +372,9 @@ const applyEntry = (
 				role: b.role,
 				active: true,
 				devices: new Map(),
+				pendingDevices: new Map(),
 				hasEverHadDevice: false,
+				addedByDeviceId: e.signerKind === "device" ? e.signerId : undefined,
 			});
 			break;
 		case "remove-user": {
@@ -330,13 +382,14 @@ const applyEntry = (
 			if (m) {
 				m.active = false;
 				m.devices.clear();
+				m.pendingDevices.clear();
 			}
 			break;
 		}
 		case "add-device": {
 			const m = state.members.get(b.userId);
 			if (!m) throw new Error("add-device for unknown user");
-			m.devices.set(b.deviceId, {
+			m.pendingDevices.set(b.deviceId, {
 				deviceId: b.deviceId,
 				signPub: b.deviceSignPub,
 				encPub: b.deviceEncPub,
@@ -344,15 +397,22 @@ const applyEntry = (
 				enrolledAtHash: hash,
 			});
 			m.hasEverHadDevice = true;
+			break;
+		}
+		case "prove-device": {
+			const m = state.members.get(b.userId)!;
+			const d = m.pendingDevices.get(b.deviceId)!;
+			m.pendingDevices.delete(b.deviceId);
+			m.devices.set(b.deviceId, d);
 			// Retain the key and owner for historical rotation-signature / grant checks
 			// (not cleared on removal).
-			state.deviceKeys.set(b.deviceId, Buffer.from(b.deviceSignPub, "base64"));
+			state.deviceKeys.set(b.deviceId, Buffer.from(d.signPub, "base64"));
 			state.deviceOwners.set(b.deviceId, b.userId);
 			break;
 		}
 		case "remove-device": {
-			const devices = state.members.get(b.userId)?.devices;
-			if (!devices) break;
+			const m = state.members.get(b.userId);
+			if (!m) break;
 			// Revocation is transitive over the enrollment delegation tree, but only
 			// for enrollments that are NOT causally before this removal. A device the
 			// removed device enrolled earlier (e.g. the owner's phone, enrolled from a
@@ -360,10 +420,12 @@ const applyEntry = (
 			// survive. A concurrent/later enrollment — a removed device racing in a
 			// replacement — is discarded even if canonical DAG ordering happened to
 			// fold that add before this removal.
+			// Pending (unproven) devices are revoked the same way.
 			const revoked = [b.deviceId];
 			for (const deviceId of revoked) {
-				devices.delete(deviceId);
-				for (const d of devices.values()) {
+				m.devices.delete(deviceId);
+				m.pendingDevices.delete(deviceId);
+				for (const d of [...m.devices.values(), ...m.pendingDevices.values()]) {
 					if (d.enrolledByDeviceId === deviceId && !ancestorHashes.has(d.enrolledAtHash))
 						revoked.push(d.deviceId);
 				}
@@ -414,6 +476,7 @@ export const replay = (entries: LogEntry[], expectedVaultId?: string): Membershi
 		members: new Map(),
 		deviceKeys: new Map(),
 		deviceOwners: new Map(),
+		appliedHashes: new Set(),
 	};
 	order.forEach((e, i) => {
 		// Exactly one genesis roots the DAG; ignore any others (different vault).
@@ -427,6 +490,7 @@ export const replay = (entries: LogEntry[], expectedVaultId?: string): Membershi
 			);
 			if (!ok) return; // bad signature — skip
 			applyEntry(state, e, hashes[i]!, ancestors.get(hashes[i]!) ?? new Set());
+			state.appliedHashes.add(hashes[i]!);
 		} catch {
 			// unauthorized signer / inapplicable entry — skip, keep folding the rest
 		}

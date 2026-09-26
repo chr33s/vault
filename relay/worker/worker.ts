@@ -17,17 +17,27 @@ import {
 	replay,
 	deviceSignKey,
 	validRootGenesis,
+	wellFormedEntry,
 	type LogEntry,
 	type Membership,
 } from "../../core/authlog.ts";
 import {
+	opsSinceSql,
+	rotationId,
+	rowToOp,
+	vectorFromRows,
+	vectorSql,
 	grantAuthentic,
 	verifyEnvelope,
 	type OpEnvelope,
 	type VersionVector,
 	type GrantRow,
 } from "../../core/protocol.ts";
-import { rotationAuthentic, type RotationRecord } from "../../core/rotation.ts";
+import {
+	rotationAuthentic,
+	verifiableRotations,
+	type RotationRecord,
+} from "../../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "../access.ts";
 import { handle, type RelayStorage } from "../handler.ts";
 
@@ -111,10 +121,14 @@ class DoRelayStorage implements RelayStorage {
 		return this.sql.exec(q, ...b).toArray();
 	}
 	putOp(teamId: string, op: OpEnvelope): boolean {
+		// Count a (device, seq) collision as a duplicate too: INSERT OR IGNORE drops
+		// it, so it must not be reported as accepted.
 		const before = this.rows(
-			`SELECT COUNT(*) AS c FROM relay_ops WHERE team_id=? AND hash=?`,
+			`SELECT COUNT(*) AS c FROM relay_ops WHERE team_id=? AND (hash=? OR (device_id=? AND seq=?))`,
 			teamId,
 			op.hash,
+			op.deviceId,
+			op.seq,
 		)[0]!.c as number;
 		if (before > 0) return false;
 		this.sql.exec(
@@ -132,24 +146,25 @@ class DoRelayStorage implements RelayStorage {
 		return this.rows(
 			`SELECT device_id,seq,hash,sig,payload FROM relay_ops WHERE team_id=? ORDER BY device_id,seq`,
 			teamId,
-		).map((r) => ({
-			deviceId: r.device_id as string,
-			seq: r.seq as number,
-			hash: r.hash as string,
-			sig: r.sig as string,
-			payload: r.payload as string,
-		}));
+		).map(rowToOp);
 	}
 	vector(teamId: string): VersionVector {
-		const v: VersionVector = {};
-		for (const r of this.rows(
-			`SELECT device_id, MAX(seq) AS m FROM relay_ops WHERE team_id=? GROUP BY device_id`,
-			teamId,
-		))
-			v[r.device_id as string] = r.m as number;
-		return v;
+		return vectorFromRows(this.rows(vectorSql("relay_ops", true), teamId));
+	}
+	maxSeq(teamId: string, deviceId: string): number {
+		return (
+			(this.rows(
+				`SELECT MAX(seq) AS m FROM relay_ops WHERE team_id=? AND device_id=?`,
+				teamId,
+				deviceId,
+			)[0]?.m as number | null) ?? 0
+		);
+	}
+	opsSince(teamId: string, vector: VersionVector): OpEnvelope[] {
+		return this.rows(opsSinceSql("relay_ops", true), JSON.stringify(vector), teamId).map(rowToOp);
 	}
 	putAuth(teamId: string, entry: LogEntry): void {
+		if (!wellFormedEntry(entry)) return; // would break replay for the whole team
 		// Key by the recomputed hash (don't trust the client's cached field) — same
 		// as the Node relay, now that entryHash (node:crypto) runs under nodejs_compat.
 		const hash = entryHash(entry);
@@ -174,6 +189,7 @@ class DoRelayStorage implements RelayStorage {
 			for (const row of rows) {
 				try {
 					const entry = JSON.parse(row.entry as string) as LogEntry;
+					if (!wellFormedEntry(entry)) continue;
 					if (validRootGenesis(entry, teamId)) {
 						legacyHash = entryHash(entry);
 						break;
@@ -206,6 +222,7 @@ class DoRelayStorage implements RelayStorage {
 		return this.rows(`SELECT entry FROM relay_authlog WHERE team_id=?`, teamId).flatMap((row) => {
 			try {
 				const entry = JSON.parse(row.entry as string) as LogEntry;
+				if (!wellFormedEntry(entry)) return [];
 				const hash = entryHash(entry);
 				if (entry.body.type === "genesis" && (hash !== pinned || !validRootGenesis(entry, teamId)))
 					return [];
@@ -217,9 +234,22 @@ class DoRelayStorage implements RelayStorage {
 			}
 		});
 	}
+	// Stored rotations that verify against the team's auth log (see
+	// verifiableRotations): only these are served and counted as held.
+	private verifiedRotations(teamId: string): Array<{ id: string; record: string }> {
+		return verifiableRotations(
+			this.rows(`SELECT record FROM relay_rotations WHERE team_id=? ORDER BY epoch`, teamId).map(
+				(r) => r.record as string,
+			),
+			this.membershipFor(teamId),
+		);
+	}
 	putRotation(teamId: string, rec: RotationRecord): void {
+		// Replace a slot's record unless the one there already verifies.
+		const id = rotationId(rec.epoch, rec.deviceId);
+		if (this.verifiedRotations(teamId).some((r) => r.id === id)) return;
 		this.sql.exec(
-			`INSERT OR IGNORE INTO relay_rotations (team_id,epoch,device_id,record) VALUES (?,?,?,?)`,
+			`INSERT OR REPLACE INTO relay_rotations (team_id,epoch,device_id,record) VALUES (?,?,?,?)`,
 			teamId,
 			rec.epoch,
 			rec.deviceId,
@@ -227,12 +257,20 @@ class DoRelayStorage implements RelayStorage {
 		);
 	}
 	rotationsExcept(teamId: string, have: Set<string>): string[] {
+		return this.verifiedRotations(teamId)
+			.filter((r) => !have.has(r.id))
+			.map((r) => r.record);
+	}
+	authLacking(teamId: string, hashes: string[]): string[] {
 		return this.rows(
-			`SELECT epoch,device_id,record FROM relay_rotations WHERE team_id=? ORDER BY epoch`,
+			`SELECT value FROM json_each(?) WHERE value NOT IN (SELECT hash FROM relay_authlog WHERE team_id=?)`,
+			JSON.stringify(hashes),
 			teamId,
-		)
-			.filter((r) => !have.has(`${r.epoch as number}:${r.device_id as string}`))
-			.map((r) => r.record as string);
+		).map((r) => r.value as string);
+	}
+	rotationsLacking(teamId: string, ids: string[]): string[] {
+		const held = new Set(this.verifiedRotations(teamId).map((r) => r.id));
+		return ids.filter((id) => !held.has(id));
 	}
 	putGrant(teamId: string, g: GrantRow): void {
 		// First-write-wins: a grant slot is immutable once set, so a captured/stale

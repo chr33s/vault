@@ -24,7 +24,7 @@ import {
 	recoveryEnable,
 	contributeRecovery,
 } from "../cli/engine.ts";
-import { entryHash, heads, makeEntry, replay } from "../core/authlog.ts";
+import { deviceIdOf, entryHash, heads, makeEntry, replay } from "../core/authlog.ts";
 import * as cr from "../core/crypto.ts";
 import { encodeHLC } from "../core/hlc.ts";
 import { grantAuthentic, grantBytes, makeEnvelope, type GrantRow } from "../core/protocol.ts";
@@ -184,6 +184,7 @@ test("rotation preserves CRDT timestamps and every live password conflict", asyn
 		// password writes are conflicts that must both survive.
 		editItem(s1, "service", { username: "d1", password: "one" });
 		editItem(s2, "service", { username: "d2", password: "two" });
+		for (const e of d2.authLog()) d1.appendAuthEntry(e); // incl. d2's proof
 		for (const op of d2.allOps()) d1.putOp(op);
 		rebuildSession(s1);
 		const mergedUsername = getItem(s1, "service")!.fields.username;
@@ -240,22 +241,37 @@ test("a removed device cannot use its retained user identity to re-enroll", asyn
 			false,
 			"a removed device's copied user key is not an enrollment authority",
 		);
-		const delegatedId = `${replacement.deviceId}-delegated`;
+		// A real, provable delegated device (derived id + its own proof), so only
+		// the transitive-revocation rule can keep it out.
+		const delegate = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+		const delegatedId = deviceIdOf(delegate.sign.publicKey.toString("base64"));
 		const delegatedReplacement = makeEntry(
 			heads(staleChain),
 			{
 				type: "add-device",
 				userId: s2.userId,
 				deviceId: delegatedId,
-				deviceSignPub: replacement.signPub,
-				deviceEncPub: replacement.encPub,
+				deviceSignPub: delegate.sign.publicKey.toString("base64"),
+				deviceEncPub: delegate.enc.publicKey.toString("base64"),
 			},
 			s2.deviceId,
 			"device",
 			s2.priv.deviceSign,
 		);
+		const delegatedProof = makeEntry(
+			[delegatedReplacement.hash],
+			{ type: "prove-device", userId: s2.userId, deviceId: delegatedId },
+			delegatedId,
+			"device",
+			delegate.sign.privateKey,
+		);
+		const delegation = [...staleChain, delegatedReplacement, delegatedProof];
+		assert.ok(
+			replay(delegation, s1.vaultId).members.get(s1.userId)!.devices.has(delegatedId),
+			"without the removal the delegation would be active",
+		);
 		assert.equal(
-			replay([...s1.store.authLog(), delegatedReplacement], s1.vaultId)
+			replay([...s1.store.authLog(), ...delegation], s1.vaultId)
 				.members.get(s1.userId)!
 				.devices.has(delegatedId),
 			false,
@@ -507,6 +523,7 @@ test("removing a device keeps the items it authored before removal", async () =>
 		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS)));
 		const s2 = await unlock(d2, PASS);
 		addItem(s2, "bank", { username: "me", password: "hunter2" });
+		for (const e of d2.authLog()) d1.appendAuthEntry(e); // incl. d2's proof
 		for (const op of d2.allOps()) d1.putOp(op);
 		rebuildSession(s1);
 		assert.ok(getItem(s1, "bank"), "the owner sees the item the second device authored");

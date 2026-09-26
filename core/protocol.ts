@@ -35,6 +35,11 @@ export type SyncResponse = {
 	authLog: LogEntry[]; // DAG entries whose hash the caller did not list
 	rotations: string[]; // serialized RotationRecords the caller lacks
 	grants: GrantRow[]; // recovery-escrow grants + org-key announcement
+	// Which of the caller's listed auth hashes / rotation ids the responder lacks,
+	// so the caller pushes only those. Optional: an older relay omits them and the
+	// caller pushes everything.
+	lacksAuth?: string[];
+	lacksRotations?: string[];
 };
 export type PushRequest = {
 	teamId: string;
@@ -120,7 +125,7 @@ export const grantVerifiable = (teamId: string, g: GrantRow, membership: Members
 	return !!signer && grantPrincipalOk(g, signer.role, ownerUserId);
 };
 
-export const rotationId = (epoch: number, deviceId: string): string => `${epoch}:${deviceId}`;
+export { rotationId } from "./wire.ts";
 
 const envelopeBytes = (deviceId: string, seq: number, payload: string): Buffer =>
 	Buffer.from(`${deviceId}|${seq}|${payload}`, "utf8");
@@ -145,14 +150,35 @@ export const verifyEnvelope = (env: OpEnvelope, signPub?: Buffer): boolean => {
 	return verify(Buffer.from(env.hash, "hex"), signPub, Buffer.from(env.sig, "base64"));
 };
 
-// Ops in `have` that the peer (described by `theirVector`) is missing.
-export const opsSince = (have: OpEnvelope[], theirVector: VersionVector): OpEnvelope[] =>
-	have.filter((op) => op.seq > (theirVector[op.deviceId] ?? 0));
+export { acceptContiguous } from "./wire.ts";
 
-export const vectorFromOps = (ops: OpEnvelope[]): VersionVector => {
+// ---- op-log SQL shared by the client Store and both relay storages ----
+// `table` has (device_id, seq, hash, sig, payload) columns, plus team_id when
+// team-scoped (the relays); team-scoped queries bind the teamId last.
+
+export const rowToOp = (r: Record<string, unknown>): OpEnvelope => ({
+	deviceId: r.device_id as string,
+	seq: r.seq as number,
+	hash: r.hash as string,
+	sig: r.sig as string,
+	payload: r.payload as string,
+});
+
+// Highest seq per device. Op logs are kept gap-free at ingest (see
+// acceptContiguous), so the maximum is also the highest contiguous seq.
+export const vectorSql = (table: string, teamScoped: boolean): string =>
+	`SELECT device_id, MAX(seq) AS m FROM ${table}${teamScoped ? " WHERE team_id = ?" : ""} GROUP BY device_id`;
+
+export const vectorFromRows = (rows: Array<Record<string, unknown>>): VersionVector => {
 	const v: VersionVector = {};
-	for (const op of ops) {
-		v[op.deviceId] = Math.max(v[op.deviceId] ?? 0, op.seq);
-	}
+	for (const r of rows) if ((r.m as number) > 0) v[r.device_id as string] = r.m as number;
 	return v;
 };
+
+// Ops past a vector in one query: the vector is bound as JSON and joined by key.
+// Binds JSON.stringify(vector) first, then the teamId when team-scoped.
+export const opsSinceSql = (table: string, teamScoped: boolean): string =>
+	`SELECT o.device_id, o.seq, o.hash, o.sig, o.payload FROM ${table} o
+  LEFT JOIN json_each(?) v ON v.key = o.device_id
+  WHERE ${teamScoped ? "o.team_id = ? AND " : ""}o.seq > COALESCE(v.value, 0)
+  ORDER BY o.device_id, o.seq`;

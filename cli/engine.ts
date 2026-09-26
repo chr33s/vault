@@ -9,6 +9,8 @@ import {
 	activeDeviceMember,
 	deviceSignKey,
 	entryHash,
+	deviceIdOf,
+	wellFormedEntry,
 	type LogEntry,
 	type EntryBody,
 	type Role,
@@ -43,8 +45,8 @@ import {
 	decodeGrant,
 	rotationBytes,
 	rotationAuthentic,
-	verifyRotation,
-	wellFormedRotation,
+	parseRotation,
+	rotationVerifiable,
 	needsCatchUp,
 	type RotationRecord,
 	type SealedGrant,
@@ -85,7 +87,8 @@ export type Session = {
 	state: VaultState;
 };
 
-const idFromPub = (pub: Buffer): string => cr.sha256(pub).toString("hex").slice(0, 16);
+// User and device ids share the one derivation replay enforces for devices.
+const idFromPub = (pub: Buffer): string => deviceIdOf(pub.toString("base64"));
 
 // ---- at-rest private-key sealing under the account key ----
 
@@ -254,10 +257,26 @@ const signedEntry = (
 	signerPriv: Buffer,
 ): LogEntry => makeEntry(heads(chain), body, signerId, signerKind, signerPriv);
 
+// Proof of possession for a just-added device (see authlog ProveDeviceEntry):
+// signed by the device's own key, naming its user.
+const proveDevice = (
+	chain: LogEntry[],
+	userId: string,
+	deviceId: string,
+	deviceSignPriv: Buffer,
+): LogEntry =>
+	signedEntry(
+		chain,
+		{ type: "prove-device", userId, deviceId },
+		deviceId,
+		"device",
+		deviceSignPriv,
+	);
+
 // ---- rotation helpers ----
 
 const loadRotations = (store: Store): RotationRecord[] =>
-	store.rotations().map((r) => JSON.parse(r) as RotationRecord);
+	store.rotations().flatMap((raw) => parseRotation(raw) ?? []);
 
 // Signatures from historical devices remain useful to recover keys for old
 // ciphertext, but they do not authorize a current epoch.  Keep these two
@@ -265,12 +284,16 @@ const loadRotations = (store: Store): RotationRecord[] =>
 const signatureVerifiedRotations = (
 	store: Store,
 	membership: Membership = replay(store.authLog()),
-): RotationRecord[] =>
-	loadRotations(store).filter((r) => {
-		if (!wellFormedRotation(r)) return false; // reject a nonsensical epoch chain
-		const pub = membership.deviceKeys.get(r.signerId);
-		return pub !== undefined && verifyRotation(r, pub);
-	});
+): RotationRecord[] => loadRotations(store).filter((r) => rotationVerifiable(r, membership));
+
+// Ids of the rotation records we hold that verify. Advertised to a relay/peer as
+// "already have", so an unverifiable record stored by an older client can never
+// shadow the genuine one for its (epoch, deviceId) slot.
+export const verifiedRotationIds = (
+	s: Session,
+	membership: Membership = replay(s.store.authLog(), s.vaultId),
+): string[] =>
+	signatureVerifiedRotations(s.store, membership).map((r) => rotationId(r.epoch, r.deviceId));
 
 const activeAdminRotations = (
 	store: Store,
@@ -295,9 +318,9 @@ const recoverEpochKeys = (
 	const keys = new Map<string, Buffer>();
 	const pubB64 = deviceEncPub.toString("base64");
 	for (const r of rotations) {
-		const g = r.grants[pubB64];
-		if (!g) continue;
 		try {
+			const g = r.grants?.[pubB64];
+			if (!g) continue;
 			const key = unseal(decodeGrant(g), deviceEncPriv, deviceEncPub);
 			if (keyCommit(key) === r.keyCommit) keys.set(r.keyCommit, key);
 		} catch {
@@ -396,6 +419,7 @@ export const init = async (
 			userSign.privateKey,
 		),
 	];
+	chain = [...chain, proveDevice(chain, userId, deviceId, deviceSign.privateKey)];
 
 	// Epoch 1 key, sealed to this device (the bootstrap self-grant).
 	const k1 = cr.randomBytes(32);
@@ -524,8 +548,10 @@ export const unlock = async (
 // Re-validate the auth log and rebuild the materialized replica from the op
 // log (used after a sync round pulls in new ops). Also refreshes the current
 // epoch and winning key.
-export const rebuildSession = (s: Session): void => {
-	const membership = replay(s.store.authLog(), s.vaultId);
+export const rebuildSession = (
+	s: Session,
+	membership: Membership = replay(s.store.authLog(), s.vaultId),
+): void => {
 	const verifiedRotations = signatureVerifiedRotations(s.store, membership);
 	const rotations = activeAdminRotations(s.store, membership);
 	// Recompute the key set from scratch (like unlock) rather than accumulating
@@ -537,7 +563,7 @@ export const rebuildSession = (s: Session): void => {
 		s.currentEpoch = win.epoch;
 		s.currentKeyCommit = win.keyCommit;
 	} else {
-		s.currentEpoch = 0;
+		s.currentEpoch = 1; // same fallback as unlock()
 		s.currentKeyCommit = "";
 	}
 	rebuildState(s, membership);
@@ -548,11 +574,14 @@ export const rebuildSession = (s: Session): void => {
 // Order, fork reconciliation, and authority are all resolved at replay time, so
 // a divergent branch is absorbed and linearized deterministically rather than
 // rejected — no fork is "lost".
+// `prior` (membership + verified rotation ids computed before the pull) is
+// reused only when no auth entry was imported, i.e. the log is unchanged.
 export const importAuthAndRotations = (
 	s: Session,
 	incomingAuth: LogEntry[],
 	incomingRotations: string[],
-): { authImported: number; rotationsImported: number } => {
+	prior?: { membership: Membership; verifiedIds: string[] },
+): { authImported: number; rotationsImported: number; membership: Membership } => {
 	let authImported = 0;
 	const have = new Set(s.store.authHashes());
 	// The vault's root genesis is fixed at init/join through a trusted path (the
@@ -563,6 +592,7 @@ export const importAuthAndRotations = (
 	// explicitly not trusted to cause. Recompute the hash so a spoofed `e.hash`
 	// can't slip past the dedupe set either.
 	for (const e of incomingAuth) {
+		if (!wellFormedEntry(e)) continue; // malformed: would break every replay
 		const h = entryHash(e);
 		if (have.has(h)) continue;
 		if (e.body.type === "genesis") continue; // exactly one genesis; we already hold it
@@ -571,21 +601,24 @@ export const importAuthAndRotations = (
 		authImported++;
 	}
 
+	// Rotations are only stored once their signature verifies against the (just
+	// extended) auth log. Dedupe against the records we hold that verify, so an
+	// unverifiable record stored earlier is replaced by the genuine one rather than
+	// shadowing it; malformed input is skipped, never fatal.
 	let rotationsImported = 0;
-	const haveRot = new Set(
-		s.store.rotations().map((r) => {
-			const o = JSON.parse(r) as RotationRecord;
-			return rotationId(o.epoch, o.deviceId);
-		}),
-	);
+	const unchanged = prior && authImported === 0;
+	const membership = unchanged ? prior.membership : replay(s.store.authLog(), s.vaultId);
+	const haveRot = new Set(unchanged ? prior.verifiedIds : verifiedRotationIds(s, membership));
 	for (const rec of incomingRotations) {
-		const r = JSON.parse(rec) as RotationRecord;
-		if (!haveRot.has(rotationId(r.epoch, r.deviceId))) {
-			s.store.putRotation(r.epoch, r.deviceId, rec);
-			rotationsImported++;
-		}
+		const r = parseRotation(rec);
+		if (!r || !rotationVerifiable(r, membership)) continue;
+		const id = rotationId(r.epoch, r.deviceId);
+		if (haveRot.has(id)) continue;
+		s.store.putRotation(r.epoch, r.deviceId, JSON.stringify(r));
+		haveRot.add(id);
+		rotationsImported++;
 	}
-	return { authImported, rotationsImported };
+	return { authImported, rotationsImported, membership };
 };
 
 // Verify every op's signature against the auth log, decrypt, and merge.
@@ -596,14 +629,21 @@ const rebuildState = (s: Session, membership = replay(s.store.authLog(), s.vault
 		const signPub = deviceSignKey(membership, op.deviceId);
 		if (!signPub) continue; // op from an unknown/revoked device — reject
 		if (!verifyEnvelope(op, signPub)) continue;
-		const field = decryptOp(op.payload, s.keys);
-		if (field) {
+		// A validly-signed but malformed op (corrupt ciphertext, non-JSON plaintext,
+		// bad HLC) is skipped like any other invalid op. Letting it throw would make
+		// unlock() fail on every replica, locking everyone out, including the admin
+		// who would need an unlocked session to remove the device that wrote it.
+		try {
+			const field = decryptOp(op.payload, s.keys);
+			if (!field) continue;
 			// Reject implausibly future-dated writes before they enter the CRDT. Once
 			// accepted, observe() must preserve their exact causal order rather than
 			// clamping the local clock below an already-applied LWW timestamp.
 			if (op.deviceId !== s.deviceId && !isWithinForwardDrift(decodeHLC(field.hlc))) continue;
 			s.state.apply(field);
 			if (field.hlc > maxHlc) maxHlc = field.hlc; // encodeHLC is fixed-width: string max == logical max
+		} catch {
+			/* malformed op: skip */
 		}
 	}
 	// Advance the local clock past everything observed so the next local edit
@@ -725,7 +765,9 @@ export const rotate = (
 	const grants: Record<string, SealedGrant> = {};
 	for (const m of membership.members.values()) {
 		if (!m.active) continue;
-		for (const d of m.devices.values()) {
+		// Pending devices too: a device added but whose proof hasn't synced yet
+		// would otherwise miss this epoch's key for good.
+		for (const d of [...m.devices.values(), ...m.pendingDevices.values()]) {
 			const encPub = Buffer.from(d.encPub, "base64");
 			grants[d.encPub] = encodeGrant(seal(newKey, encPub));
 		}
@@ -783,7 +825,7 @@ export const removeDevice = (s: Session, deviceId: string): number => {
 	const membership = replay(chain, s.vaultId);
 	let ownerId: string | undefined;
 	for (const m of membership.members.values()) {
-		if (m.active && m.devices.has(deviceId)) ownerId = m.userId;
+		if (m.active && (m.devices.has(deviceId) || m.pendingDevices.has(deviceId))) ownerId = m.userId;
 	}
 	if (!ownerId) throw new Error(`no such active device ${deviceId}`);
 	const signer = activeDeviceMember(membership, s.deviceId);
@@ -828,9 +870,13 @@ export const maybeCatchUp = (s: Session): number | undefined => {
 	const membership = replay(chain, s.vaultId);
 	if (!activeAdminDevice(membership, s.deviceId)) return undefined;
 	const win = winner(activeAdminRotations(s.store, membership));
+	// Only removals replay actually applied: an unsigned/unauthorized remove-*
+	// entry anyone can push to a relay must not force a rotation and a full
+	// re-encryption on every admin.
 	const removalHashes = chain
 		.filter((e) => e.body.type === "remove-user" || e.body.type === "remove-device")
-		.map((e) => entryHash(e));
+		.map((e) => entryHash(e))
+		.filter((h) => membership.appliedHashes.has(h));
 	if (needsCatchUp(win, removalHashes)) {
 		return rotate(s, membership);
 	}
@@ -865,6 +911,7 @@ export type TokenB = {
 	userPriv: SealedGrant; // {userSign,userEnc} sealed to new device
 	relay?: RelayInfo;
 	sas: string; // short authentication string for mutual verification
+	sasVersion?: number; // SAS_VERSION of the enroller; absent before v2
 };
 
 // `auth` on the new device: create local device keys, persist them sealed under
@@ -907,6 +954,24 @@ export const authNewDevice = async (store: Store, password: string): Promise<Tok
 		signPub: deviceSign.publicKey.toString("base64"),
 		encPub: deviceEnc.publicKey.toString("base64"),
 	};
+};
+
+// SAS over (enroller device signing key, new device signing key). The receiving
+// side takes the enroller's key from the signed log entry that admitted it, so a
+// matching SAS means that entry was signed by the device the user is looking at:
+// a signing key can't be borrowed without its private half (unlike an
+// encryption key, which add-device never proves possession of).
+// Bumped whenever sasOf's inputs change. A token without the current version was
+// made by an older enroller whose displayed code is computed differently, so the
+// comparison would fail for reasons that look like an attack; refuse it with an
+// explanation instead.
+const SAS_VERSION = 2;
+const requireSasVersion = (v: number | undefined): void => {
+	if (v !== SAS_VERSION)
+		throw new Error(
+			"the enrolling device runs an older vault version whose verification code can't be " +
+				"checked by this one; update vault on that device and re-run the enrollment",
+		);
 };
 
 const sasOf = (a: Buffer, b: Buffer): string => {
@@ -971,7 +1036,8 @@ export const deviceAdd = (
 		epochGrants,
 		userPriv,
 		relay: opts.relay,
-		sas: sasOf(s.pub.deviceEnc, newSignPub),
+		sas: sasOf(s.pub.deviceSign, newSignPub),
+		sasVersion: SAS_VERSION,
 	};
 };
 
@@ -984,6 +1050,7 @@ export const deviceConfirm = async (
 	keystore?: KeyStore,
 ): Promise<{ sas: string }> => {
 	if (store.getMeta("pending") !== "1") throw new Error("run `vault auth` first on this device");
+	requireSasVersion(tokenB.sasVersion);
 	const kdfParams = JSON.parse(requireMeta(store, "kdfParams")) as KdfParams;
 	const { accountKey } = await deriveKeys(password, kdfParams);
 	const deviceId = requireMeta(store, "deviceId");
@@ -1007,7 +1074,7 @@ export const deviceConfirm = async (
 	if (membership.vaultId !== tokenB.vaultId)
 		throw new Error("auth log vault does not match the enrollment token");
 	const ownerMember = membership.members.get(tokenB.userId);
-	const enrolledDevice = ownerMember?.devices.get(deviceId);
+	const enrolledDevice = ownerMember?.pendingDevices.get(deviceId);
 	if (
 		!ownerMember?.active ||
 		!enrolledDevice ||
@@ -1015,12 +1082,26 @@ export const deviceConfirm = async (
 	)
 		throw new Error("auth log does not authorize this device");
 
+	// Compute the SAS ourselves from the enrolling device's key in the signed log
+	// and our own signing key. Echoing tokenB.sas would let whoever forged Token B
+	// pick the string and defeat the comparison.
+	const enroller = enrolledDevice.enrolledByDeviceId;
+	const enrollerSignPub = enroller && membership.deviceKeys.get(enroller);
+	if (!enrollerSignPub) throw new Error("auth log does not name the enrolling device");
+	const sas = sasOf(enrollerSignPub, Buffer.from(requireMeta(store, "deviceSignPub"), "base64"));
+
 	// Unseal the user private identity keys (sealed to this device in Token B).
 	const up = JSON.parse(
 		unseal(decodeGrant(tokenB.userPriv), deviceEnc, deviceEncPub).toString("utf8"),
 	);
 	const userSign = Buffer.from(up.userSign, "base64");
 	const userEnc = Buffer.from(up.userEnc, "base64");
+
+	// Prove possession of our device key so replicas activate us (published on
+	// our first sync, ahead of our ops).
+	const proof = proveDevice(tokenB.authLog, tokenB.userId, deviceId, deviceSign);
+	if (!activeDeviceMember(replay([...tokenB.authLog, proof], tokenB.vaultId), deviceId))
+		throw new Error("auth log does not authorize this device");
 
 	// Mint the wrap key + meta BEFORE the transaction (async; may mint a DUK).
 	const { wrap, meta: wrapMeta } = await createWrapKey(accountKey, keystore);
@@ -1038,13 +1119,14 @@ export const deviceConfirm = async (
 		persistWrapMeta(store, wrapMeta);
 		store.setMeta("encPrivKeys", encPrivKeys);
 		for (const e of tokenB.authLog) store.appendAuthEntry(e);
+		store.appendAuthEntry(proof);
 		for (const r of tokenB.rotations) store.putRotation(r.epoch, r.deviceId, JSON.stringify(r));
 		store.setMeta("selfEpochGrants", JSON.stringify(tokenB.epochGrants));
 		persistRelay(store, tokenB.relay);
 		store.setMeta("pending", "0");
 	});
 
-	return { sas: tokenB.sas };
+	return { sas };
 };
 
 // ============================================================================
@@ -1075,6 +1157,7 @@ export type JoinToken = {
 	epochGrants: Record<string, SealedGrant>; // keyCommit -> vault key sealed to joiner device
 	relay?: RelayInfo;
 	sas: string;
+	sasVersion?: number;
 };
 
 // `invite` on the joining person's device: create a fresh user identity + first
@@ -1172,7 +1255,8 @@ export const shareVault = (
 		rotations: loadRotations(s.store),
 		epochGrants,
 		relay: opts.relay,
-		sas: sasOf(s.pub.deviceEnc, Buffer.from(invite.deviceSignPub, "base64")),
+		sas: sasOf(s.pub.deviceSign, Buffer.from(invite.deviceSignPub, "base64")),
+		sasVersion: SAS_VERSION,
 	};
 };
 
@@ -1186,6 +1270,7 @@ export const joinConfirm = async (
 ): Promise<{ userId: string; sas: string }> => {
 	if (store.getMeta("pending") !== "invite")
 		throw new Error("run `vault invite` first on this device");
+	requireSasVersion(join.sasVersion);
 	const kdfParams = JSON.parse(requireMeta(store, "kdfParams")) as KdfParams;
 	const { accountKey } = await deriveKeys(password, kdfParams);
 	const userId = requireMeta(store, "userId");
@@ -1209,6 +1294,15 @@ export const joinConfirm = async (
 	if (!me || !me.active) throw new Error("join token does not grant this user membership");
 	// `join.role` is transport metadata, not part of the signed enrollment
 	// ceremony.  The signed add-user record is the sole source of this role.
+	if (me.signPub !== requireMeta(store, "userSignPub"))
+		throw new Error("join token does not grant this user membership");
+
+	// Compute the SAS from the admin device that signed the add-user entry replay
+	// actually applied for us, rather than trusting join.sas, which a forged Join
+	// Token could set to anything.
+	const adderSignPub = me.addedByDeviceId && membership.deviceKeys.get(me.addedByDeviceId);
+	if (!adderSignPub) throw new Error("auth log does not name the admin device that added you");
+	const sas = sasOf(adderSignPub, Buffer.from(deviceSignPub, "base64"));
 
 	// Build our own device subkey entry against the imported chain (signed by our
 	// user identity key — authorized because we are now a member), and verify the
@@ -1226,7 +1320,13 @@ export const joinConfirm = async (
 		"user",
 		priv.userSign,
 	);
-	replay([...join.authLog, addDevice]); // throws if the extended chain is invalid
+	const proof = proveDevice([...join.authLog, addDevice], userId, deviceId, priv.deviceSign);
+	// replay() skips (rather than throws on) an entry it rejects, so check the
+	// outcome explicitly: our own device must end up active with our key.
+	const extended = replay([...join.authLog, addDevice, proof], join.vaultId);
+	const self = extended.members.get(userId)?.devices.get(deviceId);
+	if (!extended.members.get(userId)?.active || self?.signPub !== deviceSignPub)
+		throw new Error("join token does not let this device join (was it already used?)");
 
 	// Mint the wrap key + meta BEFORE the transaction (async; may mint a DUK).
 	const { wrap, meta: wrapMeta } = await createWrapKey(accountKey, keystore);
@@ -1236,6 +1336,7 @@ export const joinConfirm = async (
 	store.transaction(() => {
 		for (const e of join.authLog) store.appendAuthEntry(e);
 		store.appendAuthEntry(addDevice);
+		store.appendAuthEntry(proof);
 		for (const r of join.rotations) store.putRotation(r.epoch, r.deviceId, JSON.stringify(r));
 		store.setMeta("vaultId", join.vaultId);
 		store.setMeta("role", me.role);
@@ -1246,7 +1347,7 @@ export const joinConfirm = async (
 		store.setMeta("pending", "0");
 	});
 
-	return { userId, sas: join.sas };
+	return { userId, sas };
 };
 
 // ============================================================================
@@ -1274,10 +1375,14 @@ const signedGrant = (
 	};
 };
 
-const verifiedLocalGrant = (s: Session, principal: string): GrantRow | undefined => {
+const verifiedLocalGrant = (
+	s: Session,
+	principal: string,
+	membership?: Membership,
+): GrantRow | undefined => {
 	const grant = s.store.getGrant(s.vaultId, principal, 0);
 	if (!grant) return undefined;
-	const membership = replay(s.store.authLog(), s.vaultId);
+	membership ??= replay(s.store.authLog(), s.vaultId);
 	// Read-back, not acceptance: a grant published by a since-removed device is
 	// still valid here (that is the whole point of escrow), so verify against the
 	// retained historical key rather than requiring an active signer.
@@ -1300,13 +1405,15 @@ export const recoveryEnable = (s: Session): string => {
 
 // If escrow is enabled and we haven't yet sealed our identity to the org key,
 // do so now. Idempotent; safe to call on every unlock/sync.
-export const contributeRecovery = (s: Session): void => {
-	const membership = replay(s.store.authLog(), s.vaultId);
+export const contributeRecovery = (
+	s: Session,
+	membership: Membership = replay(s.store.authLog(), s.vaultId),
+): void => {
 	const me = activeDeviceMember(membership, s.deviceId);
 	if (!me || me.userId !== s.userId) return;
-	const org = verifiedLocalGrant(s, ORG_PRINCIPAL);
+	const org = verifiedLocalGrant(s, ORG_PRINCIPAL, membership);
 	if (!org) return;
-	if (verifiedLocalGrant(s, recoveryPrincipal(s.userId))) return;
+	if (verifiedLocalGrant(s, recoveryPrincipal(s.userId), membership)) return;
 	const orgPubB64 = org.wrapped;
 	const orgPub = Buffer.from(orgPubB64, "base64");
 	const material = Buffer.from(

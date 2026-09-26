@@ -11,10 +11,15 @@ import {
 	replay,
 	deviceSignKey,
 	validRootGenesis,
+	wellFormedEntry,
 	type LogEntry,
 	type Membership,
 } from "../core/authlog.ts";
 import {
+	opsSinceSql,
+	rowToOp,
+	vectorFromRows,
+	vectorSql,
 	grantAuthentic,
 	verifyEnvelope,
 	rotationId,
@@ -22,7 +27,7 @@ import {
 	type VersionVector,
 } from "../core/protocol.ts";
 import type { GrantRow } from "../core/protocol.ts";
-import { rotationAuthentic, type RotationRecord } from "../core/rotation.ts";
+import { rotationAuthentic, verifiableRotations, type RotationRecord } from "../core/rotation.ts";
 import { authorizeHeaders, type AccessConfig } from "./access.ts";
 import { handle, type RelayStorage } from "./handler.ts";
 import { GENERIC_500, installSafeFatalHandlers } from "./log.ts";
@@ -115,6 +120,7 @@ class RelayStore implements RelayStorage {
 	}
 
 	putAuth(teamId: string, entry: LogEntry): void {
+		if (!wellFormedEntry(entry)) return; // would break replay for the whole team
 		// Key by the recomputed hash (don't trust the client's cached field).
 		const hash = entryHash(entry);
 		this.db
@@ -135,6 +141,7 @@ class RelayStore implements RelayStorage {
 			for (const row of rows) {
 				try {
 					const entry = JSON.parse(row.entry) as LogEntry;
+					if (!wellFormedEntry(entry)) continue;
 					if (validRootGenesis(entry, teamId)) {
 						legacyHash = entryHash(entry);
 						break;
@@ -168,6 +175,7 @@ class RelayStore implements RelayStorage {
 		return rows.flatMap((row) => {
 			try {
 				const entry = JSON.parse(row.entry) as LogEntry;
+				if (!wellFormedEntry(entry)) return [];
 				const hash = entryHash(entry);
 				if (entry.body.type === "genesis" && (hash !== pinned || !validRootGenesis(entry, teamId)))
 					return [];
@@ -179,22 +187,48 @@ class RelayStore implements RelayStorage {
 			}
 		});
 	}
+	// Stored rotations that verify against the team's auth log (see
+	// verifiableRotations): only these are served and counted as held.
+	private verifiedRotations(teamId: string): Array<{ id: string; record: string }> {
+		const rows = this.db
+			.prepare(`SELECT record FROM relay_rotations WHERE team_id = ? ORDER BY epoch`)
+			.all(teamId) as Array<{ record: string }>;
+		return verifiableRotations(
+			rows.map((r) => r.record),
+			this.membershipFor(teamId),
+		);
+	}
 	putRotation(teamId: string, rec: RotationRecord): void {
+		// Replace a slot's record unless the one there already verifies, so an
+		// unverifiable (legacy) record can't shadow the genuine one.
+		const held = this.verifiedRotations(teamId).some(
+			(r) => r.id === rotationId(rec.epoch, rec.deviceId),
+		);
+		if (held) return;
 		this.db
 			.prepare(
-				`INSERT OR IGNORE INTO relay_rotations (team_id, epoch, device_id, record) VALUES (?, ?, ?, ?)`,
+				`INSERT OR REPLACE INTO relay_rotations (team_id, epoch, device_id, record) VALUES (?, ?, ?, ?)`,
 			)
 			.run(teamId, rec.epoch, rec.deviceId, JSON.stringify(rec));
 	}
 	rotationsExcept(teamId: string, haveIds: Set<string>): string[] {
-		const rows = this.db
-			.prepare(
-				`SELECT epoch, device_id, record FROM relay_rotations WHERE team_id = ? ORDER BY epoch`,
-			)
-			.all(teamId) as Array<Record<string, unknown>>;
-		return rows
-			.filter((r) => !haveIds.has(rotationId(r.epoch as number, r.device_id as string)))
-			.map((r) => r.record as string);
+		return this.verifiedRotations(teamId)
+			.filter((r) => !haveIds.has(r.id))
+			.map((r) => r.record);
+	}
+	authLacking(teamId: string, hashes: string[]): string[] {
+		return (
+			this.db
+				.prepare(
+					`SELECT value FROM json_each(?)
+           WHERE value NOT IN (SELECT hash FROM relay_authlog WHERE team_id = ?)`,
+				)
+				.all(JSON.stringify(hashes), teamId) as Array<{ value: string }>
+		).map((r) => r.value);
+	}
+	rotationsLacking(teamId: string, ids: string[]): string[] {
+		const held = new Set(this.verifiedRotations(teamId).map((r) => r.id));
+		return ids.filter((id) => !held.has(id));
 	}
 	close(): void {
 		this.db.close();
@@ -214,23 +248,24 @@ class RelayStore implements RelayStorage {
 				`SELECT device_id, seq, hash, sig, payload FROM relay_ops WHERE team_id = ? ORDER BY device_id, seq`,
 			)
 			.all(teamId) as Array<Record<string, unknown>>;
-		return rows.map((r) => ({
-			deviceId: r.device_id as string,
-			seq: r.seq as number,
-			hash: r.hash as string,
-			sig: r.sig as string,
-			payload: r.payload as string,
-		}));
+		return rows.map(rowToOp);
 	}
 	vector(teamId: string): VersionVector {
+		return vectorFromRows(
+			this.db.prepare(vectorSql("relay_ops", true)).all(teamId) as Array<Record<string, unknown>>,
+		);
+	}
+	maxSeq(teamId: string, deviceId: string): number {
+		const row = this.db
+			.prepare(`SELECT MAX(seq) AS m FROM relay_ops WHERE team_id = ? AND device_id = ?`)
+			.get(teamId, deviceId) as { m: number | null } | undefined;
+		return row?.m ?? 0;
+	}
+	opsSince(teamId: string, vector: VersionVector): OpEnvelope[] {
 		const rows = this.db
-			.prepare(
-				`SELECT device_id, MAX(seq) AS m FROM relay_ops WHERE team_id = ? GROUP BY device_id`,
-			)
-			.all(teamId) as Array<Record<string, unknown>>;
-		const v: VersionVector = {};
-		for (const r of rows) v[r.device_id as string] = r.m as number;
-		return v;
+			.prepare(opsSinceSql("relay_ops", true))
+			.all(JSON.stringify(vector), teamId) as Array<Record<string, unknown>>;
+		return rows.map(rowToOp);
 	}
 
 	// Membership derived from the team's auth log, used to authenticate incoming

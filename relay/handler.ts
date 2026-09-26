@@ -3,20 +3,25 @@
 //   - self-hosted Node behind Cloudflare Tunnel (relay/main.ts), and
 //   - the serverless Worker + Durable Object (relay/worker/worker.ts).
 //
-// This module imports NO node:* built-ins and only `import type` from core, so
-// it bundles unchanged into the Workers runtime. Each transport injects its
+// This module imports NO node:* built-ins, and from core only types plus the
+// dependency-free core/wire.ts, so it bundles unchanged into the Workers runtime. Each transport injects its
 // storage, its authorization check, and its (optional) cheap op-hash verifier.
 
 import type { LogEntry } from "../core/authlog.ts";
 import type { OpEnvelope, VersionVector } from "../core/protocol.ts";
 import type { GrantRow, SyncRequest, SyncResponse, PushRequest } from "../core/protocol.ts";
 import type { RotationRecord } from "../core/rotation.ts";
+import { acceptContiguous, wellFormedEntry } from "../core/wire.ts";
 
 // Storage the relay needs, team-partitioned. Implemented over node:sqlite (Node)
 // or Durable Object SQL (Worker). All methods may be async (the DO API is).
 export type RelayStorage = {
 	putOp(teamId: string, op: OpEnvelope): Promise<boolean> | boolean; // false if dup
 	allOps(teamId: string): Promise<OpEnvelope[]> | OpEnvelope[];
+	// Ops past `vector`, filtered by the storage.
+	opsSince(teamId: string, vector: VersionVector): Promise<OpEnvelope[]> | OpEnvelope[];
+	// Highest seq held for a device (0 if none).
+	maxSeq(teamId: string, deviceId: string): Promise<number> | number;
 	vector(teamId: string): Promise<VersionVector> | VersionVector;
 	putAuth(teamId: string, entry: LogEntry): Promise<void> | void;
 	// Recompute and atomically pin the first root genesis hash seen for a team.
@@ -25,6 +30,10 @@ export type RelayStorage = {
 	authExcept(teamId: string, have: Set<string>): Promise<LogEntry[]> | LogEntry[];
 	putRotation(teamId: string, rec: RotationRecord): Promise<void> | void;
 	rotationsExcept(teamId: string, have: Set<string>): Promise<string[]> | string[];
+	// Which of the given auth hashes / rotation ids are NOT held (optional; lets
+	// clients push only what's missing).
+	authLacking?(teamId: string, hashes: string[]): Promise<string[]> | string[];
+	rotationsLacking?(teamId: string, ids: string[]): Promise<string[]> | string[];
 	putGrant(teamId: string, g: GrantRow): Promise<void> | void;
 	allGrants(teamId: string): Promise<GrantRow[]> | GrantRow[];
 };
@@ -60,10 +69,8 @@ export type RelayDeps = {
 	verifyGrant?: (g: GrantRow, teamId: string) => boolean | Promise<boolean>;
 };
 
-// Pure helpers (inlined from core/protocol so this module pulls no crypto).
-const opsSince = (have: OpEnvelope[], theirVector: VersionVector): OpEnvelope[] =>
-	have.filter((op) => op.seq > (theirVector[op.deviceId] ?? 0));
-const rotKey = (epoch: number, deviceId: string): string => `${epoch}:${deviceId}`;
+const strings = (v: unknown): string[] =>
+	Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
 export const handle = async (
 	req: RelayRequest,
@@ -78,13 +85,17 @@ export const handle = async (
 	if (req.path === "/sync") {
 		const body = (await req.body()) as SyncRequest;
 		if (!body.teamId) return { status: 400, body: { error: "teamId required" } };
-		const have = await store.allOps(body.teamId);
+		const vector = body.vector ?? {};
+		const ops = await store.opsSince(body.teamId, vector);
 		const resp: SyncResponse = {
-			ops: opsSince(have, body.vector ?? {}),
+			ops,
 			vector: await store.vector(body.teamId),
 			authLog: await store.authExcept(body.teamId, new Set(body.authHashes ?? [])),
 			rotations: await store.rotationsExcept(body.teamId, new Set(body.rotationIds ?? [])),
 			grants: await store.allGrants(body.teamId),
+			// Of what the client listed, what the relay lacks: the client pushes only that.
+			lacksAuth: await store.authLacking?.(body.teamId, strings(body.authHashes)),
+			lacksRotations: await store.rotationsLacking?.(body.teamId, strings(body.rotationIds)),
 		};
 		return { status: 200, body: resp };
 	}
@@ -97,6 +108,9 @@ export const handle = async (
 		// ops travel in the same push as the add-device entry that authorizes them,
 		// so op verification must see the just-added key.
 		for (const entry of body.authLog ?? []) {
+			// Shape first: a malformed entry is dropped, not allowed to fail the push
+			// (and, stored, to break every later replay).
+			if (!wellFormedEntry(entry)) continue;
 			if (entry.body.type === "genesis") {
 				// A genesis is self-authorizing, so teamId alone cannot distinguish a
 				// later rival root. Recompute its hash (the cached field is untrusted) and
@@ -126,9 +140,16 @@ export const handle = async (
 		}
 
 		const verifyOp = deps.verifyOp ?? (() => true);
+		const verified: OpEnvelope[] = [];
+		for (const op of body.ops) if (await verifyOp(op, body.teamId)) verified.push(op);
+		// Keep the op log gap-free (see acceptContiguous): an op past a gap is
+		// dropped, so a writer can't skip seq 1 and have every client re-download
+		// its history each round, and the relay's plain-MAX vector stays honest.
+		const held = new Map<string, number>();
+		for (const id of new Set(verified.map((op) => op.deviceId)))
+			held.set(id, await store.maxSeq(body.teamId, id));
 		let accepted = 0;
-		for (const op of body.ops) {
-			if (!(await verifyOp(op, body.teamId))) continue;
+		for (const op of acceptContiguous(verified, (id) => held.get(id) ?? 0)) {
 			if (await store.putOp(body.teamId, op)) accepted++;
 		}
 		return { status: 200, body: { accepted } };
@@ -136,5 +157,3 @@ export const handle = async (
 
 	return { status: 404, body: { error: "not found" } };
 };
-
-export { rotKey };

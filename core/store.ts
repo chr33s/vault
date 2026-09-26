@@ -5,8 +5,16 @@
 
 import { chmodSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { entryHash, type LogEntry } from "./authlog.ts";
-import type { GrantRow, OpEnvelope, VersionVector } from "./protocol.ts";
+import { entryHash, wellFormedEntry, type LogEntry } from "./authlog.ts";
+import {
+	opsSinceSql,
+	rowToOp,
+	vectorFromRows,
+	vectorSql,
+	type GrantRow,
+	type OpEnvelope,
+	type VersionVector,
+} from "./protocol.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS ops (
@@ -136,22 +144,19 @@ export class Store {
 		const rows = this.db
 			.prepare(`SELECT device_id, seq, hash, sig, payload FROM ops ORDER BY device_id, seq`)
 			.all() as Array<Record<string, unknown>>;
-		return rows.map((r) => ({
-			deviceId: r.device_id as string,
-			seq: r.seq as number,
-			hash: r.hash as string,
-			sig: r.sig as string,
-			payload: r.payload as string,
-		}));
+		return rows.map(rowToOp);
 	}
 
+	// Highest seq per device; contiguous because ingest is (protocol.vectorSql).
 	versionVector(): VersionVector {
-		const rows = this.db
-			.prepare(`SELECT device_id, MAX(seq) AS m FROM ops GROUP BY device_id`)
-			.all() as Array<Record<string, unknown>>;
-		const v: VersionVector = {};
-		for (const r of rows) v[r.device_id as string] = r.m as number;
-		return v;
+		return vectorFromRows(
+			this.db.prepare(vectorSql("ops", false)).all() as Array<Record<string, unknown>>,
+		);
+	}
+
+	opsSince(vector: VersionVector): OpEnvelope[] {
+		const rows = this.db.prepare(opsSinceSql("ops", false)).all(JSON.stringify(vector));
+		return (rows as Array<Record<string, unknown>>).map(rowToOp);
 	}
 
 	// Highest seq this device has emitted (for minting the next seq).
@@ -171,6 +176,7 @@ export class Store {
 	// masquerade as already-held (the relay/worker path recomputes for the same
 	// reason).
 	appendAuthEntry(e: LogEntry): void {
+		if (!wellFormedEntry(e)) return; // never persist a shape replay can't handle
 		const hash = entryHash(e);
 		this.db
 			.prepare(`INSERT OR IGNORE INTO authlog (hash, entry) VALUES (?, ?)`)
@@ -181,9 +187,14 @@ export class Store {
 		const rows = this.db.prepare(`SELECT entry FROM authlog`).all() as Array<
 			Record<string, unknown>
 		>;
-		return rows.map((r) => {
-			const entry = JSON.parse(r.entry as string) as LogEntry;
-			return { ...entry, hash: entryHash(entry) };
+		// Skip rows a replay couldn't handle (legacy/corrupt) rather than throwing.
+		return rows.flatMap((r) => {
+			try {
+				const entry: unknown = JSON.parse(r.entry as string);
+				return wellFormedEntry(entry) ? [{ ...entry, hash: entryHash(entry) }] : [];
+			} catch {
+				return [];
+			}
 		});
 	}
 

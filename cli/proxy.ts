@@ -37,7 +37,7 @@ import { pipeline } from "node:stream";
 import { createSecureContext, type SecureContext, TLSSocket } from "node:tls";
 import { parseDotenv } from "./dotenv.ts";
 import type { Session } from "./engine.ts";
-import { resolveOne } from "./run.ts";
+import { childBaseEnv, resolveOne } from "./run.ts";
 import { installScrubbedFatalHandlers, makeScrubStream, registerSecret, scrub } from "./scrub.ts";
 import { type Ca, createCa, issueLeaf } from "./x509.ts";
 
@@ -731,7 +731,7 @@ export const proxy = async (
 	}
 
 	// Spawn the agent with the proxy preset and the real secret absent from env.
-	const childEnv = { ...process.env, ...childEnvExtra() };
+	const childEnv = { ...childBaseEnv(), ...childEnvExtra() };
 	return await new Promise<number>((resolve, reject) => {
 		const child = spawn(command, args, { env: childEnv, stdio: "inherit" });
 		child.on("error", (err) => {

@@ -23,6 +23,30 @@ export type ResolveOptions = {
 	mask?: boolean;
 };
 
+// Vault credentials a child process must never inherit: with the passphrase it
+// could unlock the whole vault itself, defeating `proxy` (which exists to keep
+// the agent blind) and widening `run` beyond the variables it declared.
+const VAULT_SECRET_ENV = [
+	"VAULT_PASSPHRASE",
+	"VAULT_ORG_KEY",
+	"VAULT_RELAY_TOKEN",
+	"VAULT_RELAY_TOKENS",
+	"VAULT_PEER_TOKEN",
+	"VAULT_TPM2_PIN", // gates the TPM unseal of the device unlock key
+	"CF_ACCESS_CLIENT_ID", // relay Cloudflare Access service token (see main.relayAuth)
+	"CF_ACCESS_CLIENT_SECRET",
+];
+
+// process.env minus the vault's own credentials.
+// Matched case-insensitively: Windows env names are, so `vault_passphrase` is
+// what the vault reads as VAULT_PASSPHRASE and must be stripped too.
+export const childBaseEnv = (): NodeJS.ProcessEnv => {
+	const secret = new Set(VAULT_SECRET_ENV);
+	const env: NodeJS.ProcessEnv = {};
+	for (const [k, v] of Object.entries(process.env)) if (!secret.has(k.toUpperCase())) env[k] = v;
+	return env;
+};
+
 export type Resolution = {
 	env: Record<string, string>;
 	missing: string[];
@@ -73,8 +97,11 @@ export const resolveOne = (s: Session, decl: EnvDecl, openVault?: string): strin
 	// 3. Bare/empty key — resolve from the vault by name (item titled KEY).
 	const item = getItem(s, decl.key);
 	if (!item) return undefined;
-	// Prefer a field literally named like the key, else the password.
-	return fieldValue(item, "password") ?? item.fields[decl.key];
+	// Prefer a field literally named like the key, else the password (checked
+	// second so a password conflict doesn't block a matching field).
+	const named = item.fields[decl.key];
+	if (named !== undefined && named !== "") return named; // an empty field is not a value
+	return fieldValue(item, "password") ?? named;
 };
 
 export const resolveEnv = async (s: Session, opts: ResolveOptions): Promise<Resolution> => {
@@ -122,7 +149,8 @@ export const run = async (
 			`audit: ${new Date().toISOString()} injected [${injected.join(", ")}] -> ${command}\n`,
 		);
 
-	const merged = { ...process.env, ...env };
+	// Declared variables are injected even if they shadow a stripped name.
+	const merged = { ...childBaseEnv(), ...env };
 
 	// --mask: defense-in-depth against a child that echoes an injected secret.
 	// Register each value with the scrubber and pipe the child's stdout/stderr

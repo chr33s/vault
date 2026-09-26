@@ -6,18 +6,25 @@
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { replay } from "../core/authlog.ts";
+import { deviceSignKey, replay } from "../core/authlog.ts";
 import {
+	acceptContiguous,
 	grantAuthentic,
-	opsSince,
 	rotationId,
+	verifyEnvelope,
+	type GrantRow,
 	type OpEnvelope,
 	type SyncResponse,
 	type VersionVector,
 } from "../core/protocol.ts";
-import type { RotationRecord } from "../core/rotation.ts";
+import { parseRotation, rotationAuthentic } from "../core/rotation.ts";
 import type { Session } from "./engine.ts";
-import { rebuildSession, importAuthAndRotations, contributeRecovery } from "./engine.ts";
+import {
+	rebuildSession,
+	importAuthAndRotations,
+	contributeRecovery,
+	verifiedRotationIds,
+} from "./engine.ts";
 
 // Credentials sent to the relay. Two independent, composable mechanisms:
 //   - token: the app-layer per-device token, matched in-relay against
@@ -122,11 +129,9 @@ export type SyncStats = {
 	rotationsPulled: number;
 };
 
-const localRotationIds = (s: Session): string[] =>
-	s.store
-		.rotations()
-		.map((r) => JSON.parse(r) as RotationRecord)
-		.map((r) => rotationId(r.epoch, r.deviceId));
+// Relays keep the first grant per (principal, keyVersion) slot, so a filled slot
+// is "held" whatever its contents; re-pushing ours would be ignored every round.
+const grantKey = (g: GrantRow): string => JSON.stringify([g.principal, g.keyVersion]);
 
 export const syncWithRelay = async (
 	s: Session,
@@ -135,52 +140,92 @@ export const syncWithRelay = async (
 	opts: { timeoutMs?: number } = {},
 ): Promise<SyncStats> => {
 	const base = relayUrl.replace(/\/$/, "");
+	const before = replay(s.store.authLog(), s.vaultId);
 	const localVector: VersionVector = s.store.versionVector();
+	const authHashes = s.store.authHashes();
+	const verifiedIds = verifiedRotationIds(s, before);
 
-	// Pull: ops past our vector, auth entries past our length, rotations we lack.
+	// Pull: ops past our vector, auth entries and rotations we don't list.
 	const resp = await post<SyncResponse>(
 		`${base}/sync`,
 		{
 			teamId: s.vaultId,
 			vector: localVector,
-			authHashes: s.store.authHashes(),
-			rotationIds: localRotationIds(s),
+			authHashes,
+			// Only records that verify: an unverifiable one stored by an older client
+			// must not stop the relay sending us the genuine record for its slot.
+			rotationIds: verifiedIds,
 		},
 		auth,
 		{ timeoutMs: opts.timeoutMs },
 	);
-	const pulled = s.store.putOps(resp.ops);
-	const { authImported, rotationsImported } = importAuthAndRotations(
+	// Membership first: a device's first ops arrive in the same round as the
+	// add-device entry that authorizes them. The returned membership reflects the
+	// imported entries and is reused for the rest of the round.
+	const { authImported, rotationsImported, membership } = importAuthAndRotations(
 		s,
-		resp.authLog,
-		resp.rotations,
+		resp.authLog ?? [],
+		resp.rotations ?? [],
+		{ membership: before, verifiedIds },
 	);
-	// The relay is only a transport.  Verify both the device signature and the
-	// publisher's current role before an org key can influence recovery escrow.
-	const membership = replay(s.store.authLog(), s.vaultId);
+	// The relay/peer is only a transport. Store an op only if the key of the
+	// device it names signed it: the ops table is UNIQUE(device_id, seq), so a
+	// forged op would otherwise occupy the genuine op's slot for good. Historical
+	// keys count: a removed device's old ops are kept (rebuild ignores them), so
+	// our vector covers them and the relay doesn't resend them every round.
+	const authentic = (resp.ops ?? []).filter((op) => {
+		try {
+			const key = membership.deviceKeys.get(op.deviceId);
+			return !!key && verifyEnvelope(op, key);
+		} catch {
+			return false;
+		}
+	});
+	// Gap-free ingest (see acceptContiguous): an op past a gap is dropped and
+	// asked for again next round, so a withheld op is never skipped for good.
+	const pulled = s.store.putOps(acceptContiguous(authentic, (id) => s.store.maxSeqFor(id)));
+	// Verify both the device signature and the publisher's current role before an
+	// org key can influence recovery escrow.
 	for (const g of resp.grants ?? []) {
 		if (grantAuthentic(s.vaultId, g, membership)) s.store.putGrant(s.vaultId, g);
 	}
 
-	// Push: everything the relay is missing (it dedups; volumes are tiny).
-	const toPush: OpEnvelope[] = opsSince(s.store.allOps(), resp.vector);
+	// Push only what the relay lacks AND would accept. The relay admits ops,
+	// rotations and grants only from currently active (admin) devices, so pushing
+	// a removed device's records would just be refused again every round. An older
+	// relay that doesn't report what it lacks gets everything else.
+	const toPush: OpEnvelope[] = s.store
+		.opsSince(resp.vector ?? {})
+		.filter((op) => deviceSignKey(membership, op.deviceId) !== undefined);
+	const lacksAuth = resp.lacksAuth && new Set(resp.lacksAuth);
+	const lacksRot = resp.lacksRotations && new Set(resp.lacksRotations);
+	const relayGrants = new Set((resp.grants ?? []).map(grantKey));
 	await post(
 		`${base}/push`,
 		{
 			teamId: s.vaultId,
 			ops: toPush,
-			authLog: s.store.authLog(),
-			rotations: s.store.rotations(),
-			grants: s.store.allGrants(s.vaultId),
+			authLog: lacksAuth
+				? s.store.authLog().filter((e) => lacksAuth.has(e.hash)) // authLog() recomputes .hash
+				: s.store.authLog(),
+			rotations: s.store.rotations().filter((raw) => {
+				const r = parseRotation(raw);
+				if (!r || (lacksRot && !lacksRot.has(rotationId(r.epoch, r.deviceId)))) return false;
+				return rotationAuthentic(r, membership);
+			}),
+			grants: s.store
+				.allGrants(s.vaultId)
+				.filter((g) => !relayGrants.has(grantKey(g)) && grantAuthentic(s.vaultId, g, membership)),
 		},
 		auth,
 		{ timeoutMs: opts.timeoutMs },
 	);
 
 	// Rebuild the materialized replica; contribute a recovery grant if escrow is
-	// now enabled and we don't yet have one for this user.
-	rebuildSession(s);
-	contributeRecovery(s);
+	// now enabled and we don't yet have one for this user. Grants don't change
+	// membership, so the round's membership is still current.
+	rebuildSession(s, membership);
+	contributeRecovery(s, membership);
 	return {
 		pulled,
 		pushed: toPush.length,
