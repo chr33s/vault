@@ -241,21 +241,11 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 				throw new Error("genesis must be self-signed by creator");
 			return b.userSignPub;
 		case "add-user": {
-			let signer: Member | undefined;
-			let signerPub: string;
-			if (e.signerKind === "device") {
-				signer = activeDeviceMember(state, e.signerId);
-				if (!isAdmin(signer)) throw new Error("add-user requires an active admin device");
-				signerPub = signer!.devices.get(e.signerId)!.signPub;
-			} else {
-				signer = state.members.get(e.signerId);
-				// Compatibility/bootstrap only: before an identity has ever enrolled a
-				// device, no revocable device key exists yet.  Once it does, user keys
-				// distributed in Token B are never sufficient for administration.
-				if (e.signerKind !== "user" || !isAdmin(signer) || signer?.hasEverHadDevice)
-					throw new Error("add-user requires an active admin device");
-				signerPub = signer!.signPub;
-			}
+			// Only an active admin *device* may: user identity keys are copied to
+			// every device in Token B, so a removed device still holds them.
+			const signer = e.signerKind === "device" ? activeDeviceMember(state, e.signerId) : undefined;
+			if (!signer || !isAdmin(signer)) throw new Error("add-user requires an active admin device");
+			const signerPub = signer.devices.get(e.signerId)!.signPub;
 			// An add-user must not overwrite a live member: without this, an
 			// admin-signed entry reusing an existing userId (e.g. the owner's, which
 			// is public in every enrollment token) replaces that member's keys and
@@ -268,23 +258,15 @@ const resolveSigner = (state: Membership, e: LogEntry): string => {
 			return signerPub;
 		}
 		case "remove-user": {
-			let signer: Member | undefined;
-			let signerPub: string;
-			if (e.signerKind === "device") {
-				signer = activeDeviceMember(state, e.signerId);
-				if (!isAdmin(signer)) throw new Error("remove-user requires an active admin device");
-				signerPub = signer!.devices.get(e.signerId)!.signPub;
-			} else {
-				signer = state.members.get(e.signerId);
-				if (e.signerKind !== "user" || !isAdmin(signer) || signer?.hasEverHadDevice)
-					throw new Error("remove-user requires an active admin device");
-				signerPub = signer!.signPub;
-			}
+			const signer = e.signerKind === "device" ? activeDeviceMember(state, e.signerId) : undefined;
+			if (!signer || !isAdmin(signer))
+				throw new Error("remove-user requires an active admin device");
+			const signerPub = signer.devices.get(e.signerId)!.signPub;
 			// The owner is the root of authority and cannot be removed by an admin
 			// (ownership transfer is not a supported operation); otherwise an admin
 			// could deactivate the owner and seize sole control.
 			const target = state.members.get(b.userId);
-			if (target?.role === "owner" && signer!.userId !== b.userId)
+			if (target?.role === "owner" && signer.userId !== b.userId)
 				throw new Error("the owner cannot be removed");
 			return signerPub;
 		}

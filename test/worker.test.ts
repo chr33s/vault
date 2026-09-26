@@ -5,10 +5,6 @@
 // the serverless placement produces identical protocol results to the Node path.
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
 	makeEntry,
@@ -26,7 +22,6 @@ import { grantAuthentic, grantBytes, makeEnvelope } from "../core/protocol.ts";
 import { verifyEnvelope } from "../core/protocol.ts";
 import { authorizeHeaders } from "../relay/access.ts";
 import { handle, type RelayStorage } from "../relay/handler.ts";
-import { createRelay } from "../relay/main.ts";
 import worker from "../relay/worker/worker.ts";
 
 // A tiny in-memory RelayStorage standing in for the Durable Object SQLite.
@@ -61,6 +56,12 @@ const memStore = (): RelayStorage => {
 			let m = 0;
 			for (const op of m_ops(t).values()) if (op.deviceId === d) m = Math.max(m, op.seq);
 			return m;
+		},
+		authLacking(t, hashes) {
+			return hashes.filter((h) => !m(auth, t).has(h));
+		},
+		rotationsLacking(t, ids) {
+			return ids.filter((id) => !m(rots, t).has(id));
 		},
 		vector(t) {
 			const v: Record<string, number> = {};
@@ -129,7 +130,7 @@ test("worker handler: push then sync round-trips ops", async () => {
 
 	const pushed = await handle(req("POST", "/push", { teamId: "t1", ops }), store, {
 		authorize: async () => true,
-		verifyOp: (op) => verifyEnvelope(op),
+		verifyOp: (op) => verifyEnvelope(op, k.publicKey),
 	});
 	assert.deepEqual(pushed, { status: 200, body: { accepted: 2 } });
 
@@ -154,7 +155,7 @@ test("worker handler: a tampered op is rejected by the op-hash check", async () 
 
 	const r = await handle(req("POST", "/push", { teamId: "t1", ops: [tampered] }), store, {
 		authorize: async () => true,
-		verifyOp: (op) => verifyEnvelope(op),
+		verifyOp: (op) => verifyEnvelope(op, k.publicKey),
 	});
 	assert.deepEqual(r.body, { accepted: 0 }, "hash mismatch -> not accepted");
 });
@@ -474,57 +475,4 @@ test("worker edge stops reading a chunked body once the byte limit is exceeded",
 	assert.equal(cancelled, true, "the unread remainder is cancelled");
 	assert.equal(pulls, 17, "only enough chunks to detect overflow are read");
 	assert.equal(routed, false, "oversized requests never create or reach a Durable Object");
-});
-
-test("Node relay migrates and deduplicates a legacy root by its recomputed hash", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "vault-relay-root-"));
-	const dbPath = join(dir, "relay.db");
-	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
-	const root = makeEntry(
-		[],
-		{
-			type: "genesis",
-			vaultId: "legacy-team",
-			userId: "owner",
-			userSignPub: owner.sign.publicKey.toString("base64"),
-			userEncPub: owner.enc.publicKey.toString("base64"),
-			role: "owner",
-		},
-		"owner",
-		"user",
-		owner.sign.privateKey,
-	);
-	const legacyEntry = { ...root, hash: "client-supplied-spoof" };
-	const invalidDuplicate = { ...legacyEntry, sig: "invalid-signature" };
-	const db = new DatabaseSync(dbPath);
-	db.exec(`CREATE TABLE relay_authlog (
-      team_id TEXT NOT NULL, hash TEXT NOT NULL, entry TEXT NOT NULL,
-      PRIMARY KEY (team_id, hash));`);
-	const insert = db.prepare(`INSERT INTO relay_authlog (team_id, hash, entry) VALUES (?, ?, ?)`);
-	insert.run("legacy-team", "legacy-row-key-1", JSON.stringify(invalidDuplicate));
-	insert.run("legacy-team", "legacy-row-key-2", JSON.stringify(legacyEntry));
-	insert.run("legacy-team", "legacy-row-key-3", JSON.stringify(legacyEntry));
-	db.close();
-
-	const { store } = createRelay({ dbPath });
-	const sync = (authHashes: string[]) => store.authExcept("legacy-team", new Set(authHashes));
-
-	try {
-		const initial = sync([]);
-		assert.equal(initial.length, 1, "duplicate legacy rows collapse by canonical hash");
-		assert.equal(entryHash(initial[0]!), entryHash(root));
-		assert.equal(
-			validRootGenesis(initial[0]!, "legacy-team"),
-			true,
-			"an invalid duplicate cannot shadow the root",
-		);
-		assert.equal(sync([entryHash(root)]).length, 0, "have uses the canonical hash");
-
-		assert.equal(store.pinGenesis("legacy-team", root), true, "the genuine root matches the pin");
-		store.putAuth("legacy-team", root);
-		assert.equal(sync([]).length, 1, "a canonical reinsert remains deduplicated");
-	} finally {
-		store.close();
-		await rm(dir, { recursive: true, force: true });
-	}
 });

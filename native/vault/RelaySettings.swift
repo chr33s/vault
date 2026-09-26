@@ -78,29 +78,8 @@ final class RelaySettings: ObservableObject {
 		let d = UserDefaults.standard
 		url = d.string(forKey: "relay.url") ?? ""
 		accessId = d.string(forKey: "relay.accessId") ?? ""
-		token = Self.loadCredential("relay.token", defaults: d)
-		accessSecret = Self.loadCredential("relay.accessSecret", defaults: d)
-	}
-
-	private static func loadCredential(_ account: String, defaults: UserDefaults) -> String {
-		let stored = RelayKeychain.get(account)
-		if !stored.isEmpty {
-			// A successful earlier migration may have been interrupted before cleanup.
-			defaults.removeObject(forKey: account)
-			return stored
-		}
-
-		guard let legacy = defaults.string(forKey: account), !legacy.isEmpty else {
-			defaults.removeObject(forKey: account)
-			return ""
-		}
-		guard RelayKeychain.set(account, legacy) else {
-			// Keep both the working in-memory value and the legacy fallback if Keychain
-			// access is temporarily unavailable; retry migration on the next launch.
-			return legacy
-		}
-		defaults.removeObject(forKey: account)
-		return legacy
+		token = RelayKeychain.get("relay.token")
+		accessSecret = RelayKeychain.get("relay.accessSecret")
 	}
 
 	private var trimmedURL: String { url.trimmingCharacters(in: .whitespacesAndNewlines) }

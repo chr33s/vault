@@ -152,8 +152,8 @@ export const syncWithRelay = async (
 			teamId: s.vaultId,
 			vector: localVector,
 			authHashes,
-			// Only records that verify: an unverifiable one stored by an older client
-			// must not stop the relay sending us the genuine record for its slot.
+			// Only records that verify: an unverifiable one we hold must not stop the
+			// relay sending us the genuine record for its slot.
 			rotationIds: verifiedIds,
 		},
 		auth,
@@ -192,25 +192,22 @@ export const syncWithRelay = async (
 
 	// Push only what the relay lacks AND would accept. The relay admits ops,
 	// rotations and grants only from currently active (admin) devices, so pushing
-	// a removed device's records would just be refused again every round. An older
-	// relay that doesn't report what it lacks gets everything else.
+	// a removed device's records would just be refused again every round.
 	const toPush: OpEnvelope[] = s.store
 		.opsSince(resp.vector ?? {})
 		.filter((op) => deviceSignKey(membership, op.deviceId) !== undefined);
-	const lacksAuth = resp.lacksAuth && new Set(resp.lacksAuth);
-	const lacksRot = resp.lacksRotations && new Set(resp.lacksRotations);
+	const lacksAuth = new Set(resp.lacksAuth ?? []);
+	const lacksRot = new Set(resp.lacksRotations ?? []);
 	const relayGrants = new Set((resp.grants ?? []).map(grantKey));
 	await post(
 		`${base}/push`,
 		{
 			teamId: s.vaultId,
 			ops: toPush,
-			authLog: lacksAuth
-				? s.store.authLog().filter((e) => lacksAuth.has(e.hash)) // authLog() recomputes .hash
-				: s.store.authLog(),
+			authLog: s.store.authLog().filter((e) => lacksAuth.has(e.hash)), // authLog() recomputes .hash
 			rotations: s.store.rotations().filter((raw) => {
 				const r = parseRotation(raw);
-				if (!r || (lacksRot && !lacksRot.has(rotationId(r.epoch, r.deviceId)))) return false;
+				if (!r || !lacksRot.has(rotationId(r.epoch, r.deviceId))) return false;
 				return rotationAuthentic(r, membership);
 			}),
 			grants: s.store

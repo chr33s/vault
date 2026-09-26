@@ -1,5 +1,5 @@
 // node:sqlite storage (spec §9; plan §4, §6). Backs both the CLI replica
-// (ciphertext + op log + materialized items + auth log + grants + meta) and the
+// (op log + auth log + rotations + grants + meta) and the
 // relay (the opaque `ops` table only). No decryption happens here — payloads are
 // opaque blobs; the store is a persistence layer over the protocol types.
 
@@ -25,14 +25,6 @@ CREATE TABLE IF NOT EXISTS ops (
   payload   TEXT NOT NULL,
   UNIQUE(device_id, seq)
 );
-CREATE TABLE IF NOT EXISTS items (
-  item_id     TEXT PRIMARY KEY,
-  team_id     TEXT,
-  key_version INTEGER,
-  ciphertext  BLOB,
-  revision    INTEGER,
-  deleted     INTEGER
-);
 CREATE TABLE IF NOT EXISTS authlog (   -- signed Merkle-DAG membership entries
   hash       TEXT PRIMARY KEY,
   entry      TEXT NOT NULL
@@ -42,8 +34,8 @@ CREATE TABLE IF NOT EXISTS grants (
   principal   TEXT,
   key_version INTEGER,
   wrapped     TEXT,
-  signer_id   TEXT NOT NULL DEFAULT '',
-  sig         TEXT NOT NULL DEFAULT '',
+  signer_id   TEXT NOT NULL,
+  sig         TEXT NOT NULL,
   PRIMARY KEY (team_id, principal, key_version)
 );
 CREATE TABLE IF NOT EXISTS rotations (
@@ -58,12 +50,10 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
-export type StoreOptions = { relayOnly?: boolean };
-
 export class Store {
 	readonly db: DatabaseSync;
 
-	constructor(path: string, _opts: StoreOptions = {}) {
+	constructor(path: string) {
 		this.db = new DatabaseSync(path);
 		// The replica holds ciphertext plus cleartext membership/relay metadata;
 		// default file perms are world-readable (0644 under umask 022). Tighten to
@@ -79,19 +69,6 @@ export class Store {
 		}
 		this.db.exec("PRAGMA journal_mode = WAL;");
 		this.db.exec(SCHEMA);
-		// Existing replicas predate signed grants.  Keep their rows readable (they
-		// will fail client verification) while adding the authenticated fields for
-		// all new grant records.
-		try {
-			this.db.exec("ALTER TABLE grants ADD COLUMN signer_id TEXT NOT NULL DEFAULT '';");
-		} catch {
-			/* column already exists */
-		}
-		try {
-			this.db.exec("ALTER TABLE grants ADD COLUMN sig TEXT NOT NULL DEFAULT '';");
-		} catch {
-			/* column already exists */
-		}
 	}
 
 	close(): void {
@@ -187,7 +164,7 @@ export class Store {
 		const rows = this.db.prepare(`SELECT entry FROM authlog`).all() as Array<
 			Record<string, unknown>
 		>;
-		// Skip rows a replay couldn't handle (legacy/corrupt) rather than throwing.
+		// Skip rows a replay couldn't handle (corrupt) rather than throwing.
 		return rows.flatMap((r) => {
 			try {
 				const entry: unknown = JSON.parse(r.entry as string);

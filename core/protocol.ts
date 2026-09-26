@@ -36,10 +36,9 @@ export type SyncResponse = {
 	rotations: string[]; // serialized RotationRecords the caller lacks
 	grants: GrantRow[]; // recovery-escrow grants + org-key announcement
 	// Which of the caller's listed auth hashes / rotation ids the responder lacks,
-	// so the caller pushes only those. Optional: an older relay omits them and the
-	// caller pushes everything.
-	lacksAuth?: string[];
-	lacksRotations?: string[];
+	// so the caller pushes only those.
+	lacksAuth: string[];
+	lacksRotations: string[];
 };
 export type PushRequest = {
 	teamId: string;
@@ -142,11 +141,10 @@ export const makeEnvelope = (
 	return { deviceId, seq, hash, sig, payload: payloadB64 };
 };
 
-// Verify hash integrity and (if a key is known) the signature.
-export const verifyEnvelope = (env: OpEnvelope, signPub?: Buffer): boolean => {
+// Verify hash integrity and the author's signature.
+export const verifyEnvelope = (env: OpEnvelope, signPub: Buffer): boolean => {
 	const expected = sha256(envelopeBytes(env.deviceId, env.seq, env.payload)).toString("hex");
 	if (expected !== env.hash) return false;
-	if (!signPub) return true; // hash-only check (relay path)
 	return verify(Buffer.from(env.hash, "hex"), signPub, Buffer.from(env.sig, "base64"));
 };
 

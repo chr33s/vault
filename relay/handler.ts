@@ -30,10 +30,10 @@ export type RelayStorage = {
 	authExcept(teamId: string, have: Set<string>): Promise<LogEntry[]> | LogEntry[];
 	putRotation(teamId: string, rec: RotationRecord): Promise<void> | void;
 	rotationsExcept(teamId: string, have: Set<string>): Promise<string[]> | string[];
-	// Which of the given auth hashes / rotation ids are NOT held (optional; lets
-	// clients push only what's missing).
-	authLacking?(teamId: string, hashes: string[]): Promise<string[]> | string[];
-	rotationsLacking?(teamId: string, ids: string[]): Promise<string[]> | string[];
+	// Which of the given auth hashes / rotation ids are NOT held, so clients push
+	// only what's missing.
+	authLacking(teamId: string, hashes: string[]): Promise<string[]> | string[];
+	rotationsLacking(teamId: string, ids: string[]): Promise<string[]> | string[];
 	putGrant(teamId: string, g: GrantRow): Promise<void> | void;
 	allGrants(teamId: string): Promise<GrantRow[]> | GrantRow[];
 };
@@ -94,8 +94,8 @@ export const handle = async (
 			rotations: await store.rotationsExcept(body.teamId, new Set(body.rotationIds ?? [])),
 			grants: await store.allGrants(body.teamId),
 			// Of what the client listed, what the relay lacks: the client pushes only that.
-			lacksAuth: await store.authLacking?.(body.teamId, strings(body.authHashes)),
-			lacksRotations: await store.rotationsLacking?.(body.teamId, strings(body.rotationIds)),
+			lacksAuth: await store.authLacking(body.teamId, strings(body.authHashes)),
+			lacksRotations: await store.rotationsLacking(body.teamId, strings(body.rotationIds)),
 		};
 		return { status: 200, body: resp };
 	}

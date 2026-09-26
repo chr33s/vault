@@ -52,7 +52,7 @@ test("rotation propagates to a second device through the relay", async () => {
 		// Enroll device 2 (same user) and sync it up.
 		const s2Store = new Store(join(dir, "d2.db"));
 		const tokenA = await authNewDevice(s2Store, PASS);
-		const tokenB = deviceAdd(s1, tokenA, { role: "admin" });
+		const tokenB = deviceAdd(s1, tokenA);
 		await deviceConfirm(s2Store, PASS, tokenB);
 		await syncWithRelay(s1, relay.url);
 		const s2 = await unlock(s2Store, PASS);
@@ -90,7 +90,7 @@ test("device-remove revokes a single device subkey and locks it out of new data 
 		const s1 = await unlock(d1, PASS);
 		addItem(s1, "github", { username: "alice", password: "pw" });
 		const d2 = new Store(join(dir, "d2.db"));
-		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS), { role: "admin" }));
+		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS)));
 		await syncWithRelay(s1, relay.url);
 		const s2 = await unlock(d2, PASS);
 		await syncWithRelay(s2, relay.url);
@@ -126,7 +126,7 @@ test("FORK over relay: concurrent device enrollments converge (both writers acce
 		const s1 = await unlock(d1, PASS);
 		const d2 = new Store(join(dir, "d2.db"));
 		const tA2 = await authNewDevice(d2, PASS);
-		await deviceConfirm(d2, PASS, deviceAdd(s1, tA2, { role: "admin" }));
+		await deviceConfirm(d2, PASS, deviceAdd(s1, tA2));
 		await syncWithRelay(s1, relay.url);
 		const s2 = await unlock(d2, PASS);
 		await syncWithRelay(s2, relay.url);
@@ -136,9 +136,9 @@ test("FORK over relay: concurrent device enrollments converge (both writers acce
 		// device 2 enrolls device 4 — both add-device entries fork from the same
 		// head of the membership DAG.
 		const d3 = new Store(join(dir, "d3.db"));
-		await deviceConfirm(d3, PASS, deviceAdd(s1, await authNewDevice(d3, PASS), { role: "admin" }));
+		await deviceConfirm(d3, PASS, deviceAdd(s1, await authNewDevice(d3, PASS)));
 		const d4 = new Store(join(dir, "d4.db"));
-		await deviceConfirm(d4, PASS, deviceAdd(s2, await authNewDevice(d4, PASS), { role: "admin" }));
+		await deviceConfirm(d4, PASS, deviceAdd(s2, await authNewDevice(d4, PASS)));
 
 		// Devices 3 and 4 each write an item, then everyone syncs to converge.
 		const s3 = await unlock(d3, PASS);
@@ -171,7 +171,7 @@ test("two concurrent admin rotations converge on one winner (spec §10.2)", asyn
 		const s1 = await unlock(d1, PASS);
 		addItem(s1, "github", { username: "alice", password: "pw" });
 		const d2 = new Store(join(dir, "d2.db"));
-		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS), { role: "admin" }));
+		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS)));
 		await syncWithRelay(s1, relay.url);
 		const s2 = await unlock(d2, PASS);
 		await syncWithRelay(s2, relay.url);
@@ -273,7 +273,7 @@ test("security catch-up: an unobserved removal forces a following rotation (spec
 		await init(d1, PASS);
 		const s1 = await unlock(d1, PASS);
 		const d2 = new Store(join(dir, "d2.db"));
-		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS), { role: "admin" }));
+		await deviceConfirm(d2, PASS, deviceAdd(s1, await authNewDevice(d2, PASS)));
 		await syncWithRelay(s1, relay.url);
 		const s2 = await unlock(d2, PASS);
 		await syncWithRelay(s2, relay.url);

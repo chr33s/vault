@@ -295,12 +295,12 @@ test("rotation rejects member and removed-device signers even with valid histori
 		const memberStore = new Store(join(dir, "member.db"));
 		const invite = await inviteInit(memberStore, "member-pass");
 		const joinToken = shareVault(owner, invite, { role: "member" });
-		await joinConfirm(memberStore, "member-pass", { ...joinToken, role: "owner" });
+		await joinConfirm(memberStore, "member-pass", joinToken);
 		const member = await unlock(memberStore, "member-pass");
 		assert.equal(member.role, "member", "join role is derived from signed membership, not Token B");
 		const memberDeviceStore = new Store(join(dir, "member-device.db"));
 		const memberToken = deviceAdd(member, await authNewDevice(memberDeviceStore, "member-pass"));
-		await deviceConfirm(memberDeviceStore, "member-pass", { ...memberToken, role: "owner" });
+		await deviceConfirm(memberDeviceStore, "member-pass", memberToken);
 		assert.equal(
 			(await unlock(memberDeviceStore, "member-pass")).role,
 			"member",

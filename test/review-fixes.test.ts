@@ -20,6 +20,7 @@ import {
 	authNewDevice,
 	deviceAdd,
 	deviceConfirm,
+	enrollmentSas,
 	inviteInit,
 	shareVault,
 	joinConfirm,
@@ -52,6 +53,8 @@ const memRelay = (): RelayStorage => ({
 	allOps: () => [],
 	opsSince: () => [],
 	maxSeq: () => 0,
+	authLacking: () => [],
+	rotationsLacking: () => [],
 	vector: () => ({}),
 	putAuth: () => undefined,
 	pinGenesis: () => false,
@@ -205,6 +208,8 @@ test("sync drops forged ops so they cannot occupy the genuine (device, seq) slot
 			authLog: [],
 			rotations: [],
 			grants: [],
+			lacksAuth: [],
+			lacksRotations: [],
 		}));
 		try {
 			await syncWithRelay(s1, url);
@@ -263,6 +268,8 @@ test("a removed device's ops are kept so the vector covers them", async () => {
 			authLog: [],
 			rotations: [],
 			grants: [],
+			lacksAuth: [],
+			lacksRotations: [],
 		}));
 		try {
 			await syncWithRelay(s1, url);
@@ -379,6 +386,8 @@ test("a client does not store ops past a gap, so the missing op is asked for aga
 			authLog: [],
 			rotations: [],
 			grants: [],
+			lacksAuth: [],
+			lacksRotations: [],
 		}));
 		try {
 			await syncWithRelay(s1, url);
@@ -431,7 +440,7 @@ test("imported rotations must verify; malformed ones are skipped, not fatal", as
 	}
 });
 
-test("device-confirm and join compute the SAS instead of echoing the token's", async () => {
+test("device-confirm and join compute the same SAS the enroller shows", async () => {
 	const dir = await tmp();
 	try {
 		const st1 = new Store(join(dir, "d1.db"));
@@ -439,13 +448,13 @@ test("device-confirm and join compute the SAS instead of echoing the token's", a
 		const s1 = await unlock(st1, PASS);
 		const st2 = new Store(join(dir, "d2.db"));
 		const tokenB = deviceAdd(s1, await authNewDevice(st2, PASS));
-		const { sas } = await deviceConfirm(st2, PASS, { ...tokenB, sas: "000000" });
-		assert.equal(sas, tokenB.sas);
+		const { sas } = await deviceConfirm(st2, PASS, tokenB);
+		assert.equal(sas, enrollmentSas(s1, st2.getMeta("deviceSignPub")!));
 
 		const st3 = new Store(join(dir, "d3.db"));
 		const join3 = shareVault(s1, await inviteInit(st3, "b"));
-		const r = await joinConfirm(st3, "b", { ...join3, sas: "000000" });
-		assert.equal(r.sas, join3.sas);
+		const r = await joinConfirm(st3, "b", join3);
+		assert.equal(r.sas, enrollmentSas(s1, st3.getMeta("deviceSignPub")!));
 		for (const st of [st1, st2, st3]) st.close();
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -581,22 +590,6 @@ test("vault credentials are stripped from child env regardless of case", () => {
 		assert.equal(childBaseEnv().vault_passphrase, undefined);
 	} finally {
 		delete process.env.vault_passphrase;
-	}
-});
-
-test("enrollment refuses a token from an older enroller instead of showing a mismatched SAS", async () => {
-	const dir = await tmp();
-	try {
-		const st1 = new Store(join(dir, "d1.db"));
-		await init(st1, PASS);
-		const s1 = await unlock(st1, PASS);
-		const st2 = new Store(join(dir, "d2.db"));
-		const { sasVersion: _, ...legacy } = deviceAdd(s1, await authNewDevice(st2, PASS));
-		await assert.rejects(deviceConfirm(st2, PASS, legacy), /older vault version/);
-		st1.close();
-		st2.close();
-	} finally {
-		await rm(dir, { recursive: true, force: true });
 	}
 });
 

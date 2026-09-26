@@ -120,10 +120,10 @@ reachable, the two placements differ fundamentally:
 
    ```bash
    # With a Cloudflare Access service token:
-   VAULT_PASSPHRASE=… vault sync --relay https://vault.example.com \
-     --access-id <uuid>.access --access-secret <secret>
+   VAULT_PASSPHRASE=… CF_ACCESS_CLIENT_SECRET=<secret> vault sync \
+     --relay https://vault.example.com --access-id <uuid>.access
    # Or with an app-layer token (no Access app):
-   VAULT_PASSPHRASE=… vault sync --relay https://vault.example.com --relay-token <tok>
+   VAULT_PASSPHRASE=… VAULT_RELAY_TOKEN=<tok> vault sync --relay https://vault.example.com
    ```
 
 ---
@@ -164,8 +164,10 @@ SQLite Durable Object (from `wrangler.toml`'s migration) automatically. Because
 3. **Verify:** `curl https://<your-worker>.workers.dev/health` → `{"ok":true}`;
    a `/sync` without a valid token must return **403** until step 1 is done.
 4. Hand the Worker URL + each device's credential to clients, then
-   `vault sync --relay <url> --relay-token <tok>` (app-layer) — or, if you front
-   the Worker with an Access app, `--access-id <id> --access-secret <s>`. See
+   `VAULT_RELAY_TOKEN=<tok> vault sync --relay <url>` (app-layer) — or, if you
+   front the Worker with an Access app, `--access-id <id>` plus
+   `CF_ACCESS_CLIENT_SECRET` (or `--access-secret-file`). Secrets are never
+   accepted on argv. See
    "Authenticating clients" below for the full table and dashboard steps.
 
 ### Manual deploy (Wrangler CLI)
@@ -271,7 +273,7 @@ All under **Zero Trust** (`one.dash.cloudflare.com` → your account → Zero Tr
 ```bash
 # Cloudflare Access service token (when an Access app fronts the relay):
 vault sync --relay https://<relay-host> \
-  --access-id <uuid>.access --access-secret <client-secret>
+  --access-id <uuid>.access --access-secret-file ~/.vault-access-secret
 
 # Or via env (e.g. in scripts / the systemd-managed device):
 export CF_ACCESS_CLIENT_ID=<uuid>.access
@@ -279,9 +281,9 @@ export CF_ACCESS_CLIENT_SECRET=<client-secret>
 vault sync --relay https://<relay-host>
 
 # App-layer token (no Access app), or BOTH together:
-vault sync --relay https://<relay-host> --relay-token <tok>
-vault sync --relay https://<relay-host> \
-  --relay-token <tok> --access-id <uuid>.access --access-secret <secret>
+VAULT_RELAY_TOKEN=<tok> vault sync --relay https://<relay-host>
+vault sync --relay https://<relay-host> --relay-token-file ~/.vault-relay-token \
+  --access-id <uuid>.access --access-secret-file ~/.vault-access-secret
 ```
 
 How it authenticates end-to-end with Access: the CLI sends
@@ -300,8 +302,8 @@ local `meta` table is plaintext, so the app-layer `token` and the Access
 device runs:
 
 ```bash
-vault sync --relay <url> --access-id <id> --access-secret <secret>   # Access
-vault sync --relay <url> --relay-token <token>                       # app-layer
+CF_ACCESS_CLIENT_SECRET=<secret> vault sync --relay <url> --access-id <id>   # Access
+VAULT_RELAY_TOKEN=<token> vault sync --relay <url>                           # app-layer
 ```
 
 with the URL (and accessId) defaulting from enrollment, so only the secret need

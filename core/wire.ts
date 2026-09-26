@@ -41,7 +41,7 @@ const wellFormedBody = (b: unknown): b is EntryBody => {
 };
 
 // Structural check (not a validity check) for an auth-log entry received from anywhere untrusted (a
-// relay, a peer, a push, or a legacy row). replay(), heads() and linearize()
+// relay, a peer, a push, or a corrupt row). replay(), heads() and linearize()
 // assume this shape, so one malformed entry (e.g. `parents` as a string) that
 // slipped into a store would otherwise throw on every replay and lock the vault
 // on every replica. Signatures and authority are checked later, at replay.

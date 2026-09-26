@@ -29,7 +29,7 @@ test/    node:test specs
 
 | Milestone                      | Status | Notes                                                                                                                                                                                                                                                                                                                                                                             |
 | ------------------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| M1 core + tests                | ✅     | crypto, sealed-box, Argon2id KDF (legacy scrypt read path), HLC, field-level CRDT with password MV-register, signed Merkle-DAG auth log with deterministic fork reconciliation, conflict-free epochs, anti-entropy protocol, sqlite store                                                                                                                                         |
+| M1 core + tests                | ✅     | crypto, sealed-box, Argon2id KDF, HLC, field-level CRDT with password MV-register, signed Merkle-DAG auth log with deterministic fork reconciliation, conflict-free epochs, anti-entropy protocol, sqlite store                                                                                                                                                                   |
 | M2 local CLI                   | ✅     | `init/add/get/list/edit/rm` + `run` against the local replica, no network                                                                                                                                                                                                                                                                                                         |
 | M3 relay + sync                | ✅     | `node:http` relay (`/sync`, `/push`); the op log **and** the signed auth log, rotation records, and recovery grants all propagate; two CLIs converge through a relay                                                                                                                                                                                                              |
 | M4 enrollment                  | ✅     | `auth` / `device-add` / `device-confirm` token handshake, auth-log validation, user-with-device-subkeys                                                                                                                                                                                                                                                                           |
@@ -50,9 +50,8 @@ test/    node:test specs
 - **Password KDF: Argon2id** (async `crypto.argon2`, threadpool-offloaded) — the
   spec's preferred primitive, native in Node 26 so it stays zero-dep with no WASM
   asset (plan §2). New vaults use 64 MiB / 3 passes / 1 lane; cost params + the
-  algorithm live in `kdfParams` so they can be raised later. **Legacy scrypt
-  vaults still unlock** (no migration): `kdfParams.algo` discriminates and the
-  scrypt path is retained, KAT-locked in tests.
+  algorithm live in `kdfParams` so they can be raised later; the derivation is
+  KAT-locked in tests.
 
 ## Running (dev)
 
@@ -306,7 +305,7 @@ org-level recovery authority.
 ```bash
 vault recovery-enable                       # owner: prints the org PRIVATE key (store offline)
 # ...members sync, contributing their sealed recovery material...
-vault recover --user <id> --org-key <k>     # owner: reconstruct a locked-out member
+vault recover --user <id> --org-key-file <f> # owner: reconstruct a locked-out member (or VAULT_ORG_KEY)
 ```
 
 ## Direct tailnet fallback (spec §8.6)
@@ -321,12 +320,12 @@ only ciphertext plus the membership metadata it already gossips through the hub.
 ```bash
 # On an always-on device: serve this vault's replica to the tailnet.
 vault serve                                  # binds to this device's Tailscale IP
-vault serve --peer-token <t>                 # gate it with a shared token (recommended)
+vault serve --peer-token-file <f>            # gate it with a shared token (recommended; or VAULT_PEER_TOKEN)
 
 # On another device: reconcile with the hub AND online tailnet peers...
 vault sync --tailnet --relay <url>
 # ...or skip the hub entirely (e.g. it's unreachable):
-vault sync --tailnet-only --peer-token <t>
+vault sync --tailnet-only --peer-token-file <f>
 ```
 
 `vault serve` holds no keys and runs while the vault is locked — it's a dumb
@@ -452,8 +451,7 @@ terminal-level "secure input" exists but is narrow and platform-specific:
 
 - **No reliable key-memory zeroing in JS/V8** — accepted KNOWN ISSUE, not a
   defect. Mitigated by minimizing key lifetime and never logging secrets.
-- **At-rest keys** are sealed under the account key (Argon2id-derived; scrypt for
-  legacy vaults). Optionally,
+- **At-rest keys** are sealed under the account key (Argon2id-derived). Optionally,
   `vault init --keychain` / `vault keystore enable` folds an OS keystore second
   factor into the wrap key (`HKDF(accountKey, device-unlock-key)`), so a stolen
   disk can't be brute-forced offline at any passphrase strength. Providers:

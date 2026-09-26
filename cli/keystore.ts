@@ -1,6 +1,6 @@
 // Optional keystore second factor for at-rest key wrapping (spec §3.4, plan §11).
 //
-// By default the at-rest private keys are sealed under the scrypt-derived account
+// By default the at-rest private keys are sealed under the Argon2id-derived account
 // key alone, so a stolen disk + a weak passphrase is brute-forceable offline. A
 // keystore binds an additional high-entropy secret (a per-device "unlock key")
 // to an OS-protected store, and the wrapping key becomes HKDF(accountKey, DUK).
@@ -148,16 +148,16 @@ export const macKeychain: KeyStore = {
 // logic is testable off-Windows.
 
 // DPAPI is exactly a BlobCipher (aliased, not hand-mirrored, so future BlobCipher
-// evolution surfaces here too rather than silently skipping this tier). Its
-// CurrentUser binding takes no per-id parameter: unlike systemd-creds (--name) or
-// hello (AEAD AAD), windows-dpapi does NOT bind the blob to the keystore id. That
-// gap is deliberate — the blobs live in the owner-only 0700 config tree and DPAPI
-// already scopes to the current Windows user (a same-user attacker can call
-// ProtectedData directly regardless), and threading the id into ProtectedData's
-// optionalEntropy would change the sealed format and break every existing
-// windows-dpapi vault without a migration read-path. powerShellDpapi's one-arg
-// protect/unprotect ignore the extra `name` makeBlobKeyStore passes.
+// evolution surfaces here too rather than silently skipping this tier). Like
+// systemd-creds (--name) and hello (AEAD AAD), the blob is bound to the keystore
+// id: it goes into ProtectedData's optionalEntropy, so a blob copied or renamed
+// to another id won't unprotect.
 export type Dpapi = BlobCipher;
+
+// optionalEntropy for a keystore id, embedded in the script as base64 (so no
+// id character can break out of the PowerShell string; ids aren't secret).
+const dpapiEntropy = (name = ""): string =>
+	`[Convert]::FromBase64String('${Buffer.from(`credvault/dpapi/v1:${name}`, "utf8").toString("base64")}')`;
 
 // Run a PowerShell script that reads base64 on stdin and writes base64 on
 // stdout. Avoids putting secrets on the command line / in the process table.
@@ -192,19 +192,19 @@ export const powerShellDpapi: Dpapi = {
 			return false;
 		}
 	},
-	protect(plaintext: Buffer): Promise<Buffer> {
+	protect(plaintext: Buffer, name?: string): Promise<Buffer> {
 		return runPowerShell(
 			psPipe(
-				"[System.Security.Cryptography.ProtectedData]::Protect($bytes,$null," +
+				`[System.Security.Cryptography.ProtectedData]::Protect($bytes,${dpapiEntropy(name)},` +
 					"[System.Security.Cryptography.DataProtectionScope]::CurrentUser)",
 			),
 			plaintext,
 		);
 	},
-	unprotect(blob: Buffer): Promise<Buffer> {
+	unprotect(blob: Buffer, name?: string): Promise<Buffer> {
 		return runPowerShell(
 			psPipe(
-				"[System.Security.Cryptography.ProtectedData]::Unprotect($bytes,$null," +
+				`[System.Security.Cryptography.ProtectedData]::Unprotect($bytes,${dpapiEntropy(name)},` +
 					"[System.Security.Cryptography.DataProtectionScope]::CurrentUser)",
 			),
 			blob,
@@ -217,9 +217,7 @@ export const powerShellDpapi: Dpapi = {
 // DPAPI (Windows) and systemd-creds (Linux) are the same SHAPE of tier: an OS
 // facility that seals bytes bound to this machine/user and hands back a blob we
 // persist on disk — at-rest protection, no per-access prompt, no extra hardware.
-// `BlobCipher` (cli/blobcipher.ts) captures that shape; the old `Dpapi` type is a
-// structural subset (its one-arg protect/unprotect is assignable), so existing
-// callers keep working.
+// `BlobCipher` (cli/blobcipher.ts) captures that shape.
 
 const blobDir = async (subdir: string): Promise<string> => {
 	const dir = join(configDir(), subdir);
@@ -270,8 +268,8 @@ export const makeBlobKeyStore = ({ name, subdir, ext, cipher }: BlobStoreOptions
 	},
 });
 
-// Windows DPAPI tier, now expressed over the shared helper. Behavior is unchanged:
-// name "windows-dpapi", blobs under <configDir>/dpapi/<id>.dpapi.
+// Windows DPAPI tier over the shared helper: name "windows-dpapi", blobs under
+// <configDir>/dpapi/<id>.dpapi.
 export const makeDpapiKeyStore = (dpapi: Dpapi = powerShellDpapi): KeyStore =>
 	makeBlobKeyStore({ name: "windows-dpapi", subdir: "dpapi", ext: "dpapi", cipher: dpapi });
 

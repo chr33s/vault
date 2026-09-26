@@ -76,20 +76,10 @@ class RelayStore implements RelayStorage {
       principal   TEXT NOT NULL,
       key_version INTEGER NOT NULL,
       wrapped     TEXT NOT NULL,
-		  signer_id   TEXT NOT NULL DEFAULT '',
-		  sig         TEXT NOT NULL DEFAULT '',
+		  signer_id   TEXT NOT NULL,
+		  sig         TEXT NOT NULL,
       PRIMARY KEY (team_id, principal, key_version)
     );`);
-		try {
-			this.db.exec("ALTER TABLE relay_grants ADD COLUMN signer_id TEXT NOT NULL DEFAULT '';");
-		} catch {
-			/* column already exists */
-		}
-		try {
-			this.db.exec("ALTER TABLE relay_grants ADD COLUMN sig TEXT NOT NULL DEFAULT '';");
-		} catch {
-			/* column already exists */
-		}
 	}
 
 	putGrant(teamId: string, g: GrantRow): void {
@@ -132,29 +122,10 @@ class RelayStore implements RelayStorage {
 			| { hash: string }
 			| undefined;
 		if (!pinned) {
-			// Upgrade path: preserve the first matching genesis already stored by an
-			// older relay instead of letting the next pusher choose a new root.
-			const rows = this.db
-				.prepare(`SELECT entry FROM relay_authlog WHERE team_id = ? ORDER BY rowid`)
-				.all(teamId) as Array<{ entry: string }>;
-			let legacyHash: string | undefined;
-			for (const row of rows) {
-				try {
-					const entry = JSON.parse(row.entry) as LogEntry;
-					if (!wellFormedEntry(entry)) continue;
-					if (validRootGenesis(entry, teamId)) {
-						legacyHash = entryHash(entry);
-						break;
-					}
-				} catch {
-					/* skip malformed legacy rows */
-				}
-			}
-			const initial = legacyHash ?? candidate;
-			if (!initial) return undefined;
+			if (!candidate) return undefined;
 			this.db
 				.prepare(`INSERT OR IGNORE INTO relay_roots (team_id, hash) VALUES (?, ?)`)
-				.run(teamId, initial);
+				.run(teamId, candidate);
 			pinned = this.db.prepare(`SELECT hash FROM relay_roots WHERE team_id = ?`).get(teamId) as {
 				hash: string;
 			};
@@ -200,7 +171,7 @@ class RelayStore implements RelayStorage {
 	}
 	putRotation(teamId: string, rec: RotationRecord): void {
 		// Replace a slot's record unless the one there already verifies, so an
-		// unverifiable (legacy) record can't shadow the genuine one.
+		// unverifiable record can't shadow the genuine one.
 		const held = this.verifiedRotations(teamId).some(
 			(r) => r.id === rotationId(rec.epoch, rec.deviceId),
 		);

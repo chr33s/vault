@@ -104,18 +104,8 @@ class DoRelayStorage implements RelayStorage {
       PRIMARY KEY (team_id, epoch, device_id));`);
 		this.sql.exec(`CREATE TABLE IF NOT EXISTS relay_grants (
       team_id TEXT NOT NULL, principal TEXT NOT NULL, key_version INTEGER NOT NULL, wrapped TEXT NOT NULL,
-      signer_id TEXT NOT NULL DEFAULT '', sig TEXT NOT NULL DEFAULT '',
+      signer_id TEXT NOT NULL, sig TEXT NOT NULL,
       PRIMARY KEY (team_id, principal, key_version));`);
-		try {
-			this.sql.exec("ALTER TABLE relay_grants ADD COLUMN signer_id TEXT NOT NULL DEFAULT '';");
-		} catch {
-			/* column already exists */
-		}
-		try {
-			this.sql.exec("ALTER TABLE relay_grants ADD COLUMN sig TEXT NOT NULL DEFAULT '';");
-		} catch {
-			/* column already exists */
-		}
 	}
 	private rows(q: string, ...b: unknown[]): Array<Record<string, unknown>> {
 		return this.sql.exec(q, ...b).toArray();
@@ -180,30 +170,11 @@ class DoRelayStorage implements RelayStorage {
 			| { hash: string }
 			| undefined;
 		if (!pinned) {
-			// Preserve the first matching root already stored by a pre-pin Worker.
-			const rows = this.rows(
-				`SELECT entry FROM relay_authlog WHERE team_id=? ORDER BY rowid`,
-				teamId,
-			);
-			let legacyHash: string | undefined;
-			for (const row of rows) {
-				try {
-					const entry = JSON.parse(row.entry as string) as LogEntry;
-					if (!wellFormedEntry(entry)) continue;
-					if (validRootGenesis(entry, teamId)) {
-						legacyHash = entryHash(entry);
-						break;
-					}
-				} catch {
-					/* skip malformed legacy rows */
-				}
-			}
-			const initial = legacyHash ?? candidate;
-			if (!initial) return undefined;
+			if (!candidate) return undefined;
 			this.sql.exec(
 				`INSERT OR IGNORE INTO relay_roots (team_id,hash) VALUES (?,?)`,
 				teamId,
-				initial,
+				candidate,
 			);
 			pinned = this.rows(`SELECT hash FROM relay_roots WHERE team_id=?`, teamId)[0] as {
 				hash: string;

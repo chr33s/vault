@@ -27,6 +27,26 @@ const fakeDpapi = (tag: string): Dpapi => ({
 	},
 });
 
+test("DPAPI store passes the keystore id so blobs are bound to it", async () => {
+	await withHome(async () => {
+		const names: Array<string | undefined> = [];
+		const ks = makeDpapiKeyStore({
+			...fakeDpapi("userA"),
+			async protect(plaintext: Buffer, name?: string) {
+				names.push(name);
+				return fakeDpapi("userA").protect(plaintext);
+			},
+			async unprotect(blob: Buffer, name?: string) {
+				names.push(name);
+				return fakeDpapi("userA").unprotect(blob);
+			},
+		});
+		await ks.put("vault-abc", Buffer.from("duk"));
+		await ks.get("vault-abc");
+		assert.deepEqual(names, ["vault-abc", "vault-abc"]);
+	});
+});
+
 const withHome = async (fn: () => Promise<void>): Promise<void> => {
 	const home = await mkdtemp(join(tmpdir(), "vault-dpapi-"));
 	const prev = process.env.VAULT_HOME;

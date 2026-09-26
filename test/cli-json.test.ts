@@ -66,7 +66,7 @@ test("--json emits one structured object per command", async () => {
 		assert.deepEqual(get.passwords, ["s3cr3t"]);
 
 		const field = lastJson(
-			(await execFile(["--json", "get", "github", "--name", "password"], { home, env })).stdout,
+			(await execFile(["--json", "get", "github", "--field", "password"], { home, env })).stdout,
 		);
 		assert.equal(field.value, "s3cr3t");
 	});
@@ -205,7 +205,7 @@ test("--passphrase-stdin reads secrets from stdin (one line per prompt)", async 
 
 		const got = lastJson(
 			(
-				await execFile(["--json", "--passphrase-stdin", "get", "gh", "--name", "password"], {
+				await execFile(["--json", "--passphrase-stdin", "get", "gh", "--field", "password"], {
 					home,
 					input: "mypass\n",
 				})

@@ -13,6 +13,7 @@ import {
 	rotate,
 	authNewDevice,
 	deviceAdd,
+	enrollmentSas,
 	deviceConfirm,
 } from "../cli/engine.ts";
 import { syncWithRelay } from "../cli/relayclient.ts";
@@ -97,9 +98,9 @@ test("two replicas converge through the relay", async () => {
 
 		const store2 = new Store(join(dir, "d2.db"));
 		const tokenA = await authNewDevice(store2, PASS);
-		const tokenB = deviceAdd(s1, tokenA, { role: "admin" });
+		const tokenB = deviceAdd(s1, tokenA);
 		const conf = await deviceConfirm(store2, PASS, tokenB);
-		assert.equal(conf.sas, tokenB.sas);
+		assert.equal(conf.sas, enrollmentSas(s1, tokenA.signPub));
 
 		// Device 1 pushes its ops to the relay.
 		await syncWithRelay(s1, relay);
@@ -160,7 +161,7 @@ test("removeUser appends removal and rotates to a higher epoch", async () => {
 		// Enroll a second user-ish device, then remove that user.
 		const store2 = new Store(join(dir, "d2.db"));
 		const tokenA = await authNewDevice(store2, PASS);
-		deviceAdd(s, tokenA, { role: "member" }); // same user in this model; still exercises rotate
+		deviceAdd(s, tokenA); // same user in this model; still exercises rotate
 		const epoch = rotate(s);
 		assert.ok(epoch >= 2);
 		store2.close();

@@ -46,8 +46,8 @@ test("SEA binary: version + init/add/list/get + relay sync round-trip", { skip }
 		assert.match(await run("init"), /Initialized vault/);
 		await run("add", "github", "--field", "username=alice", "--field", "password=s3cr3t");
 		assert.match(await run("list"), /github/);
-		assert.equal((await run("get", "github", "--name", "username")).trim(), "alice");
-		assert.equal((await run("get", "github", "--name", "password")).trim(), "s3cr3t");
+		assert.equal((await run("get", "github", "--field", "username")).trim(), "alice");
+		assert.equal((await run("get", "github", "--field", "password")).trim(), "s3cr3t");
 
 		assert.match(await run("sync", "--relay", relay), /Synced/);
 
@@ -60,7 +60,7 @@ test("SEA binary: version + init/add/list/get + relay sync round-trip", { skip }
 			await run2("device-confirm", "--token", tokenB);
 			await run2("sync", "--relay", relay);
 			assert.equal(
-				(await run2("get", "github", "--name", "username")).trim(),
+				(await run2("get", "github", "--field", "username")).trim(),
 				"alice",
 				"device 2 converged via binary + relay",
 			);

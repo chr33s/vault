@@ -4,6 +4,7 @@
 
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
+import type { Role } from "../core/authlog.ts";
 import { ITEM_TYPES, isItemType, DEFAULT_ITEM_TYPE, type ItemType } from "../core/crdt.ts";
 import { Store } from "../core/store.ts";
 import { generateTotp, type TotpResult } from "../core/totp.ts";
@@ -23,6 +24,7 @@ import {
 	savedRelay,
 	authNewDevice,
 	deviceAdd,
+	enrollmentSas,
 	deviceConfirm,
 	inviteInit,
 	shareVault,
@@ -78,40 +80,41 @@ Vault & items
                                the countdown to stderr. 'get' also shows it inline.
 
 Sync
-  sync --relay <url> [--relay-token <t>] [--access-id <id> --access-secret <s>]
-       [--tailnet] [--tailnet-only] [--port <n>] [--peer-token <t>]
-                               Anti-entropy round with the relay. --relay-token is
-                               the app-layer token; --access-id/--access-secret is
-                               a Cloudflare Access service token (needed when an
-                               Access app fronts the relay). Env fallbacks:
-                               VAULT_RELAY_TOKEN, CF_ACCESS_CLIENT_ID,
-                               CF_ACCESS_CLIENT_SECRET.
+  sync --relay <url> [--relay-token-file <path>] [--access-id <id>]
+       [--access-secret-file <path>] [--tailnet] [--tailnet-only] [--port <n>]
+       [--peer-token-file <path>]
+                               Anti-entropy round with the relay. The relay token
+                               is the app-layer token; --access-id plus the access
+                               secret is a Cloudflare Access service token (needed
+                               when an Access app fronts the relay). Secrets come
+                               from files or env, never argv: VAULT_RELAY_TOKEN,
+                               CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET.
                                --tailnet also reconciles directly with online
                                Tailscale peers running 'vault serve' (§8.6 direct
                                fallback); --tailnet-only skips the hub (e.g. it's
-                               down). --peer-token gates the peer servers (env:
+                               down). The peer token gates the peer servers (env:
                                VAULT_PEER_TOKEN); --port sets the peer port (env:
                                VAULT_PEER_PORT, default ${DEFAULT_PEER_PORT}).
                                Env: VAULT_TAILNET=1 enables the tailnet leg.
-  serve [--host <ip>] [--port <n>] [--peer-token <t>]
+  serve [--host <ip>] [--port <n>] [--peer-token-file <path>]
                                Run an always-on replica peer for the direct tailnet
                                path (§8.6): serve this device's op-log to tailnet
                                peers so they can sync when the hub is unreachable.
                                No passphrase — holds no keys, runs while locked.
                                Binds to this device's Tailscale IP by default
-                               (--host overrides). Without --peer-token it is open
+                               (--host overrides). Without a peer token it is open
                                to the whole tailnet.
 
 Devices (token handshake)
   auth                         New device: generate keys, print Token A
-  device-add --token <A> [--relay <url>] [--relay-token <t>]
+  device-add --token <A> [--relay <url>] [--relay-token-file <path>]
                                Authorized device: seal grants, print Token B
   device-confirm --token <B>   New device: unseal vault key, build replica
   device-remove (--device <id> | --user <id>)   Revoke a device or a person, then rotate
 
 Sharing with other people
   invite                       Joiner: generate a user identity, print Invite Token
-  share --token <invite> [--role member|admin] [--relay <url>] [--relay-token <t>]
+  share --token <invite> [--role member|admin] [--relay <url>] [--relay-token-file <path>]
                                Admin: add the user, seal grants, print Join Token
   join --token <join>          Joiner: validate, add own device, build replica
 
@@ -127,7 +130,8 @@ Vaults & keys
 
 Recovery escrow (per-vault policy, spec §5)
   recovery-enable              Owner: create the org escrow key; print the org private key
-  recover --user <id> --org-key <k>   Owner: reconstruct a locked-out member's keys
+  recover --user <id> --org-key-file <path>   Owner: reconstruct a locked-out member's keys
+                               (or VAULT_ORG_KEY)
 
 Secrets into a command
   run [--env <file>] [--vault <name>] [--allow-missing] [--mask] -- <cmd> [args...]
@@ -166,10 +170,9 @@ const readToken = async <T>(values: Record<string, unknown>): Promise<T> => {
 	throw new Error("provide --token <base64> or --token-file <path>");
 };
 
-// Resolve a secret flag WITHOUT requiring it on argv (which is world-readable via
-// `ps` / /proc/<pid>/cmdline and lands in shell history). Priority:
-// `--<name>-file <path>`  >  env `<ENV>`  >  inline `--<name>` (kept for
-// compatibility but discouraged). Returns undefined if none is set.
+// Resolve a secret from `--<name>-file <path>`, else env `<ENV>`. Never from
+// argv, which is world-readable via `ps` / /proc/<pid>/cmdline and lands in
+// shell history. Returns undefined if none is set.
 const readSecretFlag = async (
 	values: Record<string, unknown>,
 	name: string,
@@ -177,9 +180,7 @@ const readSecretFlag = async (
 ): Promise<string | undefined> => {
 	const file = values[`${name}-file`];
 	if (typeof file === "string") return (await readFile(file, "utf8")).trim();
-	if (env && process.env[env] !== undefined) return process.env[env];
-	const inline = values[name];
-	return typeof inline === "string" ? inline : undefined;
+	return env ? process.env[env] : undefined;
 };
 
 const openStore = async (values: Record<string, unknown>): Promise<Store> =>
@@ -345,23 +346,19 @@ const main = async (): Promise<number> => {
 			"tailnet-only": { type: "boolean" }, // sync: skip the hub (e.g. hub is down)
 			host: { type: "string" }, // serve: bind address (default: this device's tailnet IP)
 			port: { type: "string" }, // serve/sync: peer-server port
-			"peer-token": { type: "string" }, // serve/sync: shared token gating the peer server
-			"peer-token-file": { type: "string" }, // ...from a file instead of argv
+			"peer-token-file": { type: "string" }, // serve/sync: shared token gating the peer server
 			peer: { type: "string", multiple: true }, // sync: tailnet peer allowlist (name/ip)
 			token: { type: "string" },
 			"token-file": { type: "string" },
-			"relay-token": { type: "string" },
-			"relay-token-file": { type: "string" }, // ...from a file instead of argv
+			"relay-token-file": { type: "string" }, // relay app-layer token (file/env only, never argv)
 			role: { type: "string" },
 			user: { type: "string" },
 			device: { type: "string" },
-			"org-key": { type: "string" },
 			"org-key-file": { type: "string" }, // recover: org escrow key from a file, not argv
 			keychain: { type: "boolean" },
 			"with-key": { type: "string" }, // keystore/init: systemd-creds binding (host|tpm2|auto)
 			"access-id": { type: "string" },
-			"access-secret": { type: "string" },
-			"access-secret-file": { type: "string" }, // ...from a file instead of argv
+			"access-secret-file": { type: "string" }, // Cloudflare Access client secret (file/env only)
 			env: { type: "string" }, // run
 			"allow-missing": { type: "boolean" }, // run
 			mask: { type: "boolean" }, // run: scrub the child's stdout/stderr
@@ -373,15 +370,13 @@ const main = async (): Promise<number> => {
 	if (values.json) setJsonOutput(true);
 	if (values["passphrase-stdin"]) setPassphraseSource("stdin");
 
-	// Pre-resolve the `--<flag>-file` secret alternatives into `values` so the rest
-	// of the CLI reads them like an inline flag — but the secret comes off disk, not
-	// argv (which is world-readable via `ps` and lands in shell history). An inline
-	// flag, if also given, wins for backward compatibility.
+	// Secrets are only accepted from `--<flag>-file` (or env), never argv, which is
+	// world-readable via `ps` and lands in shell history. Resolve the files into
+	// `values` under the bare name so the rest of the CLI reads one place.
 	const vbag = values as Record<string, unknown>;
 	for (const flag of ["relay-token", "access-secret", "peer-token"]) {
 		const file = vbag[`${flag}-file`];
-		if (typeof file === "string" && vbag[flag] === undefined)
-			vbag[flag] = (await readFile(file, "utf8")).trim();
+		if (typeof file === "string") vbag[flag] = (await readFile(file, "utf8")).trim();
 	}
 	// `--with-key <mode>` is sugar over $VAULT_SYSTEMD_CREDS_KEY: it selects the
 	// systemd-creds binding used when a DUK is minted (`init --keychain`,
@@ -445,9 +440,7 @@ const main = async (): Promise<number> => {
 				if (!title) throw new Error("usage: vault get <title> [--field name]");
 				const item = getItem(s, title);
 				if (!item) throw new Error(`no item titled "${title}"`);
-				// `--field` is what HELP documents; `--name` is kept as an alias.
-				const field =
-					(values.field as string[] | undefined)?.at(-1) ?? (values.name as string | undefined);
+				const field = (values.field as string[] | undefined)?.at(-1);
 				if (field) {
 					const v = field === "password" ? item.passwords.join("\n") : item.fields[field];
 					if (v === undefined) throw new Error(`no field "${field}"`);
@@ -566,7 +559,7 @@ const main = async (): Promise<number> => {
 				const relay = (values.relay as string | undefined) ?? saved?.url;
 				if (!relay && !useTailnet)
 					throw new Error(
-						"usage: vault sync --relay <url> [--relay-token <t>] [--access-id <id> --access-secret <s>] [--tailnet]\n" +
+						"usage: vault sync --relay <url> [--relay-token-file <path>] [--access-id <id> --access-secret-file <path>] [--tailnet]\n" +
 							"(no relay saved from enrollment; pass --relay or --tailnet)",
 					);
 				const flags = relayAuth(values);
@@ -610,7 +603,8 @@ const main = async (): Promise<number> => {
 					legsAttempted++;
 					const port = Number(values.port ?? process.env.VAULT_PEER_PORT ?? DEFAULT_PEER_PORT);
 					const peerToken =
-						(values["peer-token"] as string | undefined) ?? process.env.VAULT_PEER_TOKEN;
+						((values as Record<string, unknown>)["peer-token"] as string | undefined) ??
+						process.env.VAULT_PEER_TOKEN;
 					// Optional allowlist (--peer name/ip, repeatable, or VAULT_PEER_ALLOW
 					// comma-separated): restrict which tailnet nodes receive the peer token.
 					const allow = [
@@ -619,7 +613,7 @@ const main = async (): Promise<number> => {
 					].filter(Boolean);
 					if (peerToken && allow.length === 0)
 						process.stderr.write(
-							"warning: presenting --peer-token to ALL online tailnet nodes; set --peer/VAULT_PEER_ALLOW to restrict\n",
+							"warning: presenting the peer token to ALL online tailnet nodes; set --peer/VAULT_PEER_ALLOW to restrict\n",
 						);
 					try {
 						const r = await syncTailnet(s, { port, auth: { token: peerToken }, allow });
@@ -665,7 +659,9 @@ const main = async (): Promise<number> => {
 			// wait briefly for a concurrent writer instead of failing on SQLITE_BUSY.
 			store.db.exec("PRAGMA busy_timeout = 5000;");
 			const port = Number(values.port ?? process.env.VAULT_PEER_PORT ?? DEFAULT_PEER_PORT);
-			const token = (values["peer-token"] as string | undefined) ?? process.env.VAULT_PEER_TOKEN;
+			const token =
+				((values as Record<string, unknown>)["peer-token"] as string | undefined) ??
+				process.env.VAULT_PEER_TOKEN;
 			// Bind to this device's tailnet IP by default so the server is reachable
 			// over the tailnet (the access gate, §7.3) and not the LAN/public iface.
 			let host = values.host as string | undefined;
@@ -684,7 +680,7 @@ const main = async (): Promise<number> => {
 			});
 			emit(
 				`vault peer server listening on ${host}:${port} (vault ${vaultId})\n` +
-					(token ? "" : "warning: no --peer-token set; open to the whole tailnet\n"),
+					(token ? "" : "warning: no peer token set; open to the whole tailnet\n"),
 				{ host, port, vaultId, gated: !!token },
 			);
 			// Block until signalled, then close the server and store cleanly. Guard
@@ -759,8 +755,8 @@ const main = async (): Promise<number> => {
 					relay: relayInfo(values),
 				});
 				emit(
-					`Verify SAS matches the new device: ${tokenB.sas}\n\nToken B (show as QR / paste into 'device-confirm --token'):\n\n${b64(tokenB)}\n`,
-					{ sas: tokenB.sas, tokenB: b64(tokenB) },
+					`Verify SAS matches the new device: ${enrollmentSas(s, tokenA.signPub)}\n\nToken B (show as QR / paste into 'device-confirm --token'):\n\n${b64(tokenB)}\n`,
+					{ sas: enrollmentSas(s, tokenA.signPub), tokenB: b64(tokenB) },
 				);
 			});
 			return 0;
@@ -800,12 +796,12 @@ const main = async (): Promise<number> => {
 			await withSession(values, async (s) => {
 				const invite = await readToken<InviteToken>(values);
 				const join: JoinToken = shareVault(s, invite, {
-					role: (values.role as JoinToken["role"]) ?? undefined,
+					role: (values.role as Role | undefined) ?? undefined,
 					relay: relayInfo(values),
 				});
 				emit(
-					`Verify SAS matches the joiner: ${join.sas}\n\nJoin Token (give back to the joiner for 'join --token'):\n\n${b64(join)}\n`,
-					{ sas: join.sas, joinToken: b64(join) },
+					`Verify SAS matches the joiner: ${enrollmentSas(s, invite.deviceSignPub)}\n\nJoin Token (give back to the joiner for 'join --token'):\n\n${b64(join)}\n`,
+					{ sas: enrollmentSas(s, invite.deviceSignPub), joinToken: b64(join) },
 				);
 			});
 			return 0;
@@ -857,7 +853,7 @@ const main = async (): Promise<number> => {
 				const orgKey = await readSecretFlag(values, "org-key", "VAULT_ORG_KEY");
 				if (!user || !orgKey)
 					throw new Error(
-						"usage: vault recover --user <id> (--org-key-file <path> | VAULT_ORG_KEY=… | --org-key <base64>)",
+						"usage: vault recover --user <id> (--org-key-file <path> | VAULT_ORG_KEY=…)",
 					);
 				const recovered = recoverUser(s, user, orgKey);
 				emit(

@@ -287,7 +287,7 @@ const signatureVerifiedRotations = (
 ): RotationRecord[] => loadRotations(store).filter((r) => rotationVerifiable(r, membership));
 
 // Ids of the rotation records we hold that verify. Advertised to a relay/peer as
-// "already have", so an unverifiable record stored by an older client can never
+// "already have", so an unverifiable record we hold can never
 // shadow the genuine one for its (epoch, deviceId) slot.
 export const verifiedRotationIds = (
 	s: Session,
@@ -462,7 +462,6 @@ export const init = async (
 		store.setMeta("vaultId", vaultId);
 		store.setMeta("userId", userId);
 		store.setMeta("deviceId", deviceId);
-		store.setMeta("role", "owner");
 		store.setMeta("kdfParams", JSON.stringify(kdfParams));
 		store.setMeta("userSignPub", userSign.publicKey.toString("base64"));
 		store.setMeta("userEncPub", userEnc.publicKey.toString("base64"));
@@ -903,15 +902,11 @@ export type RelayInfo = {
 export type TokenB = {
 	vaultId: string;
 	userId: string;
-	role: Role;
-	currentEpoch: number;
 	authLog: LogEntry[];
 	rotations: RotationRecord[];
 	epochGrants: Record<string, SealedGrant>; // keyCommit -> vault key sealed to new device
 	userPriv: SealedGrant; // {userSign,userEnc} sealed to new device
 	relay?: RelayInfo;
-	sas: string; // short authentication string for mutual verification
-	sasVersion?: number; // SAS_VERSION of the enroller; absent before v2
 };
 
 // `auth` on the new device: create local device keys, persist them sealed under
@@ -961,40 +956,24 @@ export const authNewDevice = async (store: Store, password: string): Promise<Tok
 // matching SAS means that entry was signed by the device the user is looking at:
 // a signing key can't be borrowed without its private half (unlike an
 // encryption key, which add-device never proves possession of).
-// Bumped whenever sasOf's inputs change. A token without the current version was
-// made by an older enroller whose displayed code is computed differently, so the
-// comparison would fail for reasons that look like an attack; refuse it with an
-// explanation instead.
-const SAS_VERSION = 2;
-const requireSasVersion = (v: number | undefined): void => {
-	if (v !== SAS_VERSION)
-		throw new Error(
-			"the enrolling device runs an older vault version whose verification code can't be " +
-				"checked by this one; update vault on that device and re-run the enrollment",
-		);
-};
-
 const sasOf = (a: Buffer, b: Buffer): string => {
 	const h = cr.sha256(Buffer.concat([a, b]));
 	const n = h.readUInt32BE(0) % 1_000_000;
 	return String(n).padStart(6, "0");
 };
 
+// The SAS this (enrolling/sharing) device shows for a new device, given the new
+// device's signing public key from Token A / the Invite Token.
+export const enrollmentSas = (s: Session, newDeviceSignPubB64: string): string =>
+	sasOf(s.pub.deviceSign, Buffer.from(newDeviceSignPubB64, "base64"));
+
 // `device-add` on an authorized device: seal grants, sign add-device, build Token B.
-export const deviceAdd = (
-	s: Session,
-	tokenA: TokenA,
-	opts: { role?: Role; relay?: RelayInfo } = {},
-): TokenB => {
+export const deviceAdd = (s: Session, tokenA: TokenA, opts: { relay?: RelayInfo } = {}): TokenB => {
 	const newEncPub = Buffer.from(tokenA.encPub, "base64");
-	const newSignPub = Buffer.from(tokenA.signPub, "base64");
 	const membership = replay(s.store.authLog(), s.vaultId);
 	const me = activeDeviceMember(membership, s.deviceId);
 	if (!me || me.userId !== s.userId)
 		throw new Error("this device is not authorized to enroll another");
-	// This unauthenticated transport field is retained solely so older tokens can
-	// still be decoded.  The recipient always derives its role from the signed log.
-	void opts.role;
 
 	// Append the signed add-device entry under this user's identity.
 	const chain = s.store.authLog();
@@ -1029,15 +1008,11 @@ export const deviceAdd = (
 	return {
 		vaultId: s.vaultId,
 		userId: s.userId,
-		role: me.role,
-		currentEpoch: s.currentEpoch,
 		authLog: s.store.authLog(),
 		rotations: loadRotations(s.store),
 		epochGrants,
 		userPriv,
 		relay: opts.relay,
-		sas: sasOf(s.pub.deviceSign, newSignPub),
-		sasVersion: SAS_VERSION,
 	};
 };
 
@@ -1050,7 +1025,6 @@ export const deviceConfirm = async (
 	keystore?: KeyStore,
 ): Promise<{ sas: string }> => {
 	if (store.getMeta("pending") !== "1") throw new Error("run `vault auth` first on this device");
-	requireSasVersion(tokenB.sasVersion);
 	const kdfParams = JSON.parse(requireMeta(store, "kdfParams")) as KdfParams;
 	const { accountKey } = await deriveKeys(password, kdfParams);
 	const deviceId = requireMeta(store, "deviceId");
@@ -1113,7 +1087,6 @@ export const deviceConfirm = async (
 	store.transaction(() => {
 		store.setMeta("vaultId", tokenB.vaultId);
 		store.setMeta("userId", tokenB.userId);
-		store.setMeta("role", ownerMember.role);
 		store.setMeta("userSignPub", ownerMember.signPub);
 		store.setMeta("userEncPub", ownerMember.encPub);
 		persistWrapMeta(store, wrapMeta);
@@ -1150,14 +1123,10 @@ export type InviteToken = {
 export type JoinToken = {
 	vaultId: string;
 	userId: string;
-	role: Role;
-	currentEpoch: number;
 	authLog: LogEntry[];
 	rotations: RotationRecord[];
 	epochGrants: Record<string, SealedGrant>; // keyCommit -> vault key sealed to joiner device
 	relay?: RelayInfo;
-	sas: string;
-	sasVersion?: number;
 };
 
 // `invite` on the joining person's device: create a fresh user identity + first
@@ -1249,14 +1218,10 @@ export const shareVault = (
 	return {
 		vaultId: s.vaultId,
 		userId: invite.userId,
-		role,
-		currentEpoch: s.currentEpoch,
 		authLog: s.store.authLog(),
 		rotations: loadRotations(s.store),
 		epochGrants,
 		relay: opts.relay,
-		sas: sasOf(s.pub.deviceSign, Buffer.from(invite.deviceSignPub, "base64")),
-		sasVersion: SAS_VERSION,
 	};
 };
 
@@ -1270,7 +1235,6 @@ export const joinConfirm = async (
 ): Promise<{ userId: string; sas: string }> => {
 	if (store.getMeta("pending") !== "invite")
 		throw new Error("run `vault invite` first on this device");
-	requireSasVersion(join.sasVersion);
 	const kdfParams = JSON.parse(requireMeta(store, "kdfParams")) as KdfParams;
 	const { accountKey } = await deriveKeys(password, kdfParams);
 	const userId = requireMeta(store, "userId");
@@ -1292,8 +1256,7 @@ export const joinConfirm = async (
 		throw new Error("auth log vault does not match the join token");
 	const me = membership.members.get(userId);
 	if (!me || !me.active) throw new Error("join token does not grant this user membership");
-	// `join.role` is transport metadata, not part of the signed enrollment
-	// ceremony.  The signed add-user record is the sole source of this role.
+	// Our role comes from the signed add-user entry.
 	if (me.signPub !== requireMeta(store, "userSignPub"))
 		throw new Error("join token does not grant this user membership");
 
@@ -1339,7 +1302,6 @@ export const joinConfirm = async (
 		store.appendAuthEntry(proof);
 		for (const r of join.rotations) store.putRotation(r.epoch, r.deviceId, JSON.stringify(r));
 		store.setMeta("vaultId", join.vaultId);
-		store.setMeta("role", me.role);
 		persistWrapMeta(store, wrapMeta);
 		store.setMeta("encPrivKeys", encPrivKeys);
 		store.setMeta("selfEpochGrants", JSON.stringify(join.epochGrants));

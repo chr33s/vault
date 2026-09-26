@@ -25,19 +25,16 @@ test("envelope hash + signature verify; tamper detected", () => {
 	const k = crypto.generateEd25519();
 	const op = mkOp("devA", 1, k.privateKey);
 	assert.ok(verifyEnvelope(op, k.publicKey));
-	assert.ok(verifyEnvelope(op)); // hash-only (relay path)
 	const tampered = { ...op, payload: Buffer.from("evil").toString("base64") };
-	assert.ok(!verifyEnvelope(tampered));
+	assert.ok(!verifyEnvelope(tampered, k.publicKey));
 });
 
 test("envelope: a valid hash signed by the wrong key fails signature verification", () => {
-	// The hash-only check passes (the bytes are internally consistent), but the
-	// signature must be rejected when checked against a different device's key —
-	// guards the relay-then-replica boundary where the op-author key is enforced.
+	// The bytes are internally consistent, but the signature must be rejected when
+	// checked against a different device's key.
 	const author = crypto.generateEd25519();
 	const impostor = crypto.generateEd25519();
 	const op = mkOp("devA", 1, author.privateKey);
-	assert.ok(verifyEnvelope(op)); // hash-only path accepts it
 	assert.ok(verifyEnvelope(op, author.publicKey)); // correct key accepts it
 	assert.ok(!verifyEnvelope(op, impostor.publicKey)); // wrong key rejects it
 });

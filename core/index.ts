@@ -8,4 +8,3 @@ export * from "./authlog.ts";
 export * from "./rotation.ts";
 export * from "./protocol.ts";
 export { Store } from "./store.ts";
-export type { StoreOptions } from "./store.ts";

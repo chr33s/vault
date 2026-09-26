@@ -97,7 +97,7 @@ test("two replicas converge through a direct peer server", async () => {
 
 		const store2 = new Store(join(dir, "d2.db"));
 		const tokenA = await authNewDevice(store2, PASS);
-		const tokenB = deviceAdd(s1, tokenA, { role: "admin" });
+		const tokenB = deviceAdd(s1, tokenA);
 		await deviceConfirm(store2, PASS, tokenB);
 
 		// Device 1 runs a peer server over its own replica (the §8.6 direct path).

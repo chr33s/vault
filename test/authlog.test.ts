@@ -57,6 +57,31 @@ const enroll = (
 	return { chain, deviceId };
 };
 
+type Signer = { chain: LogEntry[]; deviceId: string; priv: Buffer };
+
+// genesis + the owner's first (proven) device, which signs admin entries: user
+// identity keys can't (only a user's first add-device is user-signed).
+const ownerRoot = (owner: Identity, userId = "owner", vaultId = "v1"): Signer => {
+	const dev = id();
+	const chain = add([], genesis(owner, userId, vaultId), userId, "user", owner.sign.privateKey);
+	const e = enroll(chain, userId, dev, userId, "user", owner.sign.privateKey);
+	return { chain: e.chain, deviceId: e.deviceId, priv: dev.sign.privateKey };
+};
+
+// add-user signed by `by`'s device, then the new user's own first device.
+const addMember = (
+	chain: LogEntry[],
+	by: Signer,
+	uid: string,
+	who: Identity,
+	role: "admin" | "member" = "member",
+): Signer => {
+	chain = add(chain, userBody(uid, who, role), by.deviceId, "device", by.priv);
+	const dev = id();
+	const e = enroll(chain, uid, dev, uid, "user", who.sign.privateKey);
+	return { chain: e.chain, deviceId: e.deviceId, priv: dev.sign.privateKey };
+};
+
 const genesis = (owner: Identity, userId = "owner", vaultId = "v1"): EntryBody => ({
 	type: "genesis",
 	vaultId,
@@ -96,106 +121,77 @@ test("genesis + add-device + add-user replays into membership", () => {
 test("forged signature is skipped, not fatal", () => {
 	const owner = id();
 	const attacker = crypto.generateEd25519();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	// add-user signed by a non-owner key but claiming the owner as signer.
+	const o = ownerRoot(owner);
+	// add-user claiming the owner's device as signer, signed by another key.
 	const mallory = id();
 	const bad = makeEntry(
-		heads(chain),
+		heads(o.chain),
 		userBody("evil", mallory, "admin"),
-		"owner",
-		"user",
+		o.deviceId,
+		"device",
 		attacker.privateKey,
 	);
-	chain = [...chain, bad];
-	const m = replay(chain);
+	const m = replay([...o.chain, bad]);
 	assert.equal(m.members.size, 1, "forged entry must not take effect");
 	assert.equal(m.members.has("evil"), false);
 });
 
 test("unauthorized signer (non-admin) is skipped", () => {
 	const owner = id();
-	const mallory = id();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	// mallory isn't even a member; signing add-user must have no effect.
-	chain = [
-		...chain,
-		makeEntry(heads(chain), userBody("evil", mallory), "mallory", "user", mallory.sign.privateKey),
-	];
+	const o = ownerRoot(owner);
+	const member = addMember(o.chain, o, "m", id());
+	const chain = add(member.chain, userBody("evil", id()), member.deviceId, "device", member.priv);
 	assert.equal(replay(chain).members.has("evil"), false);
 });
 
-test("remove-user deactivates the member and clears devices", () => {
+test("user identity keys cannot sign admin entries", () => {
 	const owner = id();
-	const bob = id();
-	const bobDev = id();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	chain = add(chain, userBody("bob", bob), "owner", "user", owner.sign.privateKey);
-	const e = enroll(chain, "bob", bobDev, "bob", "user", bob.sign.privateKey);
-	chain = e.chain;
-	const bdev = e.deviceId;
-	assert.ok(deviceSignKey(replay(chain), bdev), "active before removal");
-	chain = add(
-		chain,
+	const o = ownerRoot(owner);
+	const chain = add(o.chain, userBody("x", id()), "owner", "user", owner.sign.privateKey);
+	assert.equal(replay(chain).members.has("x"), false);
+});
+
+test("remove-user deactivates the member and clears devices", () => {
+	const o = ownerRoot(id());
+	const bob = addMember(o.chain, o, "bob", id());
+	assert.ok(deviceSignKey(replay(bob.chain), bob.deviceId), "active before removal");
+	const chain = add(
+		bob.chain,
 		{ type: "remove-user", userId: "bob" },
-		"owner",
-		"user",
-		owner.sign.privateKey,
+		o.deviceId,
+		"device",
+		o.priv,
 	);
 	const m = replay(chain);
 	assert.equal(m.members.get("bob")!.active, false);
-	assert.equal(deviceSignKey(m, bdev), undefined);
+	assert.equal(deviceSignKey(m, bob.deviceId), undefined);
 	assert.equal(m.members.get("bob")!.devices.size, 0);
 });
 
 test("FORK: concurrent entries on the same parent reconcile deterministically", () => {
-	const owner = id();
-	const x = id();
-	const y = id();
-	let base: LogEntry[] = [];
-	base = add(base, genesis(owner), "owner", "user", owner.sign.privateKey);
-
-	// Two admins-of-one: owner makes two concurrent add-user entries that both
-	// reference the same head (a fork).
-	const parent = heads(base);
-	const e1 = makeEntry(parent, userBody("x", x), "owner", "user", owner.sign.privateKey);
-	const e2 = makeEntry(parent, userBody("y", y), "owner", "user", owner.sign.privateKey);
+	const o = ownerRoot(id());
+	// The owner makes two concurrent add-user entries on the same head (a fork).
+	const parent = heads(o.chain);
+	const e1 = makeEntry(parent, userBody("x", id()), o.deviceId, "device", o.priv);
+	const e2 = makeEntry(parent, userBody("y", id()), o.deviceId, "device", o.priv);
 	assert.deepEqual(e1.parents, e2.parents, "both fork from the same parent");
 
 	// Two replicas receive the fork in opposite orders; both must converge.
-	const replicaA = replay([...base, e1, e2]);
-	const replicaB = replay([...base, e2, e1]);
+	const replicaA = replay([...o.chain, e1, e2]);
+	const replicaB = replay([...o.chain, e2, e1]);
 	const keys = (m: ReturnType<typeof replay>) => [...m.members.keys()].sort();
 	assert.deepEqual(keys(replicaA), keys(replicaB));
 	assert.deepEqual(keys(replicaA), ["owner", "x", "y"], "both concurrent adds take effect");
 });
 
 test("FORK: concurrent removals of different members both take effect", () => {
-	const owner = id();
-	const x = id();
-	const y = id();
-	let base: LogEntry[] = [];
-	base = add(base, genesis(owner), "owner", "user", owner.sign.privateKey);
-	base = add(base, userBody("x", x), "owner", "user", owner.sign.privateKey);
-	base = add(base, userBody("y", y), "owner", "user", owner.sign.privateKey);
+	const o = ownerRoot(id());
+	let base = add(o.chain, userBody("x", id()), o.deviceId, "device", o.priv);
+	base = add(base, userBody("y", id()), o.deviceId, "device", o.priv);
 
 	const parent = heads(base);
-	const rmX = makeEntry(
-		parent,
-		{ type: "remove-user", userId: "x" },
-		"owner",
-		"user",
-		owner.sign.privateKey,
-	);
-	const rmY = makeEntry(
-		parent,
-		{ type: "remove-user", userId: "y" },
-		"owner",
-		"user",
-		owner.sign.privateKey,
-	);
+	const rmX = makeEntry(parent, { type: "remove-user", userId: "x" }, o.deviceId, "device", o.priv);
+	const rmY = makeEntry(parent, { type: "remove-user", userId: "y" }, o.deviceId, "device", o.priv);
 
 	const m = replay([...base, rmX, rmY]);
 	assert.equal(m.members.get("x")!.active, false);
@@ -207,33 +203,32 @@ test("FORK: concurrent removals of different members both take effect", () => {
 });
 
 test("tamper-evidence: mutating an ancestor orphans its descendants", () => {
-	const owner = id();
-	const dev = id();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	const e = enroll(chain, "owner", dev, "owner", "user", owner.sign.privateKey);
-	chain = e.chain;
-	assert.ok(deviceSignKey(replay(chain), e.deviceId), "active before tampering");
+	const o = ownerRoot(id());
+	assert.ok(deviceSignKey(replay(o.chain), o.deviceId), "active before tampering");
 	// Tamper the genesis body without re-signing. Its hash changes, so the
 	// add-device's parent reference dangles and its signature no longer matches.
-	const tampered = structuredClone(chain);
+	const tampered = structuredClone(o.chain);
 	(tampered[0]!.body as { vaultId: string }).vaultId = "evil";
-	assert.notEqual(entryHash(tampered[0]!), chain[0]!.hash);
+	assert.notEqual(entryHash(tampered[0]!), o.chain[0]!.hash);
 	const m = replay(tampered);
 	assert.equal(m.members.size, 0, "tampering destroys the derived membership");
-	assert.equal(deviceSignKey(m, e.deviceId), undefined);
+	assert.equal(deviceSignKey(m, o.deviceId), undefined);
 });
 
 test("an admin cannot overwrite an existing member (owner-lockout guard)", () => {
 	const owner = id();
-	const admin = id();
 	const attacker = id();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner, "owner"), "owner", "user", owner.sign.privateKey);
-	chain = add(chain, userBody("admin", admin, "admin"), "owner", "user", owner.sign.privateKey);
+	const o = ownerRoot(owner);
+	const admin = addMember(o.chain, o, "admin", id(), "admin");
 	// The admin signs an add-user reusing the owner's userId with attacker keys —
 	// an attempt to replace the owner's identity/role on every replica.
-	chain = add(chain, userBody("owner", attacker, "admin"), "admin", "user", admin.sign.privateKey);
+	const chain = add(
+		admin.chain,
+		userBody("owner", attacker, "admin"),
+		admin.deviceId,
+		"device",
+		admin.priv,
+	);
 
 	const m = replay(chain);
 	const ownerMember = m.members.get("owner")!;
@@ -246,34 +241,27 @@ test("an admin cannot overwrite an existing member (owner-lockout guard)", () =>
 });
 
 test("an admin cannot mint another owner via add-user", () => {
-	const owner = id();
-	const admin = id();
-	const mallory = id();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	chain = add(chain, userBody("admin", admin, "admin"), "owner", "user", owner.sign.privateKey);
-	chain = add(
-		chain,
-		{ ...userBody("mallory", mallory), role: "owner" } as EntryBody,
-		"admin",
-		"user",
-		admin.sign.privateKey,
+	const o = ownerRoot(id());
+	const admin = addMember(o.chain, o, "admin", id(), "admin");
+	const chain = add(
+		admin.chain,
+		{ ...userBody("mallory", id()), role: "owner" } as EntryBody,
+		admin.deviceId,
+		"device",
+		admin.priv,
 	);
 	assert.equal(replay(chain).members.has("mallory"), false, "owner-role add-user is rejected");
 });
 
 test("an admin cannot remove the owner", () => {
-	const owner = id();
-	const admin = id();
-	let chain: LogEntry[] = [];
-	chain = add(chain, genesis(owner), "owner", "user", owner.sign.privateKey);
-	chain = add(chain, userBody("admin", admin, "admin"), "owner", "user", owner.sign.privateKey);
-	chain = add(
-		chain,
+	const o = ownerRoot(id());
+	const admin = addMember(o.chain, o, "admin", id(), "admin");
+	const chain = add(
+		admin.chain,
 		{ type: "remove-user", userId: "owner" },
-		"admin",
-		"user",
-		admin.sign.privateKey,
+		admin.deviceId,
+		"device",
+		admin.priv,
 	);
 	assert.equal(replay(chain).members.get("owner")!.active, true, "owner stays active");
 });
