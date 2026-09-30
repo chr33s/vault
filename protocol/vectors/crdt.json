@@ -1,0 +1,875 @@
+{
+	"hlc": {
+		"hlcs": [
+			{
+				"millis": 1700000000000,
+				"counter": 0,
+				"deviceId": "aaaa"
+			},
+			{
+				"millis": 1700000000000,
+				"counter": 1,
+				"deviceId": "aaaa"
+			},
+			{
+				"millis": 1700000000000,
+				"counter": 1,
+				"deviceId": "bbbb"
+			},
+			{
+				"millis": 1700000000001,
+				"counter": 0,
+				"deviceId": "0000"
+			},
+			{
+				"millis": 5,
+				"counter": 999999,
+				"deviceId": "x:y"
+			}
+		],
+		"encoded": [
+			"001700000000000:000000:aaaa",
+			"001700000000000:000001:aaaa",
+			"001700000000000:000001:bbbb",
+			"001700000000001:000000:0000",
+			"000000000000005:999999:x:y"
+		],
+		"compare": [
+			{
+				"a": "001700000000000:000000:aaaa",
+				"b": "001700000000000:000000:aaaa",
+				"cmp": 0
+			},
+			{
+				"a": "001700000000000:000000:aaaa",
+				"b": "001700000000000:000001:aaaa",
+				"cmp": -1
+			},
+			{
+				"a": "001700000000000:000000:aaaa",
+				"b": "001700000000000:000001:bbbb",
+				"cmp": -1
+			},
+			{
+				"a": "001700000000000:000000:aaaa",
+				"b": "001700000000001:000000:0000",
+				"cmp": -1
+			},
+			{
+				"a": "001700000000000:000000:aaaa",
+				"b": "000000000000005:999999:x:y",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000000:000001:aaaa",
+				"b": "001700000000000:000000:aaaa",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000000:000001:aaaa",
+				"b": "001700000000000:000001:aaaa",
+				"cmp": 0
+			},
+			{
+				"a": "001700000000000:000001:aaaa",
+				"b": "001700000000000:000001:bbbb",
+				"cmp": -1
+			},
+			{
+				"a": "001700000000000:000001:aaaa",
+				"b": "001700000000001:000000:0000",
+				"cmp": -1
+			},
+			{
+				"a": "001700000000000:000001:aaaa",
+				"b": "000000000000005:999999:x:y",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000000:000001:bbbb",
+				"b": "001700000000000:000000:aaaa",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000000:000001:bbbb",
+				"b": "001700000000000:000001:aaaa",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000000:000001:bbbb",
+				"b": "001700000000000:000001:bbbb",
+				"cmp": 0
+			},
+			{
+				"a": "001700000000000:000001:bbbb",
+				"b": "001700000000001:000000:0000",
+				"cmp": -1
+			},
+			{
+				"a": "001700000000000:000001:bbbb",
+				"b": "000000000000005:999999:x:y",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000001:000000:0000",
+				"b": "001700000000000:000000:aaaa",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000001:000000:0000",
+				"b": "001700000000000:000001:aaaa",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000001:000000:0000",
+				"b": "001700000000000:000001:bbbb",
+				"cmp": 1
+			},
+			{
+				"a": "001700000000001:000000:0000",
+				"b": "001700000000001:000000:0000",
+				"cmp": 0
+			},
+			{
+				"a": "001700000000001:000000:0000",
+				"b": "000000000000005:999999:x:y",
+				"cmp": 1
+			},
+			{
+				"a": "000000000000005:999999:x:y",
+				"b": "001700000000000:000000:aaaa",
+				"cmp": -1
+			},
+			{
+				"a": "000000000000005:999999:x:y",
+				"b": "001700000000000:000001:aaaa",
+				"cmp": -1
+			},
+			{
+				"a": "000000000000005:999999:x:y",
+				"b": "001700000000000:000001:bbbb",
+				"cmp": -1
+			},
+			{
+				"a": "000000000000005:999999:x:y",
+				"b": "001700000000001:000000:0000",
+				"cmp": -1
+			},
+			{
+				"a": "000000000000005:999999:x:y",
+				"b": "000000000000005:999999:x:y",
+				"cmp": 0
+			}
+		],
+		"clockSteps": [
+			{
+				"kind": "tick",
+				"now": 1000,
+				"remote": null,
+				"result": "000000000001000:000000:dev"
+			},
+			{
+				"kind": "tick",
+				"now": 1000,
+				"remote": null,
+				"result": "000000000001000:000001:dev"
+			},
+			{
+				"kind": "tick",
+				"now": 999,
+				"remote": null,
+				"result": "000000000001000:000002:dev"
+			},
+			{
+				"kind": "tick",
+				"now": 1005,
+				"remote": null,
+				"result": "000000000001005:000000:dev"
+			},
+			{
+				"kind": "observe",
+				"now": 1005,
+				"remote": {
+					"millis": 1005,
+					"counter": 7,
+					"deviceId": "peer"
+				},
+				"result": "000000000001005:000008:dev"
+			},
+			{
+				"kind": "observe",
+				"now": 1006,
+				"remote": {
+					"millis": 900,
+					"counter": 3,
+					"deviceId": "peer"
+				},
+				"result": "000000000001006:000000:dev"
+			},
+			{
+				"kind": "observe",
+				"now": 1006,
+				"remote": {
+					"millis": 2000,
+					"counter": 3,
+					"deviceId": "peer"
+				},
+				"result": "000000000002000:000004:dev"
+			},
+			{
+				"kind": "tick",
+				"now": 1500,
+				"remote": null,
+				"result": "000000000002000:000005:dev"
+			}
+		]
+	},
+	"ops": [
+		{
+			"itemId": "item-a",
+			"field": "url",
+			"value": null,
+			"hlc": "001700000000001:000000:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-1",
+			"hlc": "001700000000004:000000:d2",
+			"replaces": []
+		},
+		{
+			"itemId": "item-c",
+			"field": "__type__",
+			"value": "identity",
+			"hlc": "001700000000004:000000:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "__deleted__",
+			"value": "1",
+			"hlc": "001700000000004:000001:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "url",
+			"value": null,
+			"hlc": "001700000000004:000001:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t5",
+			"hlc": "001700000000004:000002:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n5",
+			"hlc": "001700000000004:000003:d2"
+		},
+		{
+			"itemId": "item-b",
+			"field": "__deleted__",
+			"value": "1",
+			"hlc": "001700000000004:000002:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t7",
+			"hlc": "001700000000004:000004:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n7",
+			"hlc": "001700000000004:000005:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t8",
+			"hlc": "001700000000004:000006:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n8",
+			"hlc": "001700000000004:000007:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-9",
+			"hlc": "001700000000004:000008:d2",
+			"replaces": [
+				"001700000000004:000000:d2"
+			]
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t10",
+			"hlc": "001700000000004:000003:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n10",
+			"hlc": "001700000000004:000004:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-11",
+			"hlc": "001700000000004:000000:d1",
+			"replaces": [
+				"001700000000004:000008:d2"
+			]
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t12",
+			"hlc": "001700000000004:000005:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n12",
+			"hlc": "001700000000004:000006:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t13",
+			"hlc": "001700000000004:000001:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n13",
+			"hlc": "001700000000004:000002:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t14",
+			"hlc": "001700000000004:000007:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n14",
+			"hlc": "001700000000004:000008:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-15",
+			"hlc": "001700000000004:000009:d2",
+			"replaces": []
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-16",
+			"hlc": "001700000000004:000010:d2",
+			"replaces": []
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t17",
+			"hlc": "001700000000004:000009:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n17",
+			"hlc": "001700000000004:000010:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t18",
+			"hlc": "001700000000004:000003:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n18",
+			"hlc": "001700000000004:000004:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "__deleted__",
+			"value": "1",
+			"hlc": "001700000000004:000011:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t20",
+			"hlc": "001700000000004:000012:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n20",
+			"hlc": "001700000000004:000013:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t21",
+			"hlc": "001700000000004:000005:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n21",
+			"hlc": "001700000000004:000006:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "password",
+			"value": "pw-22",
+			"hlc": "001700000000004:000007:d1",
+			"replaces": []
+		},
+		{
+			"itemId": "item-b",
+			"field": "__type__",
+			"value": "note",
+			"hlc": "001700000000004:000011:d2"
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t24",
+			"hlc": "001700000000004:000014:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n24",
+			"hlc": "001700000000004:000015:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "password",
+			"value": "pw-25",
+			"hlc": "001700000000004:000012:d2",
+			"replaces": []
+		},
+		{
+			"itemId": "item-c",
+			"field": "__deleted__",
+			"value": "1",
+			"hlc": "001700000000004:000013:d2"
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t27",
+			"hlc": "001700000000004:000014:d2"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n27",
+			"hlc": "001700000000004:000015:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "url",
+			"value": null,
+			"hlc": "001700000000004:000016:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "__type__",
+			"value": "identity",
+			"hlc": "001700000000004:000008:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "password",
+			"value": "pw-30",
+			"hlc": "001700000000004:000009:d1",
+			"replaces": []
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t31",
+			"hlc": "001700000000004:000016:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n31",
+			"hlc": "001700000000004:000017:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t32",
+			"hlc": "001700000000004:000017:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n32",
+			"hlc": "001700000000004:000018:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t33",
+			"hlc": "001700000000004:000019:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n33",
+			"hlc": "001700000000004:000020:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "password",
+			"value": "pw-34",
+			"hlc": "001700000000004:000018:d2",
+			"replaces": []
+		},
+		{
+			"itemId": "item-b",
+			"field": "password",
+			"value": "pw-35",
+			"hlc": "001700000000004:000021:d3",
+			"replaces": []
+		},
+		{
+			"itemId": "item-b",
+			"field": "url",
+			"value": null,
+			"hlc": "001700000000004:000010:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-37",
+			"hlc": "001700000000004:000011:d1",
+			"replaces": [
+				"001700000000004:000000:d1",
+				"001700000000004:000009:d2",
+				"001700000000004:000010:d2"
+			]
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t38",
+			"hlc": "001700000000004:000019:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n38",
+			"hlc": "001700000000004:000020:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t39",
+			"hlc": "001700000000004:000022:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n39",
+			"hlc": "001700000000004:000023:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "url",
+			"value": null,
+			"hlc": "001700000000004:000021:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "__deleted__",
+			"value": "1",
+			"hlc": "001700000000004:000012:d1"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t42",
+			"hlc": "001700000000004:000022:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n42",
+			"hlc": "001700000000004:000023:d2"
+		},
+		{
+			"itemId": "item-b",
+			"field": "password",
+			"value": "pw-43",
+			"hlc": "001700000000004:000024:d3",
+			"replaces": []
+		},
+		{
+			"itemId": "item-c",
+			"field": "password",
+			"value": "pw-44",
+			"hlc": "001700000000004:000025:d3",
+			"replaces": []
+		},
+		{
+			"itemId": "item-c",
+			"field": "password",
+			"value": "pw-45",
+			"hlc": "001700000000004:000026:d3",
+			"replaces": []
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-46",
+			"hlc": "001700000000004:000027:d3",
+			"replaces": [
+				"001700000000004:000011:d1"
+			]
+		},
+		{
+			"itemId": "item-b",
+			"field": "title",
+			"value": "t47",
+			"hlc": "001700000000004:000013:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "notes",
+			"value": "n47",
+			"hlc": "001700000000004:000014:d1"
+		},
+		{
+			"itemId": "item-b",
+			"field": "url",
+			"value": null,
+			"hlc": "001700000000004:000015:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t49",
+			"hlc": "001700000000004:000016:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n49",
+			"hlc": "001700000000004:000017:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t50",
+			"hlc": "001700000000004:000018:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n50",
+			"hlc": "001700000000004:000019:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "title",
+			"value": "t51",
+			"hlc": "001700000000004:000028:d3"
+		},
+		{
+			"itemId": "item-a",
+			"field": "notes",
+			"value": "n51",
+			"hlc": "001700000000004:000029:d3"
+		},
+		{
+			"itemId": "item-c",
+			"field": "title",
+			"value": "t52",
+			"hlc": "001700000000004:000024:d2"
+		},
+		{
+			"itemId": "item-c",
+			"field": "notes",
+			"value": "n52",
+			"hlc": "001700000000004:000025:d2"
+		},
+		{
+			"itemId": "item-a",
+			"field": "__type__",
+			"value": "card",
+			"hlc": "001700000000004:000030:d3"
+		},
+		{
+			"itemId": "item-b",
+			"field": "__deleted__",
+			"value": "1",
+			"hlc": "001700000000004:000020:d1"
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-55",
+			"hlc": "001700000000004:000031:d3",
+			"replaces": [
+				"001700000000004:000027:d3"
+			]
+		},
+		{
+			"itemId": "item-b",
+			"field": "password",
+			"value": "pw-56",
+			"hlc": "001700000000004:000032:d3",
+			"replaces": [
+				"001700000000004:000007:d1",
+				"001700000000004:000009:d1",
+				"001700000000004:000018:d2",
+				"001700000000004:000021:d3",
+				"001700000000004:000024:d3"
+			]
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-57",
+			"hlc": "001700000000004:000033:d3",
+			"replaces": []
+		},
+		{
+			"itemId": "item-a",
+			"field": "password",
+			"value": "pw-58",
+			"hlc": "001700000000004:000034:d3",
+			"replaces": []
+		},
+		{
+			"itemId": "item-c",
+			"field": "password",
+			"value": "pw-59",
+			"hlc": "001700000000004:000021:d1",
+			"replaces": [
+				"001700000000004:000012:d2",
+				"001700000000004:000025:d3",
+				"001700000000004:000026:d3"
+			]
+		},
+		{
+			"itemId": "item-eq",
+			"field": "password",
+			"value": "aaa",
+			"hlc": "000001700000000000:000000:dz"
+		},
+		{
+			"itemId": "item-eq",
+			"field": "password",
+			"value": "bbb",
+			"hlc": "000001700000000000:000000:dz"
+		}
+	],
+	"list": [
+		{
+			"itemId": "item-eq",
+			"itemType": "login",
+			"fields": {},
+			"passwords": [
+				"bbb"
+			],
+			"deleted": false,
+			"lastHlc": "000001700000000000:000000:dz"
+		}
+	],
+	"materialized": [
+		{
+			"itemId": "item-a",
+			"itemType": "card",
+			"fields": {
+				"notes": "n51",
+				"title": "t51"
+			},
+			"passwords": [
+				"pw-55",
+				"pw-57",
+				"pw-58"
+			],
+			"deleted": true,
+			"lastHlc": "001700000000004:000034:d3"
+		},
+		{
+			"itemId": "item-b",
+			"itemType": "note",
+			"fields": {
+				"notes": "n24",
+				"title": "t24"
+			},
+			"passwords": [
+				"pw-56"
+			],
+			"deleted": true,
+			"lastHlc": "001700000000004:000032:d3"
+		},
+		{
+			"itemId": "item-c",
+			"itemType": "identity",
+			"fields": {
+				"notes": "n52",
+				"title": "t52"
+			},
+			"passwords": [
+				"pw-59"
+			],
+			"deleted": true,
+			"lastHlc": "001700000000004:000026:d3"
+		},
+		{
+			"itemId": "item-eq",
+			"itemType": "login",
+			"fields": {},
+			"passwords": [
+				"bbb"
+			],
+			"deleted": false,
+			"lastHlc": "000001700000000000:000000:dz"
+		}
+	],
+	"livePasswordHlcs": {
+		"item-a": [
+			"001700000000004:000031:d3",
+			"001700000000004:000033:d3",
+			"001700000000004:000034:d3"
+		],
+		"item-b": [
+			"001700000000004:000032:d3"
+		],
+		"item-c": [
+			"001700000000004:000021:d1"
+		],
+		"item-eq": [
+			"000001700000000000:000000:dz"
+		]
+	},
+	"opJson": [
+		"{\"itemId\":\"item-a\",\"field\":\"url\",\"value\":null,\"hlc\":\"001700000000001:000000:d1\"}",
+		"{\"itemId\":\"item-a\",\"field\":\"password\",\"value\":\"pw-1\",\"hlc\":\"001700000000004:000000:d2\",\"replaces\":[]}",
+		"{\"itemId\":\"item-c\",\"field\":\"__type__\",\"value\":\"identity\",\"hlc\":\"001700000000004:000000:d3\"}",
+		"{\"itemId\":\"item-a\",\"field\":\"__deleted__\",\"value\":\"1\",\"hlc\":\"001700000000004:000001:d2\"}",
+		"{\"itemId\":\"item-c\",\"field\":\"url\",\"value\":null,\"hlc\":\"001700000000004:000001:d3\"}"
+	]
+}

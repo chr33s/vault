@@ -2,27 +2,17 @@
 	"name": "vault",
 	"version": "0.3.1",
 	"private": true,
-	"description": "End-to-end encrypted, local-first credential vault. Zero runtime dependencies.",
-	"bin": {
-		"vault": "cli/main.ts"
-	},
+	"description": "Cloudflare relay Worker for the vault (TypeScript). The local client, CLI, macOS app and self-hosted relay are Swift (swift/).",
 	"type": "module",
 	"scripts": {
 		"check": "oxlint --type-aware --type-check . && oxfmt --check .",
-		"check:deps": "node build/check-deps.ts",
+		"check:deps": "node worker/scripts/check-deps.ts",
 		"fix": "oxfmt --write . && oxlint --type-aware --type-check --fix",
-		"cli": "node cli/main.ts",
-		"relay": "node relay/main.ts",
-		"dev": "node --watch cli/main.ts",
-		"test": "node --test test/*.test.ts",
-		"test:sea": "node --test test/sea.test.ts",
-		"typecheck": "tsc --noEmit",
-		"bundle": "node build/bundle.ts",
-		"build:sea": "bash build/make-sea.sh"
+		"test": "node --test worker/test/*.test.ts",
+		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
 		"@types/node": "26.6.3",
-		"esbuild": "0.28.2",
 		"oxfmt": "0.70.0",
 		"oxlint": "1.85.0",
 		"oxlint-tsgolint": "7.0.2003",
@@ -30,8 +20,5 @@
 	},
 	"engines": {
 		"node": "26.10.0"
-	},
-	"allowScripts": {
-		"esbuild@0.28.2": true
 	}
 }

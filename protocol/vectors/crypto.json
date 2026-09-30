@@ -1,0 +1,395 @@
+{
+	"sha256": [
+		{
+			"input": "",
+			"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		},
+		{
+			"input": "abc",
+			"sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+		},
+		{
+			"input": "vault",
+			"sha256": "e6f0a1fbb43c89196dcfcbef85908f19ab4c5f7cc4f4c452284697757683d7ef"
+		},
+		{
+			"input": "é中😀",
+			"sha256": "aabae3418ff6346303d27c710ec789e76a3d57634026fc011ac96be24144615a"
+		}
+	],
+	"x25519": {
+		"aPriv": "sjEdB6xGsmcwuYTGzN8x7ihJkQ+Mwq/F8h64Pj0apxg=",
+		"aPub": "NJjydpdb9mbrKdpj46b/ZdNoauaoD3QQXv2108IshSw=",
+		"bPriv": "v9oHu7V221t7tvfTqY4zflcPPcJlBkhrJ+1jTcbs7ak=",
+		"bPub": "iW6zRLwvtANXu2zCnrRpzBn6RG0/9SzzZ6HNyxMyvC4=",
+		"shared": "ayxb9HHZ6067sArj/43Ah4wbPgt/4HquykcnsXwUfnE="
+	},
+	"ed25519": [
+		{
+			"seed": "pcZyV+QyJpB/LSlHD6Oq+tYpMTabZfgMJcroJk6JGus=",
+			"pub": "DttO5Y6v4er8cueyoGZbWGFBsybpzjhL36/NvTHt5Os=",
+			"msg": "",
+			"sig": "UFKOGTRswekyrZRIp3SqO13bWGO+SQqlapdrhrq5Hjc4EFB6bXtUJAqnPqmJSq+mCn1udmKxBrIclULRJEFZAg=="
+		},
+		{
+			"seed": "pcZyV+QyJpB/LSlHD6Oq+tYpMTabZfgMJcroJk6JGus=",
+			"pub": "DttO5Y6v4er8cueyoGZbWGFBsybpzjhL36/NvTHt5Os=",
+			"msg": "aGVsbG8=",
+			"sig": "i28hn89dArokKIFcN8uyGXJnlXQQpx1pCatIqJIdMGa5Qipj8s4hxYEqqx9cofJcA+t+bhl3ieiC4CoHt7lECg=="
+		},
+		{
+			"seed": "pcZyV+QyJpB/LSlHD6Oq+tYpMTabZfgMJcroJk6JGus=",
+			"pub": "DttO5Y6v4er8cueyoGZbWGFBsybpzjhL36/NvTHt5Os=",
+			"msg": "YXV0aC1lbnRyeSDDqQ==",
+			"sig": "Ii2D1hXsUyJQrs7Y2OjMnnbbZfJxO4Wl8P5+rGWQUdHZgd/MvNit9U34vaoQl+eEfRKvahah6xhHX7psAoj/Dw=="
+		}
+	],
+	"hkdf": [
+		{
+			"ikm": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+			"salt": "000102030405060708090a0b0c",
+			"info": "f0f1f2f3f4f5f6f7f8f9",
+			"len": 42,
+			"okm": "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+			"infoEncoding": "hex"
+		},
+		{
+			"ikm": "0000000000000000000000000000000000000000000000000000000000000000",
+			"salt": "",
+			"info": "credvault/kdf/account-key/v1",
+			"len": 32,
+			"okm": "9500301bb58afd85acbd3ab7809113b6c5a8cca90fe41d69c5a54be20af46d53",
+			"infoEncoding": "utf8"
+		}
+	],
+	"aead": [
+		{
+			"key": "oZfVM3rHSo9fevCLGJwlmkwSSGSoRvO/UlKbrntt7tI=",
+			"iv": "cl08KneaF+FHzcmY",
+			"aad": null,
+			"pt": "c2VjcmV0IHBheWxvYWQ=",
+			"ct": "i5Z2pHie8s8ubh/tuYU=",
+			"tag": "0P9Zjuy3ilfnJ3vT7ZLZHQ=="
+		},
+		{
+			"key": "oZfVM3rHSo9fevCLGJwlmkwSSGSoRvO/UlKbrntt7tI=",
+			"iv": "ogqvxDhTfGCBnGL3",
+			"aad": "Ym91bmQtY29udGV4dA==",
+			"pt": "",
+			"ct": "",
+			"tag": "T8p5Aaz9WQ/SnxO6kvjoJg=="
+		},
+		{
+			"key": "oZfVM3rHSo9fevCLGJwlmkwSSGSoRvO/UlKbrntt7tI=",
+			"iv": "c8m+Ru8WERrmEPkh",
+			"aad": "Ym91bmQtY29udGV4dA==",
+			"pt": "dW5pY29kZSDDqeS4rQ==",
+			"ct": "HrrsrDB+P0lkFtq0wA==",
+			"tag": "IRN0MlOUjgPbXJMgeIBCQg=="
+		}
+	],
+	"sealed": [
+		{
+			"recipientPriv": "4y79PRc09hGs+1VxeglBqs+nMcv0t5mQFys7/7Fakig=",
+			"recipientPub": "N8NTdg9hkNOOUbyTbbv+YEobQOqI/5YmxehnjbQfFXA=",
+			"plaintext": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+			"box": {
+				"ephPub": "+gx8bXPQkLedq3bUJLKDkSVzVfH9mMpe7bwPBvsjDxQ=",
+				"iv": "dkKfg18NQjL5JEoR",
+				"ct": "DyZj4gPX29Mk3imbLRTkbGsHHJ/+7AUcKEkxedcoyX4=",
+				"tag": "T7n+WhbKhlsMGfKZmpYNKQ=="
+			}
+		},
+		{
+			"recipientPriv": "4y79PRc09hGs+1VxeglBqs+nMcv0t5mQFys7/7Fakig=",
+			"recipientPub": "N8NTdg9hkNOOUbyTbbv+YEobQOqI/5YmxehnjbQfFXA=",
+			"plaintext": "YW5vdGhlciBwYXlsb2Fk",
+			"box": {
+				"ephPub": "vAXje33PFDda2xdoAzFqDEj+0rfB8lnyrh4ZNu2UBhg=",
+				"iv": "ZxSErNcmMDf9PQxY",
+				"ct": "MOQj8ej+5GctJrwXiINY",
+				"tag": "RG/Ls4AYT1adNdL8DmNO/g=="
+			}
+		}
+	],
+	"kdf": [
+		{
+			"password": "correct horse battery staple é",
+			"params": {
+				"algo": "argon2id",
+				"salt": "MDEyMzQ1Njc4OWFiY2RlZg==",
+				"memory": 64,
+				"passes": 2,
+				"parallelism": 1
+			},
+			"accountKey": "Sug5Gya9Rw+76YUZUxy/11wU0xV1AyJ1K8Gdljvo7hA=",
+			"authVerifier": "5/ZExVpD5ZTTK1X85NBg6AdN0ftLF8Rir09Q8eV1E9M="
+		},
+		{
+			"password": "correct horse battery staple é",
+			"params": {
+				"algo": "argon2id",
+				"salt": "ZmVkY2JhOTg3NjU0MzIxMA==",
+				"memory": 256,
+				"passes": 3,
+				"parallelism": 2
+			},
+			"accountKey": "ML7HGSIzIIIO2+KkjfEQ0vsVfs0B2qbdVp64cqxtg5I=",
+			"authVerifier": "3bLzeLgtqbzteY76l76cJ4s1i2NKFSb5g895zBgBhJU="
+		},
+		{
+			"password": "correct horse battery staple é",
+			"params": {
+				"algo": "argon2id",
+				"salt": "MDEyMzQ1Njc4OWFiY2RlZg==",
+				"memory": 4096,
+				"passes": 1,
+				"parallelism": 1
+			},
+			"accountKey": "zGnV532NurwrFpFAZB4sRKzhc+7+veuNyNyIqaSc6uw=",
+			"authVerifier": "1HUcatYvuB7hlIzYBQLA5u+ZjhDVIIc6b579WMiTsbk="
+		},
+		{
+			"password": "correct horse battery staple é",
+			"params": {
+				"algo": "scrypt",
+				"salt": "MDEyMzQ1Njc4OWFiY2RlZg==",
+				"N": 1024,
+				"r": 8,
+				"p": 1,
+				"length": 32
+			},
+			"accountKey": "f34mgkENqtWP/gHu9AFH7zKb/ohgCkgT2gC+82BH7Fc=",
+			"authVerifier": "cNWvrEiQBCd5zKCdj5OEQG93Ybtt4frMxSqHcqFCbLw="
+		},
+		{
+			"password": "correct horse battery staple é",
+			"params": {
+				"algo": "scrypt",
+				"salt": "ZmVkY2JhOTg3NjU0MzIxMA==",
+				"N": 16384,
+				"r": 8,
+				"p": 2,
+				"length": 32
+			},
+			"accountKey": "GbMWbLjTA9mw1Ch9BBt9IQMrGTRZzO8PxnF7B7U2ot4=",
+			"authVerifier": "9maizCL7I1Px85wDUvIpj+Q5YIRWQjLUO+ecxLov920="
+		}
+	],
+	"totp": [
+		{
+			"value": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"atMs": 59000,
+			"result": {
+				"code": "287082",
+				"expiresInSec": 1,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====&algorithm=SHA256&digits=8",
+			"atMs": 59000,
+			"result": {
+				"code": "46119246",
+				"expiresInSec": 1,
+				"period": 30,
+				"digits": 8,
+				"algorithm": "sha256"
+			}
+		},
+		{
+			"value": "otpauth://totp/Ex:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60&digits=7&issuer=Ex",
+			"atMs": 59000,
+			"result": {
+				"code": "4755224",
+				"expiresInSec": 1,
+				"period": 60,
+				"digits": 7,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"atMs": 1111111109000,
+			"result": {
+				"code": "081804",
+				"expiresInSec": 1,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====&algorithm=SHA256&digits=8",
+			"atMs": 1111111109000,
+			"result": {
+				"code": "68084774",
+				"expiresInSec": 1,
+				"period": 30,
+				"digits": 8,
+				"algorithm": "sha256"
+			}
+		},
+		{
+			"value": "otpauth://totp/Ex:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60&digits=7&issuer=Ex",
+			"atMs": 1111111109000,
+			"result": {
+				"code": "9360094",
+				"expiresInSec": 31,
+				"period": 60,
+				"digits": 7,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"atMs": 1111111111000,
+			"result": {
+				"code": "050471",
+				"expiresInSec": 29,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====&algorithm=SHA256&digits=8",
+			"atMs": 1111111111000,
+			"result": {
+				"code": "67062674",
+				"expiresInSec": 29,
+				"period": 30,
+				"digits": 8,
+				"algorithm": "sha256"
+			}
+		},
+		{
+			"value": "otpauth://totp/Ex:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60&digits=7&issuer=Ex",
+			"atMs": 1111111111000,
+			"result": {
+				"code": "9360094",
+				"expiresInSec": 29,
+				"period": 60,
+				"digits": 7,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"atMs": 1234567890000,
+			"result": {
+				"code": "005924",
+				"expiresInSec": 30,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====&algorithm=SHA256&digits=8",
+			"atMs": 1234567890000,
+			"result": {
+				"code": "91819424",
+				"expiresInSec": 30,
+				"period": 30,
+				"digits": 8,
+				"algorithm": "sha256"
+			}
+		},
+		{
+			"value": "otpauth://totp/Ex:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60&digits=7&issuer=Ex",
+			"atMs": 1234567890000,
+			"result": {
+				"code": "5713351",
+				"expiresInSec": 30,
+				"period": 60,
+				"digits": 7,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"atMs": 2000000000000,
+			"result": {
+				"code": "279037",
+				"expiresInSec": 10,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====&algorithm=SHA256&digits=8",
+			"atMs": 2000000000000,
+			"result": {
+				"code": "90698825",
+				"expiresInSec": 10,
+				"period": 30,
+				"digits": 8,
+				"algorithm": "sha256"
+			}
+		},
+		{
+			"value": "otpauth://totp/Ex:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60&digits=7&issuer=Ex",
+			"atMs": 2000000000000,
+			"result": {
+				"code": "6864010",
+				"expiresInSec": 40,
+				"period": 60,
+				"digits": 7,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+			"atMs": 20000000000000,
+			"result": {
+				"code": "353130",
+				"expiresInSec": 10,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====&algorithm=SHA256&digits=8",
+			"atMs": 20000000000000,
+			"result": {
+				"code": "77737706",
+				"expiresInSec": 10,
+				"period": 30,
+				"digits": 8,
+				"algorithm": "sha256"
+			}
+		},
+		{
+			"value": "otpauth://totp/Ex:me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60&digits=7&issuer=Ex",
+			"atMs": 20000000000000,
+			"result": {
+				"code": "2948864",
+				"expiresInSec": 40,
+				"period": 60,
+				"digits": 7,
+				"algorithm": "sha1"
+			}
+		},
+		{
+			"value": "jbsw y3dp ehpk 3pxp",
+			"atMs": 1700000000000,
+			"result": {
+				"code": "324550",
+				"expiresInSec": 10,
+				"period": 30,
+				"digits": 6,
+				"algorithm": "sha1"
+			}
+		}
+	],
+	"hello": {
+		"name": "vault-abc123",
+		"duk": "Ifjhb5Mbfn2TY0CQcu3l+fZO7BNmK/MPNDm8Oi9IF7M=",
+		"blob": "VkhXMT86k3KKJjteUD3W0Ep9M601hLk06TsmDoJQw9TCY3dUK2BujyUvLpKILFgKxS5o1WbjrFHKR4JTpa5qAixHnLQ3tgz9JXgGeWyYo7Bz0v0GU7atX8jZQTb+hUeK"
+	}
+}

@@ -1,6 +1,5 @@
 node_modules/
 dist/
-build/.sea-node/
 *.db
 *.db-wal
 *.db-shm
@@ -9,11 +8,18 @@ build/.sea-node/
 relay.db*
 .env.local
 .build/
-native/**/.build/
-native/**/*.app
-native/build/
-native/.swiftpm
+macos/*.app
+macos/build/
+windows/hello-helper/bin/
+windows/hello-helper/obj/
 
 ## Xcode user-specific
 xcuserdata/
 *.xcuserstate
+
+## Swift package (swift/)
+swift/.swiftpm
+
+## Golden vector fixtures are checked in
+!protocol/vectors/store/*.db
+macos/vault.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/

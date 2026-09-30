@@ -18,5 +18,5 @@
 
 		"erasableSyntaxOnly": true
 	},
-	"include": ["core/**/*.ts", "cli/**/*.ts", "relay/**/*.ts", "test/**/*.ts", "build/**/*.ts"]
+	"include": ["worker/**/*.ts"]
 }

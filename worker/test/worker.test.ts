@@ -1,0 +1,563 @@
+// Exercises the serverless relay's logic without Wrangler/Miniflare: the shared
+// handler over a fake DO-SQL storage. With nodejs_compat, the Worker reuses the
+// Worker's crypto/auth code (core/protocol verifyEnvelope, access
+// authorizeHeaders), so this drives those exact paths and checks the serverless
+// placement against the protocol the Swift relay implements.
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { authorizeHeaders } from "../src/access.ts";
+import {
+	admissible,
+	makeEntry,
+	heads,
+	entryHash,
+	validRootGenesis,
+	replay,
+	deviceSignKey,
+	type EntryBody,
+	type LogEntry,
+	deviceIdOf,
+} from "../src/core/authlog.ts";
+import * as cr from "../src/core/crypto.ts";
+import { grantAuthentic, grantBytes, makeEnvelope } from "../src/core/protocol.ts";
+import { verifyEnvelope } from "../src/core/protocol.ts";
+import { handle, type RelayStorage } from "../src/handler.ts";
+import worker from "../src/worker.ts";
+
+// A tiny in-memory RelayStorage standing in for the Durable Object SQLite.
+const memStore = (): RelayStorage => {
+	const ops = new Map<string, Map<string, import("../src/core/protocol.ts").OpEnvelope>>();
+	const auth = new Map<string, Map<string, import("../src/core/authlog.ts").LogEntry>>();
+	const rots = new Map<string, Map<string, import("../src/core/rotation.ts").RotationRecord>>();
+	const grants = new Map<string, import("../src/core/protocol.ts").GrantRow[]>();
+	const roots = new Map<string, string>();
+	const m = <V>(map: Map<string, Map<string, V>>, t: string) => {
+		let x = map.get(t);
+		if (!x) map.set(t, (x = new Map()));
+		return x;
+	};
+	const m_ops = (t: string) => m(ops, t);
+	return {
+		putOp(t, op) {
+			const o = m(ops, t);
+			if (o.has(op.hash)) return false;
+			o.set(op.hash, op);
+			return true;
+		},
+		allOps(t) {
+			return [...m(ops, t).values()].sort((a, b) =>
+				a.deviceId + a.seq < b.deviceId + b.seq ? -1 : 1,
+			);
+		},
+		opsSince(t, v) {
+			return [...m_ops(t).values()].filter((op) => op.seq > (v[op.deviceId] ?? 0));
+		},
+		maxSeq(t, d) {
+			let m = 0;
+			for (const op of m_ops(t).values()) if (op.deviceId === d) m = Math.max(m, op.seq);
+			return m;
+		},
+		authLacking(t, hashes) {
+			return hashes.filter((h) => !m(auth, t).has(h));
+		},
+		rotationsLacking(t, ids) {
+			return ids.filter((id) => !m(rots, t).has(id));
+		},
+		vector(t) {
+			const v: Record<string, number> = {};
+			for (const op of m(ops, t).values()) v[op.deviceId] = Math.max(v[op.deviceId] ?? 0, op.seq);
+			return v;
+		},
+		putAuth(t, e) {
+			m(auth, t).set(entryHash(e), e);
+		},
+		pinGenesis(t, entry) {
+			if (!validRootGenesis(entry, t)) return false;
+			const hash = entryHash(entry);
+			const pinned = roots.get(t);
+			if (pinned) return pinned === hash;
+			roots.set(t, hash);
+			return true;
+		},
+		authExcept(t, have) {
+			const seen = new Set(have);
+			return [...m(auth, t).values()].filter((entry) => {
+				const hash = entryHash(entry);
+				if (seen.has(hash)) return false;
+				seen.add(hash);
+				return true;
+			});
+		},
+		putRotation(t, r) {
+			m(rots, t).set(`${r.epoch}:${r.deviceId}`, r);
+		},
+		rotationsExcept(t, have) {
+			return [...m(rots, t).entries()]
+				.filter(([k]) => !have.has(k))
+				.map(([, r]) => JSON.stringify(r));
+		},
+		putGrant(t, g) {
+			const arr = grants.get(t) ?? [];
+			if (!arr.some((x) => x.principal === g.principal && x.keyVersion === g.keyVersion))
+				arr.push(g);
+			grants.set(t, arr);
+		},
+		allGrants(t) {
+			return grants.get(t) ?? [];
+		},
+	};
+};
+
+const req = (
+	method: string,
+	path: string,
+	body: unknown,
+	headers: Record<string, string> = {},
+) => ({
+	method,
+	path,
+	header: (n: string) => headers[n.toLowerCase()],
+	body: async () => body,
+});
+
+test("worker handler: push then sync round-trips ops", async () => {
+	const store = memStore();
+	const k = cr.generateEd25519();
+	const ops = [
+		makeEnvelope("devA", 1, Buffer.from("op1"), k.privateKey),
+		makeEnvelope("devA", 2, Buffer.from("op2"), k.privateKey),
+	];
+
+	const pushed = await handle(req("POST", "/push", { teamId: "t1", ops }), store, {
+		authorize: async () => true,
+		verifyOp: (op) => verifyEnvelope(op, k.publicKey),
+	});
+	assert.deepEqual(pushed, { status: 200, body: { accepted: 2 } });
+
+	const synced = await handle(
+		req("POST", "/sync", { teamId: "t1", vector: {}, authHashes: [], rotationIds: [] }),
+		store,
+		{
+			authorize: async () => true,
+		},
+	);
+	assert.equal(synced.status, 200);
+	const b = synced.body as { ops: unknown[]; vector: Record<string, number> };
+	assert.equal(b.ops.length, 2);
+	assert.deepEqual(b.vector, { devA: 2 });
+});
+
+test("worker handler: a tampered op is rejected by the op-hash check", async () => {
+	const store = memStore();
+	const k = cr.generateEd25519();
+	const good = makeEnvelope("devA", 1, Buffer.from("op1"), k.privateKey);
+	const tampered = { ...good, payload: Buffer.from("evil").toString("base64") };
+
+	const r = await handle(req("POST", "/push", { teamId: "t1", ops: [tampered] }), store, {
+		authorize: async () => true,
+		verifyOp: (op) => verifyEnvelope(op, k.publicKey),
+	});
+	assert.deepEqual(r.body, { accepted: 0 }, "hash mismatch -> not accepted");
+});
+
+test("relay authenticates op authorship: a forged (deviceId,seq) claim is rejected", async () => {
+	// Build a minimal auth log: owner user 'u1' with device 'devA'.
+	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const devA = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const devAId = deviceIdOf(devA.sign.publicKey.toString("base64"));
+	const gen: EntryBody = {
+		type: "genesis",
+		vaultId: "t1",
+		userId: "u1",
+		userSignPub: owner.sign.publicKey.toString("base64"),
+		userEncPub: owner.enc.publicKey.toString("base64"),
+		role: "owner",
+	};
+	let chain: LogEntry[] = [makeEntry([], gen, "u1", "user", owner.sign.privateKey)];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "u1",
+				deviceId: devAId,
+				deviceSignPub: devA.sign.publicKey.toString("base64"),
+				deviceEncPub: devA.enc.publicKey.toString("base64"),
+			},
+			"u1",
+			"user",
+			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "u1", deviceId: devAId },
+			devAId,
+			"device",
+			devA.sign.privateKey,
+		),
+	];
+
+	const store = memStore();
+	// The transport's real authorship check: teamId===vaultId pins the genesis.
+	const verifyOp = (op: import("../src/core/protocol.ts").OpEnvelope, teamId: string) => {
+		const m = replay(store.authExcept(teamId, new Set()) as LogEntry[], teamId);
+		const key = deviceSignKey(m, op.deviceId);
+		return !!key && verifyEnvelope(op, key);
+	};
+
+	// An attacker (not devA) forges an op claiming devA's slot (devA, seq 1).
+	const attacker = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const forged = makeEnvelope(devAId, 1, Buffer.from("garbage"), attacker.sign.privateKey);
+	const genuine = makeEnvelope(devAId, 1, Buffer.from("real"), devA.sign.privateKey);
+
+	// An invalid first root must not claim an otherwise-empty team. Its body hash
+	// differs from the real root, while its stale signature no longer authenticates it.
+	const invalidRoot: LogEntry = {
+		...chain[0]!,
+		body: { ...gen, userId: "forged-owner" },
+	};
+	assert.equal(validRootGenesis(invalidRoot, "t1"), false);
+	await handle(req("POST", "/push", { teamId: "t1", ops: [], authLog: [invalidRoot] }), store, {
+		authorize: async () => true,
+		verifyOp,
+	});
+	assert.deepEqual(
+		store.authExcept("t1", new Set()),
+		[],
+		"an invalid genesis is not pinned or stored",
+	);
+
+	// Push carries the auth log so membership is known; the forged op is rejected.
+	const r1 = await handle(
+		req("POST", "/push", { teamId: "t1", ops: [forged], authLog: chain }),
+		store,
+		{ authorize: async () => true, verifyOp },
+	);
+	assert.deepEqual(r1.body, { accepted: 0 }, "forged authorship is rejected");
+
+	// A later self-signed genesis for the same team can sort below the real root.
+	// It must not enter storage or authorize the attacker's key for devA.
+	let rivalRoot: LogEntry | undefined;
+	let rivalUserId = "";
+	for (let nonce = 0; !rivalRoot; nonce++) {
+		rivalUserId = `attacker-${nonce}`;
+		const candidate = makeEntry(
+			[],
+			{
+				type: "genesis",
+				vaultId: "t1",
+				userId: rivalUserId,
+				userSignPub: attacker.sign.publicKey.toString("base64"),
+				userEncPub: attacker.enc.publicKey.toString("base64"),
+				role: "owner",
+			},
+			rivalUserId,
+			"user",
+			attacker.sign.privateKey,
+		);
+		if (entryHash(candidate) < entryHash(chain[0]!)) rivalRoot = candidate;
+	}
+	const rivalChain = [
+		rivalRoot,
+		makeEntry(
+			[rivalRoot.hash],
+			{
+				type: "add-device",
+				userId: rivalUserId,
+				deviceId: devAId,
+				deviceSignPub: attacker.sign.publicKey.toString("base64"),
+				deviceEncPub: attacker.enc.publicKey.toString("base64"),
+			},
+			rivalUserId,
+			"user",
+			attacker.sign.privateKey,
+		),
+	];
+	const rival = await handle(
+		req("POST", "/push", { teamId: "t1", ops: [forged], authLog: rivalChain }),
+		store,
+		{ authorize: async () => true, verifyOp },
+	);
+	assert.deepEqual(rival.body, { accepted: 0 }, "a rival root cannot authorize forged ops");
+	const storedGenesis = (store.authExcept("t1", new Set()) as LogEntry[]).filter(
+		(e) => e.body.type === "genesis",
+	);
+	assert.deepEqual(storedGenesis.map(entryHash), [entryHash(chain[0]!)]);
+
+	// The genuine device's real op for the same seq is accepted (slot not stolen).
+	const r2 = await handle(req("POST", "/push", { teamId: "t1", ops: [genuine] }), store, {
+		authorize: async () => true,
+		verifyOp,
+	});
+	assert.deepEqual(r2.body, { accepted: 1 }, "the real device's op is not censored");
+});
+
+test("relay accepts only signed, role-authorized recovery-grant publishers", async () => {
+	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const ownerDevice = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const member = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const memberDevice = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const ownerDeviceId = deviceIdOf(ownerDevice.sign.publicKey.toString("base64"));
+	const memberDeviceId = deviceIdOf(memberDevice.sign.publicKey.toString("base64"));
+	const genesis: EntryBody = {
+		type: "genesis",
+		vaultId: "grant-team",
+		userId: "owner",
+		userSignPub: owner.sign.publicKey.toString("base64"),
+		userEncPub: owner.enc.publicKey.toString("base64"),
+		role: "owner",
+	};
+	let chain: LogEntry[] = [makeEntry([], genesis, "owner", "user", owner.sign.privateKey)];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "owner",
+				deviceId: ownerDeviceId,
+				deviceSignPub: ownerDevice.sign.publicKey.toString("base64"),
+				deviceEncPub: ownerDevice.enc.publicKey.toString("base64"),
+			},
+			"owner",
+			"user",
+			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "owner", deviceId: ownerDeviceId },
+			ownerDeviceId,
+			"device",
+			ownerDevice.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-user",
+				userId: "member",
+				userSignPub: member.sign.publicKey.toString("base64"),
+				userEncPub: member.enc.publicKey.toString("base64"),
+				role: "member",
+			},
+			ownerDeviceId,
+			"device",
+			ownerDevice.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "member",
+				deviceId: memberDeviceId,
+				deviceSignPub: memberDevice.sign.publicKey.toString("base64"),
+				deviceEncPub: memberDevice.enc.publicKey.toString("base64"),
+			},
+			"member",
+			"user",
+			member.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "member", deviceId: memberDeviceId },
+			memberDeviceId,
+			"device",
+			memberDevice.sign.privateKey,
+		),
+	];
+	const makeGrant = (principal: string, signerId: string, priv: Buffer) => {
+		const unsigned = { principal, keyVersion: 0, wrapped: "public-material", signerId };
+		return {
+			...unsigned,
+			sig: cr.sign(grantBytes("grant-team", unsigned), priv).toString("base64"),
+		};
+	};
+	const memberOrgKey = makeGrant("orgPublicKey", memberDeviceId, memberDevice.sign.privateKey);
+	const ownerOrgKey = makeGrant("orgPublicKey", ownerDeviceId, ownerDevice.sign.privateKey);
+	const store = memStore();
+	const verifyGrant = (g: import("../src/core/protocol.ts").GrantRow, teamId: string) =>
+		grantAuthentic(teamId, g, replay(store.authExcept(teamId, new Set()) as LogEntry[], teamId));
+
+	await handle(
+		req("POST", "/push", {
+			teamId: "grant-team",
+			ops: [],
+			authLog: chain,
+			grants: [memberOrgKey, ownerOrgKey],
+		}),
+		store,
+		{ authorize: async () => true, verifyGrant },
+	);
+	const grants = await store.allGrants("grant-team");
+	assert.equal(grants.length, 1);
+	assert.equal(grants[0]!.signerId, ownerDeviceId, "a member cannot preseed the org key");
+});
+
+test("worker handler: health + auth gate (shared authorizeHeaders)", async () => {
+	const store = memStore();
+	assert.deepEqual(
+		await handle(req("GET", "/health", {}), store, { authorize: async () => true }),
+		{
+			status: 200,
+			body: { ok: true },
+		},
+	);
+	const cfg = { serviceTokens: new Set(["good"]) };
+	const denied = await handle(req("POST", "/sync", { teamId: "t1" }), store, {
+		authorize: (h) => authorizeHeaders(h, cfg),
+	});
+	assert.equal(denied.status, 403);
+	const ok = await handle(
+		req(
+			"POST",
+			"/sync",
+			{ teamId: "t1", vector: {}, authHashes: [], rotationIds: [] },
+			{ "cf-access-token": "good" },
+		),
+		store,
+		{ authorize: (h) => authorizeHeaders(h, cfg) },
+	);
+	assert.equal(ok.status, 200);
+});
+
+test("worker edge stops reading a chunked body once the byte limit is exceeded", async () => {
+	const chunk = new Uint8Array(1024 * 1024);
+	let pulls = 0;
+	let cancelled = false;
+	const body = new ReadableStream<Uint8Array>(
+		{
+			pull(controller) {
+				pulls++;
+				if (pulls > 17) throw new Error("reader consumed past the oversized chunk");
+				controller.enqueue(chunk);
+			},
+			cancel() {
+				cancelled = true;
+			},
+		},
+		{ highWaterMark: 0 },
+	);
+	const request = new Request("https://relay.test/push", {
+		method: "POST",
+		body,
+		duplex: "half",
+	} as RequestInit & { duplex: "half" });
+	let routed = false;
+	const env = {
+		RELAY_DO: {
+			idFromName() {
+				routed = true;
+				return "unused";
+			},
+			get() {
+				return { fetch: async () => new Response(null, { status: 204 }) };
+			},
+		},
+	};
+
+	const response = await worker.fetch(request, env);
+	assert.equal(response.status, 413);
+	assert.equal(cancelled, true, "the unread remainder is cancelled");
+	assert.equal(pulls, 17, "only enough chunks to detect overflow are read");
+	assert.equal(routed, false, "oversized requests never create or reach a Durable Object");
+});
+
+test("relay persists only auth entries that replay applies (Swift relay parity)", async () => {
+	const owner = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const devA = { sign: cr.generateEd25519(), enc: cr.generateX25519() };
+	const devAId = deviceIdOf(devA.sign.publicKey.toString("base64"));
+	const b64 = (k: Buffer) => k.toString("base64");
+	let chain: LogEntry[] = [
+		makeEntry(
+			[],
+			{
+				type: "genesis",
+				vaultId: "t1",
+				userId: "u1",
+				userSignPub: b64(owner.sign.publicKey),
+				userEncPub: b64(owner.enc.publicKey),
+				role: "owner",
+			},
+			"u1",
+			"user",
+			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{
+				type: "add-device",
+				userId: "u1",
+				deviceId: devAId,
+				deviceSignPub: b64(devA.sign.publicKey),
+				deviceEncPub: b64(devA.enc.publicKey),
+			},
+			"u1",
+			"user",
+			owner.sign.privateKey,
+		),
+	];
+	chain = [
+		...chain,
+		makeEntry(
+			heads(chain),
+			{ type: "prove-device", userId: "u1", deviceId: devAId },
+			devAId,
+			"device",
+			devA.sign.privateKey,
+		),
+	];
+	// A token holder who is not a member signs an add-user with an unknown device key.
+	const attacker = cr.generateEd25519();
+	const attackerId = deviceIdOf(b64(attacker.publicKey));
+	const junk = makeEntry(
+		heads(chain),
+		{
+			type: "add-user",
+			userId: "evil",
+			userSignPub: b64(attacker.publicKey),
+			userEncPub: b64(cr.generateX25519().publicKey),
+			role: "admin",
+		} as EntryBody,
+		attackerId,
+		"device",
+		attacker.privateKey,
+	);
+
+	const store = memStore();
+	const admitAuth = (entries: LogEntry[], teamId: string) =>
+		admissible(entries, store.authExcept(teamId, new Set()) as LogEntry[], teamId);
+	const r = await handle(
+		req("POST", "/push", { teamId: "t1", ops: [], authLog: [...chain, junk] }),
+		store,
+		{ authorize: async () => true, admitAuth },
+	);
+	assert.equal(r.status, 200);
+	const stored = (store.authExcept("t1", new Set()) as LogEntry[]).map(entryHash).sort();
+	assert.deepEqual(stored, chain.map(entryHash).sort(), "the unauthorized entry is not stored");
+
+	// A later push of the same junk alone is still refused.
+	await handle(req("POST", "/push", { teamId: "t1", ops: [], authLog: [junk] }), store, {
+		authorize: async () => true,
+		admitAuth,
+	});
+	assert.equal((store.authExcept("t1", new Set()) as LogEntry[]).length, chain.length);
+});

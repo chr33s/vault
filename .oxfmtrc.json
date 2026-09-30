@@ -3,7 +3,12 @@
 	"useTabs": true,
 	"tabWidth": 2,
 	"overrides": [{ "files": ["*.md", "*.{yaml,yml}"], "useTabs": false }],
-	"ignorePatterns": ["**/.build/**", "native/**/*.app/**"],
+	"ignorePatterns": [
+		"**/.build/**",
+		"macos/*.app/**",
+		"protocol/vectors/*.json",
+		"protocol/vectors/store/**"
+	],
 	"experimentalSortImports": {
 		"internalPattern": ["#"],
 		"newlinesBetween": false
